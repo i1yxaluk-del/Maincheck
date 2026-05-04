@@ -53,11 +53,11 @@ systemctl status ai-suggester
 Краткая шпаргалка:
 ```bash
 # Из корня репозитория
-PYTHONPATH=Сервер python -m shared.rag_cli add  ./data/docs/fz_44.docx --doc-id fz-44 --version 2025-03
-PYTHONPATH=Сервер python -m shared.rag_cli list
-PYTHONPATH=Сервер python -m shared.rag_cli remove fz-44
-PYTHONPATH=Сервер python -m shared.rag_cli search "согласно распоряжения"
-PYTHONPATH=Сервер python -m shared.rag_cli ingest-folder ./data/docs
+PYTHONPATH=server python -m shared.rag_cli add  ./data/docs/fz_44.docx --doc-id fz-44 --version 2025-03
+PYTHONPATH=server python -m shared.rag_cli list
+PYTHONPATH=server python -m shared.rag_cli remove fz-44
+PYTHONPATH=server python -m shared.rag_cli search "согласно распоряжения"
+PYTHONPATH=server python -m shared.rag_cli ingest-folder ./data/docs
 ```
 
 ## Траблшутинг

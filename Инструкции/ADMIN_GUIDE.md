@@ -111,7 +111,7 @@ ollama pull t-tech/T-lite-it-2.1:q4_K_M
 ollama pull nomic-embed-text    # нужен для RAG
 
 # AI Suggester (из корня репо)
-cd Сервер/local
+cd server/local
 cp .env.example .env
 # отредактировать .env при необходимости (NUM_THREADS и т.д.)
 pip install -r requirements.txt
@@ -134,7 +134,7 @@ curl http://localhost:8000/metrics
 Если у организации нет сервера с 32 ГБ RAM, но есть доступ в интернет:
 
 ```bash
-cd Сервер/cloud
+cd server/cloud
 cp .env.example .env
 # вписать OPENROUTER_API_KEY
 pip install -r requirements.txt
@@ -152,9 +152,9 @@ pip install -r requirements.txt
 # Один раз
 ollama pull nomic-embed-text
 # Положить документы в data/docs/
-PYTHONPATH=Сервер python -m shared.rag_cli ingest-folder ./data/docs
+PYTHONPATH=server python -m shared.rag_cli ingest-folder ./data/docs
 
-# В Сервер/local/.env
+# В server/local/.env
 RAG_ENABLED=true
 # Перезапустить сервер
 systemctl restart ai-suggester
@@ -162,12 +162,12 @@ systemctl restart ai-suggester
 
 Обновить редакцию:
 ```bash
-PYTHONPATH=Сервер python -m shared.rag_cli add data/docs/fz_44_v2025.docx --doc-id fz-44 --version 2025-03
+PYTHONPATH=server python -m shared.rag_cli add data/docs/fz_44_v2025.docx --doc-id fz-44 --version 2025-03
 ```
 
 Удалить отменённый документ:
 ```bash
-PYTHONPATH=Сервер python -m shared.rag_cli remove fz-44
+PYTHONPATH=server python -m shared.rag_cli remove fz-44
 ```
 
 ---
