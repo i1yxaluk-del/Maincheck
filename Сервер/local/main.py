@@ -16,6 +16,16 @@ qwen2.5:32b, forzer/GigaChat3-10B-A1.8B, qwen3:30b-a3b-instruct-2507.
 Новое в v1.5:
     • Переход по умолчанию на T-lite-it-2.1 (в 2× быстрее)
     • Пост-процессор ===CHANGES===: фильтрует идемпотентные пункты «X → X»
+    • v1.5.11: реконструкция CHANGES из diff, когда модель сочиняет рапорт
+Новое в v1.6:
+    • Retrieval-augmented few-shot (USE_FEW_SHOT=true):
+      на каждый запрос подмешиваются top-K похожих пар «неправильно → правильно»
+      из банка (data/gec_bank.jsonl, seed из LORuGEC, 288 пар, 48 правил).
+      Академически верифицированный SOTA для русского GEC
+      (Sorokin & Nasyrova, BEA @ ACL 2025).
+    • Точка расширения под ведомственные документы: добавьте свой JSONL в
+      GEC_BANK_FILES, он будет подмешиваться в те же few-shot примеры.
+      Ноль обучения, только retrieval.
 """
 from __future__ import annotations
 
@@ -73,11 +83,23 @@ RAG_STORE_DIR = os.getenv("RAG_STORE_DIR", "data/rag_store")
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 RAG_EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "nomic-embed-text")
 
+# Few-shot retrieval (v1.6): на каждый запрос подмешиваем top-K пар
+# «неправильно → правильно» из банка как примеры формата и стиля правок.
+# По умолчанию отключено (0-shot), чтобы сохранить полную обратную совместимость
+# с v1.5.11. Включение → USE_FEW_SHOT=true.
+USE_FEW_SHOT = os.getenv("USE_FEW_SHOT", "false").lower() in ("1", "true", "yes", "on")
+GEC_BANK_FILES = [
+    s.strip() for s in os.getenv("GEC_BANK_FILES", "../shared/gec_seed/gec_bank.jsonl").split(",")
+    if s.strip()
+]
+GEC_TOP_K = int(os.getenv("GEC_TOP_K", "3"))
+
 logger = setup_logger("ai_suggester.local")
 audit = AuditStore()
 
 _rag_store = None
 _rag_embedder = None
+_gec_bank = None
 
 if RAG_ENABLED:
     try:
@@ -92,6 +114,46 @@ if RAG_ENABLED:
     except Exception as e:
         logger.warning("RAG не удалось инициализировать: %s", e)
         _rag_store = None
+
+if USE_FEW_SHOT:
+    try:
+        from shared.gec_bank import GecBank  # noqa: E402
+        from shared.rag_store import HashingEmbedder, OllamaEmbedder  # noqa: E402
+
+        # Переиспользуем RAG-эмбеддер, если он уже инициализирован (экономим RAM
+        # и сетевые hops). Иначе создаём собственный Ollama-эмбеддер на той же
+        # модели nomic-embed-text. Если Ollama недоступен — HashingEmbedder как
+        # резерв (лексическое пересечение вместо семантического, качество ниже,
+        # но не ломается).
+        if _rag_embedder is not None:
+            _gec_embedder = _rag_embedder
+        else:
+            try:
+                _gec_embedder = OllamaEmbedder(model=RAG_EMBED_MODEL, base_url=OLLAMA_URL)
+                # Проверка доступности: делаем probe-эмбеддинг
+                _ = _gec_embedder.embed(["probe"])
+            except Exception as exc:
+                logger.warning(
+                    "Ollama-эмбеддер (%s) недоступен (%s), переключаюсь на HashingEmbedder",
+                    RAG_EMBED_MODEL, exc,
+                )
+                _gec_embedder = HashingEmbedder(dim=1024)
+        _gec_bank = GecBank(_gec_embedder)
+        _here = Path(__file__).resolve().parent
+        _resolved_paths = [str((_here / p) if not Path(p).is_absolute() else Path(p)) for p in GEC_BANK_FILES]
+        n = _gec_bank.load_jsonl(*_resolved_paths)
+        if n == 0:
+            logger.warning("Few-shot retrieval включён, но банк пуст — falling back на 0-shot")
+            _gec_bank = None
+        else:
+            _gec_bank.build_index()
+            logger.info(
+                "Few-shot retrieval включён: %d пар, top_k=%d, embedder=%s",
+                n, GEC_TOP_K, _gec_embedder.name,
+            )
+    except Exception as e:
+        logger.warning("Few-shot retrieval не удалось инициализировать: %s", e)
+        _gec_bank = None
 
 
 SYSTEM_PROMPT = """Ты — корректор русского языка для официальных документов. Не рассуждай, сразу выдавай ответ в нужном формате.
@@ -130,7 +192,7 @@ SYSTEM_PROMPT = """Ты — корректор русского языка дл�
 ===END==="""
 
 
-app = FastAPI(title="AI LibreOffice Suggester — Local", version="1.5.11")
+app = FastAPI(title="AI LibreOffice Suggester — Local", version="1.6.0")
 
 
 @app.on_event("startup")
@@ -515,6 +577,8 @@ async def health():
             status += f" | ВНИМАНИЕ: модель {MODEL_NAME} не найдена. Загружены: {', '.join(models)}"
         if RAG_ENABLED and _rag_store:
             status += f" | RAG: {len(_rag_store.docs)} документов"
+        if _gec_bank is not None:
+            status += f" | Few-shot: {len(_gec_bank)} пар, top_k={GEC_TOP_K}"
         return status
     except Exception as e:
         return f"ОШИБКА: Ollama недоступна — {e}"
@@ -527,6 +591,9 @@ async def metrics(hours: int = 24):
         "model": MODEL_NAME,
         "rag_enabled": RAG_ENABLED,
         "rag_documents": len(_rag_store.docs) if _rag_store else 0,
+        "few_shot_enabled": _gec_bank is not None,
+        "few_shot_pairs": len(_gec_bank) if _gec_bank else 0,
+        "few_shot_top_k": GEC_TOP_K if _gec_bank else 0,
         "audit": audit.stats(hours=hours),
     })
 
@@ -548,10 +615,37 @@ async def suggest(
         user_msg += f"\n{extra}\n"
     user_msg += f"\n---\nТЕКСТ ДЛЯ ПРОВЕРКИ:\n{raw_text}"
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_msg},
-    ]
+    # Few-shot retrieval (v1.6): подмешиваем top-K примеров перед user-сообщением.
+    # Академический SOTA для RU GEC — именно эта схема (Sorokin & Nasyrova 2025).
+    # Если банк пуст/недоступен — falling back на 0-shot (полная совместимость).
+    few_shot_examples: list = []
+    if _gec_bank is not None:
+        try:
+            hits = _gec_bank.search(raw_text, top_k=GEC_TOP_K)
+            few_shot_examples = [pair for score, pair in hits]
+            if few_shot_examples:
+                logger.info(
+                    "Few-shot: подмешиваю %d пар: %s",
+                    len(few_shot_examples),
+                    [p.rule or p.wrong[:40] for p in few_shot_examples],
+                )
+        except Exception as e:
+            logger.warning("Few-shot retrieval провалился (0-shot fallback): %s", e)
+            few_shot_examples = []
+
+    if few_shot_examples:
+        from shared.gec_bank import build_few_shot_messages  # noqa: E402
+
+        messages = build_few_shot_messages(
+            system_prompt=SYSTEM_PROMPT,
+            user_text=user_msg,
+            examples=few_shot_examples,
+        )
+    else:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ]
 
     client_ip = request.client.host if request.client else ""
     user_agent = request.headers.get("user-agent", "")

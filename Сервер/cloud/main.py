@@ -71,7 +71,7 @@ SYSTEM_PROMPT = """Ты — корректор русского языка дл�
 1. Ошибок не найдено. Текст соответствует нормам.
 ===END==="""
 
-app = FastAPI(title="AI LibreOffice Suggester — Cloud", version="1.5.11")
+app = FastAPI(title="AI LibreOffice Suggester — Cloud", version="1.6.0")
 
 
 def _key_missing() -> bool:
