@@ -28,6 +28,9 @@ logs/
 chroma_store/
 rag_cache/
 
+# GEC bank index cache (переиндексируется на старте при отсутствии)
+*.index.pkl
+
 # OS / editor
 .DS_Store
 Thumbs.db
