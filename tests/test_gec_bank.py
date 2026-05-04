@@ -209,6 +209,108 @@ def test_seed_bank_no_nested_quotes_after_load() -> None:
             )
 
 
+def test_build_index_cache_roundtrip(tmp_path: Path, sample_bank_file: Path) -> None:
+    """Первый build_index сохраняет кэш; второй поднимает векторы оттуда,
+    минуя embedder (чтобы старт сервера не упирался в 278 × 8 с)."""
+
+    class _CountingEmbedder:
+        name = "mock:hash:8"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @property
+        def dim(self) -> int:
+            return 8
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            self.calls += 1
+            base = HashingEmbedder(dim=8)
+            return base.embed(texts)
+
+    cache = tmp_path / "index.pkl"
+    e1 = _CountingEmbedder()
+    bank1 = GecBank(e1)
+    bank1.load_jsonl(sample_bank_file)
+    bank1.build_index(cache_path=cache)
+    assert e1.calls == 1, "первый build_index должен вызвать embedder ровно один раз"
+    assert cache.exists(), "после первого build_index должен появиться файл кэша"
+
+    # Второй bank — тот же эмбеддер по имени, тот же банк → должен грузить кэш
+    e2 = _CountingEmbedder()
+    bank2 = GecBank(e2)
+    bank2.load_jsonl(sample_bank_file)
+    bank2.build_index(cache_path=cache)
+    assert e2.calls == 0, "при валидном кэше embedder вызываться не должен"
+    assert bank2._indexed_count == bank1._indexed_count
+    # Векторы из кэша эквивалентны исходным
+    vecs1 = [list(e.vec) for e in bank1._entries]
+    vecs2 = [list(e.vec) for e in bank2._entries]
+    assert vecs1 == vecs2
+
+
+def test_build_index_cache_invalidates_on_content_change(
+    tmp_path: Path, sample_bank_file: Path
+) -> None:
+    """Если банк изменился (добавили пару) — fingerprint меняется, кэш
+    игнорируется, embedder вызывается заново."""
+    cache = tmp_path / "index.pkl"
+
+    class _CountingEmbedder:
+        name = "mock:hash:8"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @property
+        def dim(self) -> int:
+            return 8
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            self.calls += 1
+            return HashingEmbedder(dim=8).embed(texts)
+
+    e1 = _CountingEmbedder()
+    bank1 = GecBank(e1)
+    bank1.load_jsonl(sample_bank_file)
+    bank1.build_index(cache_path=cache)
+
+    # Добавляем пару в jsonl
+    with sample_bank_file.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "wrong": "Новая ошибка",
+            "right": "Новая правка",
+            "rule": "тест",
+        }, ensure_ascii=False) + "\n")
+
+    e2 = _CountingEmbedder()
+    bank2 = GecBank(e2)
+    bank2.load_jsonl(sample_bank_file)
+    bank2.build_index(cache_path=cache)
+    assert e2.calls == 1, "после изменения банка embedder должен быть вызван"
+
+
+def test_build_index_cache_invalidates_on_embedder_change(
+    tmp_path: Path, sample_bank_file: Path
+) -> None:
+    """Смена эмбеддера (hashing:64 → hashing:128) должна инвалидировать
+    кэш — иначе размерности векторов в банке и в запросе не совпадут."""
+    cache = tmp_path / "index.pkl"
+    bank1 = GecBank(HashingEmbedder(dim=64))
+    bank1.load_jsonl(sample_bank_file)
+    bank1.build_index(cache_path=cache)
+    dim1 = len(bank1._entries[0].vec)
+
+    bank2 = GecBank(HashingEmbedder(dim=128))
+    bank2.load_jsonl(sample_bank_file)
+    bank2.build_index(cache_path=cache)
+    dim2 = len(bank2._entries[0].vec)
+
+    assert dim1 == 64 and dim2 == 128, (
+        "кэш должен переиндексироваться при смене эмбеддера (dim)"
+    )
+
+
 def test_seed_bank_file_is_valid() -> None:
     """Проверяет, что встроенный seed-банк парсится без ошибок."""
     here = Path(__file__).resolve().parent

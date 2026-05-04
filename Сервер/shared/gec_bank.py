@@ -32,9 +32,11 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
+import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -154,18 +156,79 @@ class GecBank:
         return len(self._entries)
 
     # --- индексация ----------------------------------------------------
-    def build_index(self) -> None:
+    def _bank_fingerprint(self) -> str:
+        """SHA-256 по `(wrong, right)`-парам банка + имени эмбеддера.
+
+        Используется как ключ кэша. Изменили банк или эмбеддер — ключ меняется,
+        кэш переиндексируется. Rule/definition в хэше не учитываем: эмбеддинг
+        берём только с `wrong`, поэтому перефразировка правила не обнуляет кэш.
+        """
+        h = hashlib.sha256()
+        h.update(self.embedder.name.encode("utf-8"))
+        h.update(b"\n")
+        for e in self._entries:
+            h.update(e.pair.wrong.encode("utf-8"))
+            h.update(b"\t")
+            h.update(e.pair.right.encode("utf-8"))
+            h.update(b"\n")
+        return h.hexdigest()
+
+    def build_index(self, cache_path: Path | str | None = None) -> None:
         """Считает эмбеддинги для всех пар и сохраняет в RAM.
 
         Эмбеддим `wrong`-поле: пользовательский текст тоже «неправильный»,
         поэтому максимально близкий по смыслу пример будет иметь похожую
         структуру ошибки. Для nomic-embed-text это даёт интуитивно
         правильное поведение (похожие контексты → похожие правила).
+
+        Если передан `cache_path` — перед обсчётом пытаемся загрузить
+        ранее сохранённые векторы (pickle) с совпадающим fingerprint банка
+        и эмбеддера. Это критично для старта на CPU Broadwell: без кэша
+        278 последовательных `/api/embeddings`-запросов к Ollama
+        (nomic-embed-text, ~8 с на запрос) занимают ~37 минут.
+
+        При переиндексации — сохраняем кэш на диск под тем же `cache_path`.
         """
         if not self._entries:
             self._indexed_count = 0
             return
+
+        fp = self._bank_fingerprint()
+        cache = Path(cache_path) if cache_path else None
+
+        # Попытка загрузить кэш
+        if cache is not None and cache.exists():
+            try:
+                with cache.open("rb") as f:
+                    payload = pickle.load(f)
+                if payload.get("fingerprint") == fp:
+                    vecs = payload["vectors"]
+                    if len(vecs) == len(self._entries):
+                        for entry, vec in zip(self._entries, vecs):
+                            entry.vec = list(vec)
+                            entry.norm = (
+                                math.sqrt(sum(v * v for v in vec)) or 1.0
+                            )
+                        self._indexed_count = len(self._entries)
+                        _log.info(
+                            "GEC bank: загружен кэш индекса %s (%d пар, dim=%d, embedder=%s)",
+                            cache, self._indexed_count,
+                            len(vecs[0]) if vecs else 0, self.embedder.name,
+                        )
+                        return
+                _log.info(
+                    "GEC bank: fingerprint кэша %s устарел — переиндексация", cache,
+                )
+            except Exception as e:
+                _log.warning("GEC bank: кэш %s повреждён (%s) — переиндексация", cache, e)
+
+        # Обсчёт индекса
         texts = [e.pair.wrong for e in self._entries]
+        _log.info(
+            "GEC bank: считаю эмбеддинги для %d пар через %s "
+            "(на CPU может занять несколько минут)…",
+            len(texts), self.embedder.name,
+        )
         vecs = self.embedder.embed(texts)
         for entry, vec in zip(self._entries, vecs):
             entry.vec = list(vec)
@@ -176,6 +239,29 @@ class GecBank:
             self._indexed_count, self.embedder.name,
             len(self._entries[0].vec) if self._entries else 0,
         )
+
+        # Сохранение кэша
+        if cache is not None:
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache.with_suffix(cache.suffix + ".tmp")
+                with tmp.open("wb") as f:
+                    pickle.dump(
+                        {
+                            "fingerprint": fp,
+                            "vectors": [list(e.vec) for e in self._entries],
+                            "embedder": self.embedder.name,
+                        },
+                        f,
+                        protocol=pickle.HIGHEST_PROTOCOL,
+                    )
+                tmp.replace(cache)
+                _log.info("GEC bank: сохранён кэш индекса %s", cache)
+            except Exception as e:
+                _log.warning(
+                    "GEC bank: не удалось сохранить кэш %s (%s) — индекс только в RAM",
+                    cache, e,
+                )
 
     # --- поиск ---------------------------------------------------------
     def search(self, query: str, top_k: int = 3) -> List[Tuple[float, GecPair]]:

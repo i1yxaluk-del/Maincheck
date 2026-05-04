@@ -146,7 +146,10 @@ if USE_FEW_SHOT:
             logger.warning("Few-shot retrieval включён, но банк пуст — falling back на 0-shot")
             _gec_bank = None
         else:
-            _gec_bank.build_index()
+            # Кэш индекса рядом с первым jsonl. Fingerprint включает имя
+            # эмбеддера, так что смена nomic↔hashing триггерит переиндексацию.
+            _cache_path = Path(_resolved_paths[0]).with_suffix(".index.pkl")
+            _gec_bank.build_index(cache_path=_cache_path)
             logger.info(
                 "Few-shot retrieval включён: %d пар, top_k=%d, embedder=%s",
                 n, GEC_TOP_K, _gec_embedder.name,
