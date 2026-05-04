@@ -65,6 +65,24 @@ def setup_logger(name: str = "ai_suggester") -> logging.Logger:
 
     logger.propagate = False
     logger._ai_configured = True  # type: ignore[attr-defined]
+
+    # Также конфигурируем «зонтичный» родительский логгер теми же handlers —
+    # чтобы соседние модули (`ai_suggester.gec_bank`, `ai_suggester.rag`,
+    # `ai_suggester.audit`) писали в тот же файл через propagation. Без
+    # этого их логи молча теряются (только WARNING утекают через root
+    # lastResort на stderr). Это и скрывало прогресс `GecBank.build_index()`
+    # в журнале v1.6.0.
+    if "." in name:
+        parent_name = name.rsplit(".", 1)[0]
+        parent = logging.getLogger(parent_name)
+        if not getattr(parent, "_ai_configured_umbrella", False):
+            parent.setLevel(level)
+            parent.addHandler(file_handler)
+            parent.addHandler(console)
+            # parent.propagate остаётся True по умолчанию, но наверху
+            # (root) обычно нет AI-handlers, поэтому дубликатов нет.
+            parent._ai_configured_umbrella = True  # type: ignore[attr-defined]
+
     logger.info(
         "Логгер инициализирован (level=%s, dir=%s, retention=%sд)",
         level_name, log_dir, retention_days,

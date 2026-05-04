@@ -69,7 +69,9 @@ OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "300"))
 # запрос пользователя не ждал 30–90 с). Отключите, если стартуете много
 # инстансов на одной машине и хотите экономить RAM.
 OLLAMA_WARMUP = os.getenv("OLLAMA_WARMUP", "true").lower() in ("1", "true", "yes", "on")
-OLLAMA_WARMUP_TIMEOUT = float(os.getenv("OLLAMA_WARMUP_TIMEOUT", "180"))
+# Broadwell/Cascade Lake CPU с 8B Q4_K_M грузится ~120-240 с на первый chat-запрос;
+# 180 с почти всегда не хватает, даём запас по умолчанию.
+OLLAMA_WARMUP_TIMEOUT = float(os.getenv("OLLAMA_WARMUP_TIMEOUT", "300"))
 # Сколько модель остаётся в RAM после ответа. Без этого 30B-модель выгружается
 # и каждый следующий запрос ждёт ~30–90 с пока она снова грузится с диска.
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
