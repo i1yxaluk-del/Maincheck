@@ -195,7 +195,7 @@ def test_seed_bank_no_nested_quotes_after_load() -> None:
     from shared.gec_bank import _OUTER_QUOTE_CHARS
 
     here = Path(__file__).resolve().parent
-    seed = here.parent / "Сервер" / "shared" / "gec_seed" / "gec_bank.jsonl"
+    seed = here.parent / "server" / "shared" / "gec_seed" / "gec_bank.jsonl"
     bank = GecBank(HashingEmbedder(dim=64))
     n = bank.load_jsonl(seed)
     assert n > 0
@@ -314,7 +314,7 @@ def test_build_index_cache_invalidates_on_embedder_change(
 def test_seed_bank_file_is_valid() -> None:
     """Проверяет, что встроенный seed-банк парсится без ошибок."""
     here = Path(__file__).resolve().parent
-    seed = here.parent / "Сервер" / "shared" / "gec_seed" / "gec_bank.jsonl"
+    seed = here.parent / "server" / "shared" / "gec_seed" / "gec_bank.jsonl"
     assert seed.exists(), f"seed-банк отсутствует: {seed}"
     bank = GecBank(HashingEmbedder(dim=64))
     n = bank.load_jsonl(seed)

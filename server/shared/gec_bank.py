@@ -46,7 +46,7 @@ from .rag_store import Embedder, HashingEmbedder  # noqa: F401 — для пот
 _log = logging.getLogger("ai_suggester.gec_bank")
 
 # Кавычки, которые сервер использует как ВНЕШНИЕ ограничители в блоке
-# `===CHANGES===` (см. `_QUOTE_CHARS` в `Сервер/local/main.py`). Если
+# `===CHANGES===` (см. `_QUOTE_CHARS` в `server/local/main.py`). Если
 # пара «неправильно → правильно» сама содержит любой из этих символов,
 # то few-shot assistant-сообщение получит вложенные кавычки вида
 # `«текст с «внутренней» кавычкой»`, и серверный регэксп

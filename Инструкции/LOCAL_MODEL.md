@@ -105,12 +105,12 @@ ollama list
 
 ## 3. Подключение к AI Suggester
 
-1. Использовать папку `Сервер/local/` из репозитория.
+1. Использовать папку `server/local/` из репозитория.
 2. Скопировать `.env.example` → `.env`, задать `MODEL_NAME=t-tech/T-lite-it-2.1:q4_K_M`.
 3. Запустить:
 
-   **Linux:** `cd Сервер/local && ./start.sh`
-   **Windows:** `cd Сервер\local && start.bat`
+   **Linux:** `cd server/local && ./start.sh`
+   **Windows:** `cd server\local && start.bat`
 
 4. Проверить <http://localhost:8000/health> — ожидаем `Ollama OK | Модель t-tech/T-lite-it-2.1:q4_K_M загружена`.
 5. Админу: для диагностики — **Сервис → Макросы → Мои макросы → ai_macro → Health → AICheckServer**.

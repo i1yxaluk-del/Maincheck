@@ -47,8 +47,8 @@
 
 ### `ModuleNotFoundError: No module named 'shared'`
 Запускайте из корня репозитория: `uvicorn main:app` выполняйте внутри папки
-`Сервер/local/` или `Сервер/cloud/`. Скрипт `start.sh`/`start.bat` делает это автоматически.
-Если запускаете вручную — сначала выполните `cd Сервер/local`.
+`server/local/` или `server/cloud/`. Скрипт `start.sh`/`start.bat` делает это автоматически.
+Если запускаете вручную — сначала выполните `cd server/local`.
 
 ### `[Errno 98] Address already in use`
 На порту 8000 уже висит другой процесс.
@@ -138,7 +138,7 @@ ExecStart=/usr/bin/numactl --cpunodebind=0 --membind=0 /usr/local/bin/ollama ser
 
 ### Облачный сервер: «`HTTP 401`»
 Ключ OpenRouter истёк или недействителен. Сгенерировать новый: <https://openrouter.ai/keys>.
-Положить в `Сервер/cloud/.env`. **Никогда** не коммитить в git.
+Положить в `server/cloud/.env`. **Никогда** не коммитить в git.
 
 ### Облачный сервер: «Все модели вернули 429»
 Rate limit бесплатного тарифа OpenRouter исчерпан. Подождать час или подключить платный.
