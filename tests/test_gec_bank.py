@@ -149,6 +149,66 @@ def test_build_few_shot_messages_no_extra_system() -> None:
     assert [m["role"] for m in msgs] == ["system", "user"]
 
 
+def test_load_jsonl_skips_pairs_with_nested_quotes(tmp_path: Path) -> None:
+    """Пары с внешними кавычками в wrong/right ломают _CHANGE_PAIR_RE
+    на сервере (обрезка цитаты до первой внутренней кавычки). Такие пары
+    должны отбрасываться на этапе загрузки с warning'ом.
+    """
+    p = tmp_path / "bank_nested.jsonl"
+    items = [
+        # OK — без кавычек
+        {"wrong": "согласно приказа", "right": "согласно приказу", "rule": "rA"},
+        # Skip — «» внутри wrong
+        {
+            "wrong": 'В Wildberries рассказали «Ведомостям», что покупка.',
+            "right": 'В Wildberries рассказали «Ведомостям» что покупка.',
+            "rule": "rB",
+        },
+        # Skip — " внутри right
+        {
+            "wrong": "Он сказал что приедет",
+            "right": 'Он сказал "что приедет"',
+            "rule": "rC",
+        },
+        # Skip — „" (типографские)
+        {
+            "wrong": "текст, „внутри“, продолжение",
+            "right": "текст „внутри“ продолжение",
+            "rule": "rD",
+        },
+        # OK — апостроф ASCII (НЕ в _OUTER_QUOTE_CHARS)
+        {"wrong": "I don't know", "right": "I don't know тут", "rule": "rE"},
+    ]
+    with p.open("w", encoding="utf-8") as f:
+        for d in items:
+            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+    bank = GecBank(HashingEmbedder(dim=64))
+    n = bank.load_jsonl(p)
+    # Ожидаем: rA, rE — прошли; rB, rC, rD — отброшены
+    assert n == 2, f"ожидалось 2 пары, получили {n}"
+    assert [e.pair.rule for e in bank._entries] == ["rA", "rE"]
+
+
+def test_seed_bank_no_nested_quotes_after_load() -> None:
+    """После фильтра ни одна загруженная пара не должна содержать
+    внешние кавычки. Это инвариант для безопасного few-shot."""
+    from shared.gec_bank import _OUTER_QUOTE_CHARS
+
+    here = Path(__file__).resolve().parent
+    seed = here.parent / "Сервер" / "shared" / "gec_seed" / "gec_bank.jsonl"
+    bank = GecBank(HashingEmbedder(dim=64))
+    n = bank.load_jsonl(seed)
+    assert n > 0
+    for entry in bank._entries:
+        for c in _OUTER_QUOTE_CHARS:
+            assert c not in entry.pair.wrong, (
+                f"пара с {c!r} в wrong не должна попасть в банк: {entry.pair.wrong!r}"
+            )
+            assert c not in entry.pair.right, (
+                f"пара с {c!r} в right не должна попасть в банк: {entry.pair.right!r}"
+            )
+
+
 def test_seed_bank_file_is_valid() -> None:
     """Проверяет, что встроенный seed-банк парсится без ошибок."""
     here = Path(__file__).resolve().parent

@@ -43,6 +43,17 @@ from .rag_store import Embedder, HashingEmbedder  # noqa: F401 — для пот
 
 _log = logging.getLogger("ai_suggester.gec_bank")
 
+# Кавычки, которые сервер использует как ВНЕШНИЕ ограничители в блоке
+# `===CHANGES===` (см. `_QUOTE_CHARS` в `Сервер/local/main.py`). Если
+# пара «неправильно → правильно» сама содержит любой из этих символов,
+# то few-shot assistant-сообщение получит вложенные кавычки вида
+# `«текст с «внутренней» кавычкой»`, и серверный регэксп
+# `_CHANGE_PAIR_RE` обрежет цитату до первой внутренней кавычки. Модель,
+# обученная по этим примерам, воспроизведёт паттерн → `_drop_changes_not_in_text`
+# не найдёт цитату в `raw_text` и молча выкинет валидную правку. Такие пары
+# исключаются из банка на этапе загрузки (см. load_jsonl).
+_OUTER_QUOTE_CHARS = "«»\"\u201c\u201d\u2018\u2019\u201a\u201b\u201e"
+
 
 @dataclass
 class GecPair:
@@ -88,7 +99,13 @@ class GecBank:
         """Загружает пары из одного или нескольких JSONL-файлов.
 
         Поля `wrong` и `right` обязательны; отсутствующие строки
-        игнорируются с warning'ом. Возвращает число успешно загруженных пар.
+        игнорируются с warning'ом. Пары, содержащие в `wrong` или `right`
+        любой из `_OUTER_QUOTE_CHARS`, пропускаются и счётчик таких
+        skipped-пар логируется — они создают вложенные кавычки в
+        few-shot CHANGES и ломают `_CHANGE_PAIR_RE` на стороне сервера
+        (`_drop_changes_not_in_text` молча выкидывает валидные правки).
+
+        Возвращает число успешно загруженных пар.
         """
         loaded = 0
         for p_raw in paths:
@@ -96,6 +113,7 @@ class GecBank:
             if not p.exists():
                 _log.warning("GEC bank файл не найден: %s", p)
                 continue
+            skipped_nested = 0
             with p.open("r", encoding="utf-8") as f:
                 for lineno, raw_line in enumerate(f, 1):
                     line = raw_line.strip()
@@ -110,6 +128,9 @@ class GecBank:
                     right = (data.get("right") or "").strip()
                     if not wrong or not right or wrong == right:
                         continue
+                    if any(c in wrong or c in right for c in _OUTER_QUOTE_CHARS):
+                        skipped_nested += 1
+                        continue
                     self._entries.append(_Indexed(pair=GecPair(
                         wrong=wrong,
                         right=right,
@@ -118,6 +139,11 @@ class GecBank:
                         section=(data.get("section") or "").strip(),
                     )))
                     loaded += 1
+            if skipped_nested:
+                _log.info(
+                    "GEC bank: %s — пропущено %d пар с вложенными кавычками "
+                    "(защита от обрезки _CHANGE_PAIR_RE)", p, skipped_nested,
+                )
             _log.info("GEC bank: загружен %s (всего пар: %d)", p, len(self._entries))
         return loaded
 
