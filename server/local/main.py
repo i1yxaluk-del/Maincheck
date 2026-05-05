@@ -95,6 +95,10 @@ GEC_BANK_FILES = [
     if s.strip()
 ]
 GEC_TOP_K = int(os.getenv("GEC_TOP_K", "3"))
+# Эмбеддер для GEC-банка. По умолчанию переиспользует RAG_EMBED_MODEL,
+# но можно задать отдельно (например, RAG=nomic-embed-text для документов
+# и GEC=bge-m3 для коротких пар правок).
+GEC_EMBED_MODEL = os.getenv("GEC_EMBED_MODEL", RAG_EMBED_MODEL)
 
 logger = setup_logger("ai_suggester.local")
 audit = AuditStore()
@@ -122,22 +126,24 @@ if USE_FEW_SHOT:
         from shared.gec_bank import GecBank  # noqa: E402
         from shared.rag_store import HashingEmbedder, OllamaEmbedder  # noqa: E402
 
-        # Переиспользуем RAG-эмбеддер, если он уже инициализирован (экономим RAM
-        # и сетевые hops). Иначе создаём собственный Ollama-эмбеддер на той же
-        # модели nomic-embed-text. Если Ollama недоступен — HashingEmbedder как
-        # резерв (лексическое пересечение вместо семантического, качество ниже,
+        # Переиспользуем RAG-эмбеддер, только если у GEC и RAG **одинаковая
+        # модель** (экономим RAM и сетевые hops). Иначе нужен отдельный
+        # Ollama-эмбеддер: GEC_EMBED_MODEL может отличаться от RAG_EMBED_MODEL,
+        # например, RAG=nomic-embed-text для документов + GEC=bge-m3 для пар
+        # правок. Если Ollama недоступен — HashingEmbedder как резерв
+        # (лексическое пересечение вместо семантического, качество ниже,
         # но не ломается).
-        if _rag_embedder is not None:
+        if _rag_embedder is not None and GEC_EMBED_MODEL == RAG_EMBED_MODEL:
             _gec_embedder = _rag_embedder
         else:
             try:
-                _gec_embedder = OllamaEmbedder(model=RAG_EMBED_MODEL, base_url=OLLAMA_URL)
+                _gec_embedder = OllamaEmbedder(model=GEC_EMBED_MODEL, base_url=OLLAMA_URL)
                 # Проверка доступности: делаем probe-эмбеддинг
                 _ = _gec_embedder.embed(["probe"])
             except Exception as exc:
                 logger.warning(
                     "Ollama-эмбеддер (%s) недоступен (%s), переключаюсь на HashingEmbedder",
-                    RAG_EMBED_MODEL, exc,
+                    GEC_EMBED_MODEL, exc,
                 )
                 _gec_embedder = HashingEmbedder(dim=1024)
         _gec_bank = GecBank(_gec_embedder)
@@ -599,6 +605,9 @@ async def metrics(hours: int = 24):
         "few_shot_enabled": _gec_bank is not None,
         "few_shot_pairs": len(_gec_bank) if _gec_bank else 0,
         "few_shot_top_k": GEC_TOP_K if _gec_bank else 0,
+        "few_shot_embedder": (
+            _gec_bank.embedder.name if _gec_bank is not None else None
+        ),
         "audit": audit.stats(hours=hours),
     })
 
