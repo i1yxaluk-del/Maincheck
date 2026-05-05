@@ -347,3 +347,164 @@ def test_extended_bank_file_is_valid() -> None:
     assert len(hits) == 3
     for _, pair in hits:
         assert pair.wrong and pair.right and pair.wrong != pair.right
+
+
+# ─── v1.6.7: BM25 + hybrid retrieval ──────────────────────────────
+
+
+def test_tokenize_ru_basic() -> None:
+    """Токенизатор BM25: lower, ё→е, отбрасывает пунктуацию."""
+    from shared.gec_bank import _tokenize_ru
+
+    tokens = _tokenize_ru("Стоимостей выполненной работ, путём!")
+    assert tokens == ["стоимостей", "выполненной", "работ", "путем"]
+    # «Запятая, точка. — Тире» — пунктуация и тире не выживают
+    assert _tokenize_ru("«Запятая, точка. — Тире»") == ["запятая", "точка", "тире"]
+    # ё → е
+    assert _tokenize_ru("Проведённый") == _tokenize_ru("Проведенный")
+
+
+def test_bm25_index_score_known_doc() -> None:
+    """BM25 должен поднимать документ с запрошенными редкими токенами."""
+    from shared.gec_bank import _BM25Index, _tokenize_ru
+
+    docs = [
+        _tokenize_ru("Стоимостей выполненной работ путём применения завышенных расценок"),
+        _tokenize_ru("Совершенно посторонний документ про административные процедуры"),
+        _tokenize_ru("Согласно приказа был утверждён план работы отдела"),
+    ]
+    idx = _BM25Index(docs)
+    # Запрос с редкими словоформами из dок 0 → он должен быть top-1
+    scores = idx.score(_tokenize_ru("Стоимостей выполненной работ"))
+    assert max(range(len(scores)), key=lambda i: scores[i]) == 0
+    assert scores[0] > scores[1]
+    assert scores[0] > scores[2]
+
+
+def test_bm25_index_unknown_term_does_not_crash() -> None:
+    """Запрос с термином, которого нет в словаре, не падает и не даёт скор."""
+    from shared.gec_bank import _BM25Index, _tokenize_ru
+
+    idx = _BM25Index([_tokenize_ru("привет мир")])
+    scores = idx.score(_tokenize_ru("незнакомое слово xyzabc"))
+    assert scores == [0.0]
+
+
+def test_bm25_index_empty_collection() -> None:
+    """Пустая коллекция: avgdl=0, score не падает, возвращает пусто."""
+    from shared.gec_bank import _BM25Index
+
+    idx = _BM25Index([])
+    assert idx.score(["foo"]) == []
+
+
+def test_search_sparse_returns_lexically_close(sample_bank_file: Path) -> None:
+    """search_sparse находит пару по точному совпадению словоформ,
+    минуя dense (где hashing-embedder может не сойтись)."""
+    bank = _make_bank(sample_bank_file)
+    # «согласно приказа» — пара из банка, ищем по тем же словоформам
+    hits = bank.search_sparse("Согласно приказа был утверждён план", top_k=2)
+    assert len(hits) >= 1
+    rules = [p.rule for _, p in hits]
+    assert "Падежное управление" in rules
+    # Скор > 0
+    assert all(s > 0.0 for s, _ in hits)
+
+
+def test_search_sparse_empty_when_no_overlap(sample_bank_file: Path) -> None:
+    """Если в запросе нет ни одного слова из банка — sparse возвращает пусто."""
+    bank = _make_bank(sample_bank_file)
+    hits = bank.search_sparse("zzz qqq xxx aaa", top_k=3)
+    assert hits == []
+
+
+def test_search_hybrid_combines_dense_and_sparse(sample_bank_file: Path) -> None:
+    """Hybrid (RRF dense + sparse) выдаёт пару, релевантную хотя бы одному
+    из сигналов."""
+    bank = _make_bank(sample_bank_file)
+    hits = bank.search_hybrid("Согласно распоряжения был выпущен приказ", top_k=2)
+    assert len(hits) == 2
+    # Все score > 0 (RRF никогда не даёт 0 для не-пустого пересечения)
+    assert all(s > 0.0 for s, _ in hits)
+    rules = [p.rule for _, p in hits]
+    # Лексический сигнал «приказа» / «согласно» однозначно тащит падежное
+    # управление в top-2.
+    assert "Падежное управление" in rules
+
+
+def test_search_hybrid_empty_bank() -> None:
+    """Hybrid на пустом банке — пустой список (не падает)."""
+    bank = GecBank(HashingEmbedder(dim=32))
+    assert bank.search_hybrid("любой запрос", top_k=5) == []
+
+
+def test_search_hybrid_falls_back_when_no_bm25(sample_bank_file: Path) -> None:
+    """Если BM25-индекс не построен (например, build_bm25_index не вызывался),
+    hybrid не падает и возвращает результаты по dense."""
+    bank = GecBank(HashingEmbedder(dim=64))
+    bank.load_jsonl(sample_bank_file)
+    bank.build_index()
+    # Принудительно сбрасываем BM25 — имитируем старый кэш без sparse.
+    bank._bm25 = None
+    hits = bank.search_hybrid("Согласно распоряжения", top_k=2)
+    # Возвращает то же, что dense — без падений.
+    assert len(hits) == 2
+    assert all(s > 0.0 for s, _ in hits)
+
+
+def test_search_hybrid_outperforms_dense_on_long_admin_text() -> None:
+    """Регрессионный тест на проблему v1.6.6 → v1.6.7:
+
+    На длинном административном тексте dense (hashing surrogate)
+    «размывается» предметной лексикой и уводит ранжирование от
+    реальной грамматической ошибки. BM25 ловит редкие словоформы
+    напрямую. Hybrid должен быть как минимум не хуже dense (то есть
+    релевантная пара должна быть в top-3).
+
+    Здесь воспроизводим симптом на крошечной коллекции, чтобы тест
+    был детерминированным и быстрым.
+    """
+    pairs = [
+        # Пара, которая ДОЛЖНА быть найдена: содержит «выполненной»
+        GecPair(
+            wrong="Стоимостей выполненной работ",
+            right="Стоимости выполненных работ",
+            rule="Согласование числа существительного и причастия",
+        ),
+        # Шум: про административный домен, но без грамматических совпадений
+        GecPair(
+            wrong="Государственный контракт КС-2 на сумму более 300 тыс рублей",
+            right="Государственный контракт КС-2 на сумму более 300 тыс. рублей",
+            rule="Сокращение",
+        ),
+        GecPair(
+            wrong="Подписан акт освидетельствования скрытых работ задним числом",
+            right="Подписан акт освидетельствования скрытых работ «задним числом»",
+            rule="Кавычки при выражении",
+        ),
+    ]
+    bank = GecBank(HashingEmbedder(dim=64))
+    bank._entries = [
+        __import__("shared.gec_bank", fromlist=["_Indexed"])._Indexed(
+            pair=p, vec=[], norm=1.0,
+        )
+        for p in pairs
+    ]
+    bank.build_index()
+    query = (
+        "Установлены факты необоснованного завышения стоимостей выполненной "
+        "работ, путём применения завышенных расценок"
+    )
+    hits = bank.search_hybrid(query, top_k=3)
+    rules = [p.rule for _, p in hits]
+    # Целевая пара должна быть в top-1 (BM25 ловит «стоимостей» и «выполненной»).
+    assert rules[0] == "Согласование числа существительного и причастия", (
+        f"hybrid не вытащил релевантную пару в top-1: {rules}"
+    )
+
+
+def test_metrics_exposes_bm25_terms(sample_bank_file: Path) -> None:
+    """stats() после build_index содержит число BM25-терминов > 0."""
+    bank = _make_bank(sample_bank_file)
+    s = bank.stats()
+    assert s.get("bm25_terms", 0) > 0

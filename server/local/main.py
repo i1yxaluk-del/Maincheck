@@ -99,6 +99,17 @@ GEC_TOP_K = int(os.getenv("GEC_TOP_K", "3"))
 # но можно задать отдельно (например, RAG=nomic-embed-text для документов
 # и GEC=bge-m3 для коротких пар правок).
 GEC_EMBED_MODEL = os.getenv("GEC_EMBED_MODEL", RAG_EMBED_MODEL)
+# Стратегия retrieval (v1.6.7):
+#   hybrid — RRF dense (cosine) + sparse (BM25). Дефолт. Лучше на длинных
+#            входах: dense размывает грамматический сигнал предметной
+#            лексикой, BM25 ловит точные словоформы (Sorokin & Nasyrova
+#            BEA 2025).
+#   dense  — pure cosine, поведение v1.6.6 (откат, если hybrid вдруг хуже).
+#   sparse — pure BM25, для ablation-тестов.
+GEC_RETRIEVAL_MODE = os.getenv("GEC_RETRIEVAL_MODE", "hybrid").strip().lower()
+if GEC_RETRIEVAL_MODE not in ("hybrid", "dense", "sparse"):
+    # Не падаем, мягко даунгрейдим до hybrid.
+    GEC_RETRIEVAL_MODE = "hybrid"
 
 logger = setup_logger("ai_suggester.local")
 audit = AuditStore()
@@ -159,8 +170,8 @@ if USE_FEW_SHOT:
             _cache_path = Path(_resolved_paths[0]).with_suffix(".index.pkl")
             _gec_bank.build_index(cache_path=_cache_path)
             logger.info(
-                "Few-shot retrieval включён: %d пар, top_k=%d, embedder=%s",
-                n, GEC_TOP_K, _gec_embedder.name,
+                "Few-shot retrieval включён: %d пар, top_k=%d, embedder=%s, mode=%s",
+                n, GEC_TOP_K, _gec_embedder.name, GEC_RETRIEVAL_MODE,
             )
     except Exception as e:
         logger.warning("Few-shot retrieval не удалось инициализировать: %s", e)
@@ -172,14 +183,24 @@ SYSTEM_PROMPT = """Ты — корректор русского языка дл�
 ИСПРАВЛЯЙ ТОЛЬКО ЯВНЫЕ ОШИБКИ:
 • орфография — опечатки, удвоение/пропуск букв, слитное/раздельное написание;
 • управление — «согласно приказу» (не «согласно приказа»), «благодаря решению»;
-• согласование — однородные члены в одном падеже и числе с главным словом;
+• согласование — однородные члены и причастные обороты в одном роде, числе и падеже с главным словом («стоимости выполненных работ», не «стоимостей выполненной работ»; «работ, не предусмотренных условиями», не «не предусмотренной условиями»);
 • пунктуация — запятые при однородных членах, обособленных оборотах, придаточных.
+
+ОСОБОЕ ВНИМАНИЕ к типичным паттернам ошибок согласования (часто пропускаются):
+• число существительного и зависимого прилагательного/причастия («стоимости выполненных» — оба в род.п., мн.ч.; не смешивать «стоимостей выполненной»);
+• причастный оборот после существительного — род/число/падеж по антецеденту, даже если существительное стоит за несколько слов («актов, …, не предусмотренных» — мн.ч. от «актов», не «не предусмотренной»);
+• «должностного лица» (ед.ч.) vs «должностных лиц» (мн.ч.) — выбирай по контексту, не путай окончания.
 
 НЕ ТРОГАЙ:
 • аббревиатуры и сокращения (п/п, вх.№, исх.№, ФСБ, МВД);
 • ведомственные термины и профессиональные обороты;
-• правильно написанный текст («улучшать стиль» нельзя);
-• структуру и смысл предложений.
+• правильно написанный текст («улучшать стиль» НЕЛЬЗЯ);
+• структуру и смысл предложений;
+• е/ё взаимозаменяемы — НЕ заменяй «проведенными»→«проведёнными», «повлекших»→«повлёкших» и подобное; это стилистика, не ошибка;
+• падеж и число корректного слова — если слово грамматически верно, не «улучшай» его («Подразделения» в ген.п. ≠ «Подразделению» в дат.п. — не переписывай, если форма уже правильна);
+• синонимы и перефразировки.
+
+ПРИНЦИП: лучше ПРОПУСТИТЬ ошибку, чем СОЧИНИТЬ правку. Если сомневаешься, что фрагмент ошибочен — оставь как есть.
 
 ФОРМАТ ОТВЕТА (строго, без какого-либо текста до или после):
 ===CORRECTED===
@@ -616,6 +637,12 @@ async def metrics(hours: int = 24):
         "few_shot_embedder": (
             _gec_bank.embedder.name if _gec_bank is not None else None
         ),
+        "few_shot_retrieval_mode": (
+            GEC_RETRIEVAL_MODE if _gec_bank is not None else None
+        ),
+        "few_shot_bm25_terms": (
+            _gec_bank.stats().get("bm25_terms", 0) if _gec_bank is not None else 0
+        ),
         "audit": audit.stats(hours=hours),
     })
 
@@ -643,11 +670,17 @@ async def suggest(
     few_shot_examples: list = []
     if _gec_bank is not None:
         try:
-            hits = _gec_bank.search(raw_text, top_k=GEC_TOP_K)
+            if GEC_RETRIEVAL_MODE == "sparse":
+                hits = _gec_bank.search_sparse(raw_text, top_k=GEC_TOP_K)
+            elif GEC_RETRIEVAL_MODE == "dense":
+                hits = _gec_bank.search(raw_text, top_k=GEC_TOP_K)
+            else:  # hybrid (default)
+                hits = _gec_bank.search_hybrid(raw_text, top_k=GEC_TOP_K)
             few_shot_examples = [pair for score, pair in hits]
             if few_shot_examples:
                 logger.info(
-                    "Few-shot: подмешиваю %d пар: %s",
+                    "Few-shot (%s): подмешиваю %d пар: %s",
+                    GEC_RETRIEVAL_MODE,
                     len(few_shot_examples),
                     [p.rule or p.wrong[:40] for p in few_shot_examples],
                 )
