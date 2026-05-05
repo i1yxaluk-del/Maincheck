@@ -509,6 +509,167 @@ def test_undo_eyo_in_corrected_block_safe_on_malformed(local_module):
     assert f("===CORRECTED=== без CHANGES", "raw") == "===CORRECTED=== без CHANGES"
 
 
+# ─── v1.6.10: warmup с реалистичным num_ctx + temperature=0 ──────
+
+
+class _CapturingFakeHttpxClient:
+    """Минимальный мок httpx.AsyncClient для тестов v1.6.10. Захватывает
+    payload последнего POST и возвращает фиксированный успешный ответ.
+    Используется как drop-in замена `httpx.AsyncClient` в тестах warmup
+    и call_ollama, чтобы можно было проверить структуру JSON-payload без
+    реального обращения к Ollama."""
+
+    captured: dict = {}
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def post(self, url, json=None, **kwargs):
+        type(self).captured = {"url": url, "json": json}
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "message": {
+                        "content": (
+                            "===CORRECTED===\nок\n"
+                            "===CHANGES===\n1. Ошибок нет.\n===END==="
+                        )
+                    }
+                }
+
+        return _Resp()
+
+
+def test_local_warmup_uses_full_num_ctx(local_module, monkeypatch):
+    """v1.6.10: прогрев должен использовать тот же `num_ctx`, что и реальные
+    запросы (`OLLAMA_NUM_CTX`). Иначе Ollama при первом реальном запросе
+    переаллоцирует kv-cache (раньше: warmup `num_ctx=512` → реальный
+    `num_ctx=2048-4096` = +15-25 с cold-старта).
+
+    Регрессионный тест на v1.6.8 prod-инцидент (5 мая 2026, КС-2):
+    cold=100с, warm=79с — 21с разницы списать только на kv-cache resize."""
+    import asyncio
+
+    _CapturingFakeHttpxClient.captured = {}
+    monkeypatch.setattr(local_module.httpx, "AsyncClient", _CapturingFakeHttpxClient)
+
+    asyncio.run(local_module._warmup_ollama())
+
+    payload = _CapturingFakeHttpxClient.captured.get("json", {})
+    assert _CapturingFakeHttpxClient.captured.get("url", "").endswith("/api/chat")
+    options = payload.get("options", {})
+    assert options.get("num_ctx") == local_module.OLLAMA_NUM_CTX, (
+        f"v1.6.10: warmup должен слать num_ctx=OLLAMA_NUM_CTX="
+        f"{local_module.OLLAMA_NUM_CTX}, получено {options.get('num_ctx')}"
+    )
+
+
+def test_local_warmup_passes_temperature(local_module, monkeypatch):
+    """v1.6.10: прогрев передаёт `temperature` в Ollama-options. Без этого
+    Ollama использует свой дефолт (0.7-0.8), и при первом реальном запросе
+    с temperature=0 пересобирает sampling-state — небольшое, но добавляет
+    к cold-start latency."""
+    import asyncio
+
+    _CapturingFakeHttpxClient.captured = {}
+    monkeypatch.setattr(local_module.httpx, "AsyncClient", _CapturingFakeHttpxClient)
+
+    asyncio.run(local_module._warmup_ollama())
+
+    options = _CapturingFakeHttpxClient.captured.get("json", {}).get("options", {})
+    assert "temperature" in options, "Прогрев должен явно передавать temperature"
+    assert options["temperature"] == local_module.OLLAMA_TEMPERATURE, (
+        f"v1.6.10: warmup-temperature должен совпадать с OLLAMA_TEMPERATURE="
+        f"{local_module.OLLAMA_TEMPERATURE}"
+    )
+
+
+def test_local_warmup_uses_realistic_prompt(local_module, monkeypatch):
+    """v1.6.10: прогрев слать промпт реалистичной длины (>=500 chars),
+    чтобы Ollama скомпилировала attention pattern и токенизатор именно
+    под русский текст. До v1.6.10 был промпт «ok» (4 chars) — это
+    прогревало weights, но не decode-loop."""
+    import asyncio
+
+    _CapturingFakeHttpxClient.captured = {}
+    monkeypatch.setattr(local_module.httpx, "AsyncClient", _CapturingFakeHttpxClient)
+
+    asyncio.run(local_module._warmup_ollama())
+
+    messages = _CapturingFakeHttpxClient.captured.get("json", {}).get("messages", [])
+    assert messages, "Прогрев должен слать messages"
+    user_msg = messages[-1]["content"]
+    assert len(user_msg) >= 500, (
+        f"v1.6.10: warmup-промпт слишком короткий ({len(user_msg)} chars), "
+        f"должен быть ≥500 для прогрева decode-пути"
+    )
+
+
+def test_local_warmup_skipped_when_disabled(local_module, monkeypatch):
+    """OLLAMA_WARMUP=false: прогрев не должен делать HTTP-запросов."""
+    import asyncio
+
+    _CapturingFakeHttpxClient.captured = {}
+    monkeypatch.setattr(local_module, "OLLAMA_WARMUP", False)
+    monkeypatch.setattr(local_module.httpx, "AsyncClient", _CapturingFakeHttpxClient)
+
+    asyncio.run(local_module._warmup_ollama())
+
+    assert _CapturingFakeHttpxClient.captured == {}, (
+        "При OLLAMA_WARMUP=false прогрев не должен открывать httpx-сессию"
+    )
+
+
+def test_local_call_ollama_default_temperature_zero(local_module, monkeypatch):
+    """v1.6.10: дефолтная temperature=0 для greedy/детерминированной
+    генерации. До v1.6.10 хардкодилось 0.1 — это давало малую, но
+    воспроизводимую вариативность ответа: одинаковый текст мог получить
+    разные CHANGES (в v1.6.8 ablation: run1=1 пункт detailed,
+    run2=3 пункта diff-reconstruction). Это маскировало регрессии в QA."""
+    import asyncio
+
+    _CapturingFakeHttpxClient.captured = {}
+    monkeypatch.setattr(local_module.httpx, "AsyncClient", _CapturingFakeHttpxClient)
+
+    asyncio.run(
+        local_module.call_ollama([{"role": "user", "content": "тестовый запрос"}])
+    )
+
+    options = _CapturingFakeHttpxClient.captured.get("json", {}).get("options", {})
+    assert options.get("temperature") == 0.0, (
+        f"v1.6.10: дефолтная temperature должна быть 0 (greedy), "
+        f"получено {options.get('temperature')}"
+    )
+
+
+def test_local_call_ollama_respects_temperature_override(local_module, monkeypatch):
+    """OLLAMA_TEMPERATURE можно переопределить (например, для exploration
+    в исследовательских прогонах). Проверяем, что значение пробрасывается
+    в Ollama-options без модификации."""
+    import asyncio
+
+    _CapturingFakeHttpxClient.captured = {}
+    monkeypatch.setattr(local_module, "OLLAMA_TEMPERATURE", 0.35)
+    monkeypatch.setattr(local_module.httpx, "AsyncClient", _CapturingFakeHttpxClient)
+
+    asyncio.run(
+        local_module.call_ollama([{"role": "user", "content": "тестовый запрос"}])
+    )
+
+    options = _CapturingFakeHttpxClient.captured.get("json", {}).get("options", {})
+    assert options.get("temperature") == 0.35
+
+
 def test_local_rebuild_changes_from_diff_punctuation(local_module):
     """Если модель добавила запятые в CORRECTED, но не отрапортовала —
     сервер должен сгенерировать пункты CHANGES из diff. Реальный кейс

@@ -78,6 +78,15 @@ OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 # Отключает «thinking-режим» qwen3 (Ollama ≥ 0.9). Без этого модель пишет
 # многоминутный <think>…</think> перед ответом — для правки текста это лишнее.
 OLLAMA_THINK = os.getenv("OLLAMA_THINK", "false").lower() in ("1", "true", "yes", "on")
+# Температура сэмплинга. По умолчанию 0 — greedy decoding, полностью
+# детерминирован. До v1.6.10 хардкодилось 0.1, что давало малую, но
+# воспроизводимую вариативность ответа между запусками: одинаковый текст
+# мог получить разные CHANGES (в v1.6.8 ablation: run1=1 пункт detailed,
+# run2=3 пункта diff-reconstruction). Это маскировало регрессии в QA и
+# мешало диагностике. 0 — рекомендуется для GEC, где «верный» ответ
+# единственен. Поднимите до 0.1-0.3 если нужна разнообразная генерация
+# (например, для exploration в исследовании).
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
 
 # RAG
 RAG_ENABLED = os.getenv("RAG_ENABLED", "false").lower() in ("1", "true", "yes", "on")
@@ -221,31 +230,60 @@ app = FastAPI(title="AI LibreOffice Suggester — Local", version="1.6.0")
 @app.on_event("startup")
 async def _warmup_ollama():
     """Грузим модель в RAM при старте сервера, чтобы первый запрос
-    пользователя не ждал 30–90 с на загрузку весов 30B-модели.
+    пользователя не ждал 30–90 с на загрузку весов 8B-модели.
 
-    Делает один минимальный chat-запрос с keep_alive — Ollama после
-    этого держит модель загруженной OLLAMA_KEEP_ALIVE минут.
+    Делает один chat-запрос с **тем же `num_ctx`, что в проде** — Ollama
+    при этом аллоцирует kv-cache нужного размера. Без этого первый
+    реальный запрос с длинным промптом вызывал переаллокацию kv-cache
+    (warmup делал 512, реальный запрос требовал 2048-4096) и cold-старт
+    рос до 100 с при warm 79 с (см. v1.6.8 ablation в ЖУРНАЛ_v1.6.md).
+
+    Дополнительно прогреваем decode-путь (`num_predict=8`), чтобы Ollama
+    скомпилировала ядра BLAS и токенизатор именно под русскую раскладку,
+    а не под "ok" из v1.6.x ≤ 1.6.9.
     """
     if not OLLAMA_WARMUP:
         return
-    logger.info("Прогрев модели %s через Ollama (timeout=%.0fs)…",
-                MODEL_NAME, OLLAMA_WARMUP_TIMEOUT)
+    logger.info(
+        "Прогрев модели %s через Ollama (num_ctx=%d, timeout=%.0fs)…",
+        MODEL_NAME, OLLAMA_NUM_CTX, OLLAMA_WARMUP_TIMEOUT,
+    )
+    # Реалистичный по длине dummy-промпт (~600 токенов на T-lite) —
+    # достаточно, чтобы kv-cache аллоцировался на полный OLLAMA_NUM_CTX,
+    # но не настолько, чтобы старт занял минуту. Текст подобран
+    # специально как «нечего исправлять» — модель не должна тратить
+    # время на длинную генерацию правок.
+    warmup_payload = (
+        "Контрольный прогон системы при старте сервера. "
+        "Этот текст не содержит ошибок и используется только "
+        "для предварительной аллокации kv-cache в Ollama, "
+        "чтобы первый пользовательский запрос не ждал переинициализации "
+        "контекста. Никаких действий по этому тексту выполнять не нужно."
+    ) * 6
     try:
         async with httpx.AsyncClient(timeout=OLLAMA_WARMUP_TIMEOUT) as c:
             r = await c.post(
                 f"{OLLAMA_URL}/api/chat",
                 json={
                     "model": MODEL_NAME,
-                    "messages": [{"role": "user", "content": "ok\n\n/no_think"}],
+                    "messages": [{"role": "user", "content": warmup_payload + "\n\n/no_think"}],
                     "stream": False,
                     "think": False,
                     "keep_alive": OLLAMA_KEEP_ALIVE,
-                    "options": {"num_ctx": 512, "num_thread": NUM_THREADS},
+                    "options": {
+                        "num_ctx": OLLAMA_NUM_CTX,
+                        "num_predict": 8,
+                        "num_thread": NUM_THREADS,
+                        "temperature": OLLAMA_TEMPERATURE,
+                    },
                 },
             )
             r.raise_for_status()
-        logger.info("Прогрев OK: модель загружена в RAM, keep_alive=%s",
-                    OLLAMA_KEEP_ALIVE)
+        logger.info(
+            "Прогрев OK: модель загружена, kv-cache аллоцирован на num_ctx=%d, "
+            "keep_alive=%s",
+            OLLAMA_NUM_CTX, OLLAMA_KEEP_ALIVE,
+        )
     except Exception as e:
         logger.warning("Прогрев модели не удался (%s) — первый запрос будет медленнее", e)
 
@@ -716,7 +754,12 @@ async def call_ollama(messages: list) -> str:
         "think": OLLAMA_THINK,  # для Ollama ≥ 0.9; старые игнорируют поле
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
-            "temperature": 0.1,
+            # v1.6.10: дефолт 0 (greedy) — детерминированный вывод между
+            # одинаковыми запросами. До v1.6.10 хардкодилось 0.1; ablation
+            # v1.6.8 (run1 vs run2 на КС-2) показал, что даже 0.1 даёт
+            # разные CHANGES для одного текста — это маскирует регрессии
+            # и мешает диагностике.
+            "temperature": OLLAMA_TEMPERATURE,
             "num_ctx": OLLAMA_NUM_CTX,
             "num_predict": OLLAMA_NUM_PREDICT,
             "num_thread": NUM_THREADS,
