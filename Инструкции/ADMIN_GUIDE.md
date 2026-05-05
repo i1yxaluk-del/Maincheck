@@ -108,7 +108,8 @@ cd Клиент/AI_Suggester && zip -r ../AI_Suggester.oxt . -x "*.DS_Store" && 
 curl -fsSL https://ollama.com/install.sh | sh
 sudo systemctl enable --now ollama
 ollama pull t-tech/T-lite-it-2.1:q4_K_M
-ollama pull nomic-embed-text    # нужен для RAG
+ollama pull bge-m3              # дефолтный эмбеддер для GEC-банка (~600 МБ, v1.6.6+)
+ollama pull nomic-embed-text    # fallback / эмбеддер для RAG-документов
 
 # AI Suggester (из корня репо)
 cd server/local
