@@ -285,6 +285,131 @@ def test_local_passes_through_when_raw_text_empty(local_module):
     assert "«X» → «Y»" in out
 
 
+# ─── v1.6.8: фильтр стилистических ё-замен ──────────────────────
+
+
+def test_is_eyo_only_substitution_basic(local_module):
+    """Чисто ё↔е подмены распознаются как стилистика."""
+    f = local_module._is_eyo_only_substitution
+    assert f("проведенными", "проведёнными") is True
+    assert f("проведёнными", "проведенными") is True
+    assert f("повлекших", "повлёкших") is True
+    assert f("Тёркин", "Теркин") is True  # с большой буквы тоже
+    # Реальные правки НЕ распознаются как стилистика
+    assert f("стоимостей", "стоимости") is False  # число
+    assert f("выполненной", "выполненных") is False  # причастие
+    assert f("Подразделения", "Подразделению") is False  # падеж
+    # Пустые строки и совпадение
+    assert f("", "проведёнными") is False
+    assert f("проведенными", "") is False
+    assert f("проведенными", "проведенными") is False
+
+
+def test_drop_eyo_substitutions_filters_changes_and_undoes_corrected(local_module):
+    """Пункт «проведенными → проведёнными» — стилистика. Сервер должен:
+    1) убрать пункт из ===CHANGES===,
+    2) откатить замену в ===CORRECTED=== (вернуть «проведенными»).
+    """
+    raw_text = (
+        "Проведенными мероприятиями установлены факты, повлекших риски."
+    )
+    response = (
+        "===CORRECTED===\n"
+        "Проведёнными мероприятиями установлены факты, повлёкших риски.\n"
+        "===CHANGES===\n"
+        "1. «Проведенными» → «Проведёнными» | е/ё в причастии\n"
+        "2. «повлекших» → «повлёкших» | е/ё в причастии\n"
+        "===END==="
+    )
+    out = local_module._drop_eyo_substitutions(response, raw_text)
+    # CORRECTED откатан к исходному написанию
+    assert "Проведенными" in out
+    assert "Проведёнными" not in out
+    assert "повлекших" in out
+    assert "повлёкших" not in out
+    # Оба пункта-стилистики удалены
+    assert "1. «Проведенными»" not in out
+    assert "2. «повлекших»" not in out
+    # Так как все пункты были стилистикой — подставлена заглушка
+    assert "Ошибок не найдено" in out
+
+
+def test_drop_eyo_substitutions_keeps_real_changes(local_module):
+    """Реальные правки (число, падеж, причастие) НЕ должны фильтроваться."""
+    raw_text = "стоимостей выполненной работ путём применения"
+    response = (
+        "===CORRECTED===\n"
+        "стоимости выполненных работ путём применения\n"
+        "===CHANGES===\n"
+        "1. «стоимостей» → «стоимости» | число существительного\n"
+        "2. «выполненной» → «выполненных» | согласование причастия\n"
+        "===END==="
+    )
+    out = local_module._drop_eyo_substitutions(response, raw_text)
+    # Обе правки сохранены — это не ё-замены
+    assert "«стоимостей» → «стоимости»" in out
+    assert "«выполненной» → «выполненных»" in out
+    # CORRECTED не тронут
+    assert "стоимости выполненных работ" in out
+
+
+def test_drop_eyo_substitutions_mixed_eyo_and_real(local_module):
+    """Смешанный случай: одна ё-замена + одна реальная правка.
+    Стилистическая дропается, реальная остаётся."""
+    raw_text = "Проведенными мероприятиями выявлены стоимостей выполненной работ."
+    response = (
+        "===CORRECTED===\n"
+        "Проведёнными мероприятиями выявлены стоимости выполненных работ.\n"
+        "===CHANGES===\n"
+        "1. «Проведенными» → «Проведёнными» | е/ё\n"
+        "2. «стоимостей выполненной» → «стоимости выполненных» | согласование\n"
+        "===END==="
+    )
+    out = local_module._drop_eyo_substitutions(response, raw_text)
+    # ё-замена удалена и откатана в CORRECTED
+    assert "Проведенными" in out
+    assert "Проведёнными" not in out
+    assert "1. «Проведенными»" not in out
+    # Реальная правка осталась
+    assert "«стоимостей выполненной» → «стоимости выполненных»" in out
+    # CORRECTED содержит и откат ё, и реальную правку
+    assert "Проведенными мероприятиями выявлены стоимости выполненных работ" in out
+
+
+def test_drop_eyo_substitutions_no_op_when_no_eyo(local_module):
+    """Если ё-замен нет — функция возвращает текст без изменений (короткий путь)."""
+    raw_text = "стоимостей выполненной работ"
+    response = (
+        "===CORRECTED===\n"
+        "стоимости выполненных работ\n"
+        "===CHANGES===\n"
+        "1. «стоимостей» → «стоимости» | число\n"
+        "===END==="
+    )
+    out = local_module._drop_eyo_substitutions(response, raw_text)
+    assert out == response  # идентично — никаких изменений
+
+
+def test_drop_eyo_substitutions_safe_on_empty_raw(local_module):
+    """На пустом raw_text функция не падает и ничего не меняет."""
+    response = (
+        "===CORRECTED===\n"
+        "текст\n"
+        "===CHANGES===\n"
+        "1. «проведенными» → «проведёнными» | е/ё\n"
+        "===END==="
+    )
+    out = local_module._drop_eyo_substitutions(response, "")
+    assert out == response
+
+
+def test_drop_eyo_substitutions_safe_on_malformed_response(local_module):
+    """Если в ответе нет CORRECTED/CHANGES/END — функция не падает."""
+    f = local_module._drop_eyo_substitutions
+    assert f("просто текст", "raw") == "просто текст"
+    assert f("===CORRECTED=== без секций", "raw") == "===CORRECTED=== без секций"
+
+
 def test_local_rebuild_changes_from_diff_punctuation(local_module):
     """Если модель добавила запятые в CORRECTED, но не отрапортовала —
     сервер должен сгенерировать пункты CHANGES из diff. Реальный кейс
