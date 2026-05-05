@@ -31,6 +31,9 @@ rag_cache/
 # GEC bank index cache (переиндексируется на старте при отсутствии)
 *.index.pkl
 
+# Большие исходники open-source GEC-корпусов; build.py подсказывает откуда скачать
+tools/build_gec_bank/sources/
+
 # OS / editor
 .DS_Store
 Thumbs.db

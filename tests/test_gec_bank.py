@@ -328,3 +328,22 @@ def test_seed_bank_file_is_valid() -> None:
         assert pair.wrong
         assert pair.right
         assert pair.wrong != pair.right
+
+
+def test_extended_bank_file_is_valid() -> None:
+    """Расширенный банк (LORuGEC full, v1.6.2) тоже парсится и индексируется."""
+    here = Path(__file__).resolve().parent
+    seed = here.parent / "server" / "shared" / "gec_seed" / "gec_bank.jsonl"
+    extended = here.parent / "server" / "shared" / "gec_seed" / "gec_bank_extended.jsonl"
+    assert extended.exists(), f"расширенный банк отсутствует: {extended}"
+    bank = GecBank(HashingEmbedder(dim=64))
+    # Имитируем прод-конфиг: подгружаем оба файла из GEC_BANK_FILES.
+    n = bank.load_jsonl(seed, extended)
+    # Объединённый банк ≥ 800 пар (288 базовых + 639 LORuGEC ≈ 927).
+    assert n >= 800, f"объединённый банк слишком маленький: {n} пар"
+    bank.build_index()
+    # Должны находить пары на любую разумную русскую фразу.
+    hits = bank.search("согласование числа в существительных", top_k=3)
+    assert len(hits) == 3
+    for _, pair in hits:
+        assert pair.wrong and pair.right and pair.wrong != pair.right

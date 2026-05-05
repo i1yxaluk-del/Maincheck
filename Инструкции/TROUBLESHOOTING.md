@@ -99,14 +99,20 @@ curl -X POST http://localhost:11434/api/generate \
 ollama rm t-tech/T-lite-it-2.1:q4_K_M
 ```
 
-**2. NUM_THREADS не пересекает NUMA-границу.**
+**2. NUM_THREADS не пересекает NUMA-границу (только bare-metal).**
 ```bash
 lscpu | grep NUMA
 ```
-Если у вас 2 NUMA-ноды (например, двухсокетный Xeon E5/Gold) —
+На **bare-metal-сервере** с 2 NUMA-нодами (например, двухсокетный Xeon E5/Gold) —
 **ставьте `NUM_THREADS=` ровно в число ядер одного сокета**, не суммарно.
 Пример: 2 × 16 ядер → `NUM_THREADS=16`. Cross-NUMA трафик в Ollama
 тормозит инференс в 2–3 раза.
+
+**На VMware/виртуалке — наоборот**: гипервизор сам мигрирует vCPU между
+нодами, а попытка зафиксировать поток в гостевой ОС вызывает 50-90×
+замедление. На VMware ставьте `NUM_THREADS=` суммарное число vCPU
+**минус 4** (запас на ОС). См. также пункт 4 — снимите `numactl`-bind
+в systemd-юните Ollama если он там есть.
 
 **3. Уменьшить `OLLAMA_NUM_CTX` и `OLLAMA_NUM_PREDICT`.**
 В `.env`:
@@ -116,15 +122,37 @@ OLLAMA_NUM_PREDICT=1024  # лимит на длину ответа
 ```
 На коротких текстах (<2 КБ) это даёт ~2× прирост без потери качества.
 
-**4. Привязать Ollama к одной NUMA-ноде через `numactl`.**
-В `/etc/systemd/system/ollama.service` (override через
-`sudo systemctl edit ollama`) добавить:
+**4. NUMA-binding в systemd-юните Ollama (только bare-metal, НЕ VMware).**
+
+> ⚠️ **Виртуалка (VMware/KVM)**: убедитесь, что в
+> `/etc/systemd/system/ollama.service.d/override.conf` **нет** строки с
+> `numactl --cpunodebind=…`. На виртуалках такая привязка вызывает
+> **50-90× замедление** инференса (eval rate падает с 5-10 до 0.07 tok/s),
+> потому что в гостевой ОС нумерация NUMA-нод не соответствует физической
+> топологии хоста, и поток упирается в постоянные cache-промахи и stalls
+> при миграции vCPU гипервизором. Канонический рабочий
+> override.conf для VMware:
+>
+> ```ini
+> [Service]
+> ExecStart=
+> ExecStart=/usr/local/bin/ollama serve
+> Environment="OLLAMA_KEEP_ALIVE=24h"
+> Environment="OLLAMA_NUM_PARALLEL=1"
+> ```
+> После правки: `sudo systemctl daemon-reload && sudo systemctl restart ollama`.
+> Проверка: `time ollama run --verbose <модель> "Привет"` — `eval rate`
+> должен быть ≥ 3 tok/s. Если 0.0x — проблема в numactl, снимите.
+
+**На bare-metal-сервере** с 2 физическими сокетами привязка к одной
+ноде даёт ~30-40% прирост:
 ```
 [Service]
 ExecStart=
 ExecStart=/usr/bin/numactl --cpunodebind=0 --membind=0 /usr/local/bin/ollama serve
 ```
-Дополнительно ~30–40% на двухсокетных серверах.
+Применяйте **только** если уверены, что хост — bare-metal и `lscpu` в гостевой
+ОС показывает реальную топологию (см. `dmidecode -t system` для проверки).
 
 **5. Перейти на модель другого размера.**
 - `t-tech/T-lite-it-2.1:q4_K_M` (~5 ГБ, дефолт v1.5 — как правило, уже у вас)
