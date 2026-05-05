@@ -19,6 +19,13 @@ CLI для управления RAG-хранилищем.
 
     # Проверить индекс запросом
     python -m shared.rag_cli search "согласно распоряжения"
+
+    # Предпросмотр очистки документа без индексации (dry-run) — удобно для
+    # инспекции свежего файла Гарант/Консультант перед массовой загрузкой
+    python -m shared.rag_cli preview ./docs/fz44.docx --head 2000
+
+    # Сводная статистика по индексу (общий размер, эмбеддер и т.д.)
+    python -m shared.rag_cli stats
 """
 from __future__ import annotations
 
@@ -28,7 +35,9 @@ import os
 import sys
 from pathlib import Path
 
-from . import rag_store as rs
+from collections import Counter
+
+from . import garant_cleanup, rag_store as rs
 
 
 def _make_embedder(args) -> rs.Embedder:
@@ -96,6 +105,70 @@ def cmd_search(args) -> int:
             print(f"[{h['score']:.3f}] {h['doc_id']}#chunk{h['chunk_id']}")
             print("    " + h["text"][:300].replace("\n", " ") + ("…" if len(h["text"]) > 300 else ""))
             print()
+    return 0
+
+
+def cmd_preview(args) -> int:
+    """Прогнать очистку и чанкинг документа БЕЗ индексации.
+
+    Полезно перед массовой загрузкой ведомственных документов из Гарант/
+    Консультант — позволяет увидеть, что останется после удаления служебной
+    разметки, как файл порежется на чанки, и нет ли подозрительных потерь.
+    """
+    path = Path(args.file)
+    if not path.exists():
+        print(f"Файл не найден: {path}", file=sys.stderr)
+        return 2
+    cleaned, stats = garant_cleanup.extract_and_clean(path)
+    chunks = list(garant_cleanup.chunk_text(
+        cleaned, chunk_chars=args.chunk_chars, overlap=args.overlap,
+    ))
+    summary = {
+        "file": str(path),
+        "cleanup": stats.as_dict(),
+        "text_len": len(cleaned),
+        "chunks": len(chunks),
+        "chunk_chars_target": args.chunk_chars,
+        "chunk_overlap": args.overlap,
+        "first_chunk_chars": len(chunks[0]) if chunks else 0,
+        "last_chunk_chars": len(chunks[-1]) if chunks else 0,
+    }
+    if args.json:
+        print(json.dumps(
+            {**summary, "head": cleaned[: args.head] if args.head else cleaned},
+            ensure_ascii=False, indent=2,
+        ))
+    else:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        if args.head:
+            print("\n── Превью очищенного текста ──")
+            print(cleaned[: args.head])
+            if len(cleaned) > args.head:
+                print(f"… (ещё {len(cleaned) - args.head} символов опущено)")
+    return 0
+
+
+def cmd_stats(args) -> int:
+    """Сводка по индексу без обращения к Ollama."""
+    store = rs.RagStore(args.store_dir)
+    if not store.docs:
+        print("Хранилище пусто.")
+        return 0
+    embedders = Counter(d.embedder for d in store.docs.values())
+    versions = Counter(d.version or "(без версии)" for d in store.docs.values())
+    summary = {
+        "store_dir": str(store.dir),
+        "documents": len(store.docs),
+        "chunks": len(store.entries),
+        "vec_dim": len(store.entries[0].vec) if store.entries else 0,
+        "embedders": dict(embedders),
+        "versions_top5": dict(versions.most_common(5)),
+        "text_chars_total": sum(d.text_len for d in store.docs.values()),
+    }
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -169,6 +242,22 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--chunk-chars", type=int, default=1200)
     f.add_argument("--overlap", type=int, default=150)
     f.set_defaults(func=cmd_ingest_folder)
+
+    pv = sub.add_parser(
+        "preview",
+        help="Dry-run очистки документа без индексации (для проверки Гарант/Консультант)",
+    )
+    pv.add_argument("file")
+    pv.add_argument("--chunk-chars", type=int, default=1200)
+    pv.add_argument("--overlap", type=int, default=150)
+    pv.add_argument("--head", type=int, default=2000,
+                    help="Сколько символов очищенного текста показать (0 — всё)")
+    pv.add_argument("--json", action="store_true")
+    pv.set_defaults(func=cmd_preview)
+
+    st = sub.add_parser("stats", help="Сводка по индексу")
+    st.add_argument("--json", action="store_true")
+    st.set_defaults(func=cmd_stats)
 
     return p
 

@@ -602,6 +602,14 @@ async def metrics(hours: int = 24):
         "model": MODEL_NAME,
         "rag_enabled": RAG_ENABLED,
         "rag_documents": len(_rag_store.docs) if _rag_store else 0,
+        "rag_chunks": len(_rag_store.entries) if _rag_store else 0,
+        "rag_doc_ids": (
+            sorted(_rag_store.docs.keys()) if _rag_store else []
+        ),
+        "rag_top_k": RAG_TOP_K if (RAG_ENABLED and _rag_store) else 0,
+        "rag_embedder": (
+            _rag_embedder.name if _rag_embedder is not None else None
+        ),
         "few_shot_enabled": _gec_bank is not None,
         "few_shot_pairs": len(_gec_bank) if _gec_bank else 0,
         "few_shot_top_k": GEC_TOP_K if _gec_bank else 0,

@@ -130,11 +130,20 @@ PYTHONPATH=server python -m shared.rag_cli ingest-folder ./data/docs
 1. Из клиента Гарант/КонсультантПлюс сохранить норматив в файл
    (правый клик → «Экспорт в Word / Печать в файл»).
 2. Положить файл в `data/docs/` (или любую другую папку).
-3. Выполнить:
+3. **(Опционально, рекомендуется для нового источника)** Запустить dry-run
+   очистки, чтобы убедиться, что ничего нужного не выкинуто и чанки
+   получились разумного размера:
+   ```bash
+   PYTHONPATH=server python -m shared.rag_cli preview data/docs/fz_44.docx --head 1500
+   ```
+   Команда не трогает индекс. Покажет, сколько строк/символов осталось после
+   удаления служебной разметки, на сколько чанков порежется и первые
+   ~1500 символов очищенного текста.
+4. Выполнить:
    ```bash
    PYTHONPATH=server python -m shared.rag_cli add data/docs/fz_44.docx --doc-id fz-44 --version 2025-03
    ```
-4. Через минуту (эмбеддинги считаются на CPU, ~1–3 с/чанк на nomic-embed-text) —
+5. Через минуту (эмбеддинги считаются на CPU, ~1–3 с/чанк на nomic-embed-text) —
    документ доступен модели.
 
 ### Что делать, когда норма обновилась
@@ -186,8 +195,18 @@ rm -rf data/rag_store
   "model": "t-tech/T-lite-it-2.1:q4_K_M",
   "rag_enabled": true,
   "rag_documents": 37,
+  "rag_chunks": 4218,
+  "rag_doc_ids": ["fz-44/v2024-07", "tk-rf/v2025", "..."],
+  "rag_top_k": 4,
+  "rag_embedder": "ollama:nomic-embed-text",
   "audit": { ... }
 }
+```
+
+Сводку без HTTP-запроса (с разбивкой по эмбеддерам и версиям) — через CLI:
+
+```bash
+PYTHONPATH=server python -m shared.rag_cli stats
 ```
 
 Для анализа качества поиска используйте `python -m shared.rag_cli search "…"` —
