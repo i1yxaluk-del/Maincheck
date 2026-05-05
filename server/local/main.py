@@ -88,6 +88,15 @@ OLLAMA_THINK = os.getenv("OLLAMA_THINK", "false").lower() in ("1", "true", "yes"
 # (например, для exploration в исследовании).
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
 
+# v1.7: морфологический фильтр галлюцинированных «улучшений» падежных
+# форм через pymorphy3. Закрывает класс ошибок, который не ловит ни
+# ё-фильтр, ни _drop_changes_not_in_text: модель «исправляет»
+# «Подразделения» → «Подразделению», хотя обе формы валидны и контекст
+# не требует именно дательного. Если pymorphy3 не установлен — фильтр
+# тихо отключается, остальной пайплайн работает как раньше.
+# Подробности: server/shared/morph_filter.py.
+MORPH_FILTER_ENABLED = os.getenv("MORPH_FILTER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
 # RAG
 RAG_ENABLED = os.getenv("RAG_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 RAG_STORE_DIR = os.getenv("RAG_STORE_DIR", "data/rag_store")
@@ -126,6 +135,7 @@ audit = AuditStore()
 _rag_store = None
 _rag_embedder = None
 _gec_bank = None
+_morph_filter = None  # v1.7: lazy singleton, инициализируется ниже если MORPH_FILTER_ENABLED
 
 if RAG_ENABLED:
     try:
@@ -185,6 +195,26 @@ if USE_FEW_SHOT:
     except Exception as e:
         logger.warning("Few-shot retrieval не удалось инициализировать: %s", e)
         _gec_bank = None
+
+# v1.7: ленивый singleton морф-фильтра. pymorphy3 грузит ~50 МБ
+# словарей; делаем один раз при старте, переиспользуем между запросами.
+# Если pymorphy3 не установлен или не загружается — `_morph_filter`
+# останется без `available=True`, и весь пост-фильтр будет no-op.
+if MORPH_FILTER_ENABLED:
+    try:
+        from shared.morph_filter import get_morph_filter  # noqa: E402
+
+        _morph_filter = get_morph_filter()
+        if _morph_filter.available:
+            logger.info("MorphFilter включён: фильтр падежных «улучшений» (pymorphy3) активен")
+        else:
+            logger.info(
+                "MorphFilter: pymorphy3 не доступен — фильтр падежных «улучшений» отключён "
+                "(установите pymorphy3 + pymorphy3-dicts-ru, см. requirements.txt)"
+            )
+    except Exception as e:
+        logger.warning("MorphFilter не удалось инициализировать: %s", e)
+        _morph_filter = None
 
 
 SYSTEM_PROMPT = """Ты — корректор русского языка для официальных документов. Не рассуждай, сразу выдавай ответ в нужном формате.
@@ -596,6 +626,100 @@ def _undo_eyo_in_corrected_block(text: str, raw_text: str) -> str:
     return f"{head}===CORRECTED==={new_corrected}===CHANGES==={tail}"
 
 
+def _drop_morph_case_substitutions(text: str, raw_text: str) -> str:
+    """v1.7: дропает пункты ===CHANGES===, представляющие собой
+    «улучшение» падежной формы валидного слова без реального
+    грамматического основания, и откатывает подмену в ===CORRECTED===.
+
+    Работает только если `_morph_filter` инициализирован и `available`
+    (pymorphy3 загружен). Иначе — no-op, чтобы PR можно было откатить
+    через простое удаление зависимости.
+
+    Главный prod-кейс (КС-2, 5 мая 2026): «Подразделения» (родительный
+    падеж) → «Подразделению» (дательный) — обе формы валидны, контекст
+    «причинения ущерба Подразделения» НЕ требует именно дательного.
+    Модель «улучшает» по common pattern «ущерб + dat», но в нашем
+    тексте «Подразделения» — это родительный принадлежности, и правка
+    меняет смысл. Char-level eyo undo здесь бессилен (ё нет), и
+    `_drop_changes_not_in_text` тоже (Подразделения ЕСТЬ в raw_text).
+
+    Логика «когда дроп»:
+      * `_morph_filter.is_hallucinated_case_change(before, after, raw_text)` →
+        True (одна лемма, тот же number, разный case, перед `before` нет
+        управляющего предлога).
+
+    Чего НЕ трогает (защита от false positive):
+      * лексические замены (разные леммы);
+      * число различается — это agreement fix, реальная правка;
+      * перед `before` стоит case-governing предлог («согласно приказа» →
+        «согласно приказу» — реальная ошибка управления).
+    """
+    if _morph_filter is None or not _morph_filter.available:
+        return text
+    if "===CORRECTED===" not in text or "===CHANGES===" not in text:
+        return text
+    if "===END===" not in text:
+        return text
+    if not raw_text:
+        return text
+    try:
+        head, rest1 = text.split("===CORRECTED===", 1)
+        corrected_block, rest2 = rest1.split("===CHANGES===", 1)
+        changes_block, tail = rest2.split("===END===", 1)
+    except ValueError:
+        return text
+
+    new_corrected = corrected_block
+    kept: list[str] = []
+    dropped_count = 0
+    for raw_line in changes_block.splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            kept.append(line)
+            continue
+        m = _CHANGE_PAIR_RE.search(line)
+        if m:
+            quote_before = m.group(1).strip()
+            quote_after = m.group(2).strip()
+            if (
+                _morph_filter.is_hallucinated_case_change(
+                    quote_before, quote_after, raw_text
+                )
+                and quote_after in new_corrected
+            ):
+                # Откатываем подмену в CORRECTED. Заменяем все вхождения,
+                # т.к. модель могла «исправить» одно и то же слово
+                # несколько раз в разных предложениях.
+                new_corrected = new_corrected.replace(quote_after, quote_before)
+                logger.info(
+                    "Дроп падежной «улучшалки»: «%s» → «%s» "
+                    "(одна лемма, разный падеж, нет управляющего предлога; откат в CORRECTED)",
+                    quote_before, quote_after,
+                )
+                dropped_count += 1
+                continue
+        kept.append(line)
+
+    if dropped_count == 0:
+        return text
+
+    non_empty = [ln for ln in kept if re.search(r"\w", ln)]
+    has_real_item = any(re.match(r"\s*\d+\.\s*\S", ln) for ln in non_empty)
+    if not has_real_item:
+        kept = ["", "1. Ошибок не найдено. Текст соответствует нормам.", ""]
+
+    logger.info(
+        "Отфильтровано %d пункт(ов) падежных «улучшений» (pymorphy3 morph-filter)",
+        dropped_count,
+    )
+
+    new_changes = "\n".join(kept).rstrip() + "\n"
+    return (
+        f"{head}===CORRECTED==={new_corrected}"
+        f"===CHANGES===\n{new_changes.lstrip()}===END==={tail}"
+    )
+
+
 def _expand_word_context(s: str, lo: int, hi: int) -> tuple[int, int]:
     """Расширяет [lo, hi) до границ слов с прихватом одного соседнего слова
     с каждой стороны. Используется для генерации читаемых «было»/«стало»
@@ -937,6 +1061,14 @@ async def suggest(
             # равно остаётся. Char-level выравнивание через difflib
             # восстанавливает букву по raw_text.
             result = _undo_eyo_in_corrected_block(result, raw_text)
+            # v1.7: дроп галлюцинированных «улучшений» падежных форм
+            # через pymorphy3. Закрывает компанионную часть compound-bypass
+            # (Подразделения → Подразделению — после v1.6.9 ё откатывается,
+            # но падежная подмена остаётся). Логика: одна лемма, тот же
+            # number, разный case, нет case-governing предлога перед
+            # `before` в raw_text → дроп. См. _drop_morph_case_substitutions
+            # и server/shared/morph_filter.py для деталей.
+            result = _drop_morph_case_substitutions(result, raw_text)
             # Финальная валидация: дропаем пункты, чьё «было» отсутствует
             # в raw_text (галлюцинации модели — например, yandex-corrector
             # пишет «безопасностей» там, где в тексте «безопасности»).
