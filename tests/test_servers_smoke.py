@@ -410,6 +410,105 @@ def test_drop_eyo_substitutions_safe_on_malformed_response(local_module):
     assert f("===CORRECTED=== без секций", "raw") == "===CORRECTED=== без секций"
 
 
+# ─── v1.6.9: посимвольный char-level откат ё→е в CORRECTED ──────
+
+
+def test_undo_eyo_in_text_simple(local_module):
+    """Простой случай: в corrected ё там, где в raw — е. Откат восстанавливает."""
+    raw = "проведенными мероприятиями повлекших риски"
+    corrected = "проведёнными мероприятиями повлёкших риски"
+    out = local_module._undo_eyo_in_text(corrected, raw)
+    assert out == "проведенными мероприятиями повлекших риски"
+
+
+def test_undo_eyo_in_text_compound_bypass(local_module):
+    """Реальный кейс v1.6.8 prod (run1, 5 мая 2026, КС-2):
+    модель упаковала ё-подмену + падежную в одну compound-цитату:
+    «повлекших риски ... Подразделения» → «повлёкших риски ... Подразделению».
+    Line-level фильтр такое не дропает (не чистая ё-замена), но
+    char-level откат должен восстановить «повлекших», оставив
+    падежную правку «Подразделению» (это НЕ ё, длина сегмента не та)."""
+    raw = "нарушений, повлекших риски причинения ущерба Подразделения в размере"
+    corrected = "нарушений, повлёкших риски причинения ущерба Подразделению в размере"
+    out = local_module._undo_eyo_in_text(corrected, raw)
+    # ё-подмена откатана
+    assert "повлекших" in out
+    assert "повлёкших" not in out
+    # Падежная (НЕ ё) — остаётся
+    assert "Подразделению" in out
+
+
+def test_undo_eyo_in_text_keeps_legitimate_e(local_module):
+    """Реальная буква ё в raw_text сохраняется в corrected.
+    Например, имя «Тёркин» — в raw оно с ё, в corrected тоже должно
+    остаться с ё."""
+    raw = "В произведении упомянут Тёркин."
+    corrected = "В произведении упомянут Тёркин."
+    out = local_module._undo_eyo_in_text(corrected, raw)
+    assert out == corrected
+    # И никакой откат не нужен — счётчик undone == 0
+
+
+def test_undo_eyo_in_text_keeps_real_corrections(local_module):
+    """Реальные правки (НЕ ё) в corrected не трогаем."""
+    raw = "стоимостей выполненной работ"
+    corrected = "стоимости выполненных работ"
+    out = local_module._undo_eyo_in_text(corrected, raw)
+    assert out == corrected  # без изменений: нет ё в corrected
+
+
+def test_undo_eyo_in_text_uppercase(local_module):
+    """Большая Ё→Е тоже откатывается."""
+    raw = "Елена Проведенными мероприятиями"
+    corrected = "Ёлена Проведёнными мероприятиями"
+    out = local_module._undo_eyo_in_text(corrected, raw)
+    assert out == "Елена Проведенными мероприятиями"
+
+
+def test_undo_eyo_in_text_no_eyo_short_circuit(local_module):
+    """Если в corrected нет ни ё, ни Ё — функция возвращает ту же строку."""
+    raw = "что-то"
+    corrected = "что-то другое"
+    out = local_module._undo_eyo_in_text(corrected, raw)
+    assert out == corrected
+
+
+def test_undo_eyo_in_text_empty_raw(local_module):
+    """На пустом raw_text функция не падает и не меняет corrected."""
+    out = local_module._undo_eyo_in_text("проведёнными", "")
+    assert out == "проведёнными"
+
+
+def test_undo_eyo_in_corrected_block_full_response(local_module):
+    """Полный pipeline: ===CORRECTED=== содержит ё-подмену в compound,
+    ===CHANGES=== не трогаем — это работа _drop_eyo_substitutions."""
+    raw_text = (
+        "нарушений, повлекших риски причинения ущерба Подразделения в размере"
+    )
+    response = (
+        "===CORRECTED===\n"
+        "нарушений, повлёкших риски причинения ущерба Подразделению в размере\n"
+        "===CHANGES===\n"
+        "1. «повлекших ... Подразделения» → «повлёкших ... Подразделению» | compound\n"
+        "===END==="
+    )
+    out = local_module._undo_eyo_in_corrected_block(response, raw_text)
+    # CORRECTED-блок откатан в части ё; падежная правка сохранена.
+    corrected_block = out.split("===CORRECTED===", 1)[1].split("===CHANGES===", 1)[0]
+    assert "повлекших" in corrected_block
+    assert "повлёкших" not in corrected_block
+    assert "Подразделению" in corrected_block
+    # CHANGES не тронут — пункт целиком сохранён, включая ё-варианты в цитате.
+    assert "1. «повлекших ... Подразделения» → «повлёкших ... Подразделению»" in out
+
+
+def test_undo_eyo_in_corrected_block_safe_on_malformed(local_module):
+    """На некорректном формате не падает."""
+    f = local_module._undo_eyo_in_corrected_block
+    assert f("просто текст", "raw") == "просто текст"
+    assert f("===CORRECTED=== без CHANGES", "raw") == "===CORRECTED=== без CHANGES"
+
+
 def test_local_rebuild_changes_from_diff_punctuation(local_module):
     """Если модель добавила запятые в CORRECTED, но не отрапортовала —
     сервер должен сгенерировать пункты CHANGES из diff. Реальный кейс

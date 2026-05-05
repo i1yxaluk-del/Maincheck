@@ -508,3 +508,27 @@ def test_metrics_exposes_bm25_terms(sample_bank_file: Path) -> None:
     bank = _make_bank(sample_bank_file)
     s = bank.stats()
     assert s.get("bm25_terms", 0) > 0
+
+
+def test_search_hybrid_deterministic_tie_break(sample_bank_file: Path) -> None:
+    """v1.6.9: при равном RRF-скоре тай-брейк по индексу пары в банке.
+
+    Регрессионный тест на наблюдение из v1.6.8 prod (5 мая 2026): тот же
+    КС-2 текст с тем же hybrid-индексом возвращал РАЗНЫЕ top-1 пары между
+    запусками сервера. Корень — `set(candidates)` итерируется в
+    непредсказуемом порядке между процессами, и при ничейных RRF-скорах
+    стабильная сортировка фиксировала случайный набор индексов.
+
+    Фикс: в search_hybrid сортируем по `(-score, idx)` — при равном score
+    меньший индекс выше.
+    """
+    bank = _make_bank(sample_bank_file)
+    # Запрос, который вряд ли даёт чёткого победителя — много пар получают
+    # схожие скоры по обоим сигналам.
+    query = "тестовый запрос без явных лексических совпадений"
+    runs = [bank.search_hybrid(query, top_k=5) for _ in range(5)]
+    # Все запуски возвращают идентичную последовательность пар.
+    rules_per_run = [tuple(p.rule for _, p in r) for r in runs]
+    assert len(set(rules_per_run)) == 1, (
+        f"Hybrid retrieval недетерминирован: {rules_per_run}"
+    )
