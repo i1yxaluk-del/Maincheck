@@ -37,9 +37,10 @@ import json
 import logging
 import math
 import pickle
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .rag_store import Embedder, HashingEmbedder  # noqa: F401 — для потребителей
 
@@ -55,6 +56,69 @@ _log = logging.getLogger("ai_suggester.gec_bank")
 # не найдёт цитату в `raw_text` и молча выкинет валидную правку. Такие пары
 # исключаются из банка на этапе загрузки (см. load_jsonl).
 _OUTER_QUOTE_CHARS = "«»\"\u201c\u201d\u2018\u2019\u201a\u201b\u201e"
+
+# Токенизация для BM25 (sparse retrieval). Берём слова из кириллицы +
+# латиницы + цифр; нормализуем регистр и снимаем разницу ё/е (в большинстве
+# официальных документов е и ё взаимозаменяемы, и BM25 не должен их различать).
+_BM25_TOKEN_RE = re.compile(r"[a-zа-яё0-9]+")
+
+
+def _tokenize_ru(text: str) -> List[str]:
+    """Лёгкий токенизатор для BM25. Без лемматизации: ловим словоформы
+    напрямую, потому что грамматическая ошибка как раз в словоформе
+    («стоимостей» vs «стоимости», «выполненной» vs «выполненных»).
+    Если стеммировать — потеряем главный сигнал.
+    """
+    return _BM25_TOKEN_RE.findall(text.lower().replace("ё", "е"))
+
+
+class _BM25Index:
+    """Чистый Python BM25Okapi над статичной коллекцией документов.
+
+    Используется как sparse-половина гибридного retrieval (см. v1.6.7).
+    Для 894 пар банка строится за ~10 мс при старте, занимает ~2-5 МБ RAM,
+    кэш на диск не нужен. Параметры k1=1.5, b=0.75 — стандартные значения
+    Okapi BM25 (Robertson 2009), хорошо работают на коротких документах.
+    """
+
+    def __init__(self, docs: List[List[str]], k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.N = len(docs)
+        self.doc_lens = [len(d) for d in docs]
+        self.avgdl = (sum(self.doc_lens) / self.N) if self.N else 0.0
+        self.tfs: List[Dict[str, int]] = []
+        df: Dict[str, int] = {}
+        for d in docs:
+            tf: Dict[str, int] = {}
+            for tok in d:
+                tf[tok] = tf.get(tok, 0) + 1
+            self.tfs.append(tf)
+            for tok in tf.keys():
+                df[tok] = df.get(tok, 0) + 1
+        # Okapi IDF со сглаживанием +0.5 (стандарт)
+        self.idf: Dict[str, float] = {
+            tok: math.log((self.N - dfi + 0.5) / (dfi + 0.5) + 1.0)
+            for tok, dfi in df.items()
+        }
+
+    def score(self, query: List[str]) -> List[float]:
+        """Возвращает BM25-score для каждого документа (по индексу)."""
+        scores = [0.0] * self.N
+        if self.avgdl <= 0:
+            return scores
+        for tok in query:
+            idf = self.idf.get(tok)
+            if idf is None:
+                continue
+            for i, tf in enumerate(self.tfs):
+                f = tf.get(tok, 0)
+                if f == 0:
+                    continue
+                dl = self.doc_lens[i]
+                denom = f + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+                scores[i] += idf * f * (self.k1 + 1) / denom
+        return scores
 
 
 @dataclass
@@ -95,6 +159,7 @@ class GecBank:
         self.embedder = embedder
         self._entries: List[_Indexed] = []
         self._indexed_count = 0
+        self._bm25: Optional[_BM25Index] = None
 
     # --- загрузка ------------------------------------------------------
     def load_jsonl(self, *paths: Path | str) -> int:
@@ -263,25 +328,120 @@ class GecBank:
                     cache, e,
                 )
 
+        # Sparse-половина гибридного retrieval. Кэш не нужен — для 894 пар
+        # построение BM25 занимает <20 мс, не критично к старту.
+        self.build_bm25_index()
+
+    def build_bm25_index(self) -> None:
+        """Строит BM25-индекс для sparse retrieval (используется в search_hybrid).
+
+        Эмбеддит токенизированные «wrong»-поля. Запускается автоматически
+        в конце build_index(), но можно дёрнуть вручную (например, в тестах).
+        """
+        if not self._entries:
+            self._bm25 = None
+            return
+        docs = [_tokenize_ru(e.pair.wrong) for e in self._entries]
+        self._bm25 = _BM25Index(docs)
+        _log.info(
+            "GEC bank: BM25 sparse-индекс собран (%d пар, словарь %d уникальных токенов)",
+            len(self._entries), len(self._bm25.idf),
+        )
+
     # --- поиск ---------------------------------------------------------
     def search(self, query: str, top_k: int = 3) -> List[Tuple[float, GecPair]]:
-        """Возвращает top-k пар, наиболее похожих на query, по cosine.
+        """Возвращает top-k пар, наиболее похожих на query, по cosine
+        (dense retrieval). Backward-совместимый API.
 
         Возвращает список `(score, pair)` в порядке убывания score.
         Если банк пуст или не проиндексирован — пустой список.
         """
+        ranked = self._dense_rank(query)
+        return [(s, self._entries[i].pair) for s, i in ranked[:top_k]]
+
+    def search_sparse(self, query: str, top_k: int = 3) -> List[Tuple[float, GecPair]]:
+        """BM25-поиск (sparse). Ловит точные словоформы, в т.ч. редкие
+        падежные формы — для GEC это часто важнее семантики (ошибка
+        и есть в словоформе).
+        """
+        ranked = self._sparse_rank(query)
+        return [(s, self._entries[i].pair) for s, i in ranked[:top_k]]
+
+    def search_hybrid(
+        self,
+        query: str,
+        top_k: int = 3,
+        pool: Optional[int] = None,
+        rrf_k: int = 60,
+    ) -> List[Tuple[float, GecPair]]:
+        """Гибридный retrieval: RRF-фьюжн dense (cosine) + sparse (BM25).
+
+        Reciprocal Rank Fusion (Cormack et al. 2009): из каждого ранжирования
+        берём 1/(k+rank), суммируем. k=60 — стандартное значение, гасит
+        нерелевантные хвосты обоих списков.
+
+        Зачем: dense на длинных входах часто промахивается (Sorokin & Nasyrova
+        BEA 2025: «similarity between input texts does not necessarily
+        correspond to similar grammatical error patterns»). BM25 на тех же
+        входах ловит редкие словоформы — а ошибка как раз в словоформе.
+        Фьюжн объединяет два сигнала без подкрутки шкал.
+
+        Args:
+            query: текст запроса.
+            top_k: сколько пар вернуть финально.
+            pool: размер кандидатного пула из каждого ранжирования (default
+                max(top_k*4, 10)). Больше pool — выше recall, но дороже фьюжн.
+            rrf_k: константа RRF (default 60).
+
+        Returns: список `(rrf_score, pair)` в порядке убывания.
+        """
+        if not self._entries or self._indexed_count == 0:
+            return []
+        eff_pool = pool if pool is not None else max(top_k * 4, 10)
+        dense_ranked = self._dense_rank(query)[:eff_pool]
+        sparse_ranked = self._sparse_rank(query)[:eff_pool] if self._bm25 else []
+
+        # 1-based ранг каждого entry-индекса в каждом ранжировании.
+        dense_rank: Dict[int, int] = {idx: pos + 1 for pos, (_, idx) in enumerate(dense_ranked)}
+        sparse_rank: Dict[int, int] = {idx: pos + 1 for pos, (_, idx) in enumerate(sparse_ranked)}
+        candidates = set(dense_rank) | set(sparse_rank)
+
+        fused: List[Tuple[float, int]] = []
+        for idx in candidates:
+            s = 0.0
+            if idx in dense_rank:
+                s += 1.0 / (rrf_k + dense_rank[idx])
+            if idx in sparse_rank:
+                s += 1.0 / (rrf_k + sparse_rank[idx])
+            fused.append((s, idx))
+        fused.sort(key=lambda x: x[0], reverse=True)
+        return [(s, self._entries[i].pair) for s, i in fused[:top_k]]
+
+    # --- ранжирование (внутренние) ------------------------------------
+    def _dense_rank(self, query: str) -> List[Tuple[float, int]]:
+        """Cosine-ранжирование всех проиндексированных entry; (score, idx) desc."""
         if not self._entries or self._indexed_count == 0:
             return []
         qvec = self.embedder.embed([query])[0]
         qnorm = math.sqrt(sum(v * v for v in qvec)) or 1.0
-        scored: List[Tuple[float, GecPair]] = []
-        for entry in self._entries:
+        scored: List[Tuple[float, int]] = []
+        for i, entry in enumerate(self._entries):
             if not entry.vec or len(entry.vec) != len(qvec):
-                continue  # эмбеддер сменился или не проиндексирована пара
+                continue  # эмбеддер сменился или пара не проиндексирована
             dot = sum(a * b for a, b in zip(qvec, entry.vec))
-            scored.append((dot / (qnorm * entry.norm), entry.pair))
+            scored.append((dot / (qnorm * entry.norm), i))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[:top_k]
+        return scored
+
+    def _sparse_rank(self, query: str) -> List[Tuple[float, int]]:
+        """BM25-ранжирование всех entry; (score, idx) desc. Без BM25-индекса — пусто."""
+        if self._bm25 is None or not self._entries:
+            return []
+        qtoks = _tokenize_ru(query)
+        scores = self._bm25.score(qtoks)
+        scored = [(s, i) for i, s in enumerate(scores) if s > 0.0]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored
 
     # --- API для отладки -----------------------------------------------
     def stats(self) -> dict:
@@ -294,6 +454,7 @@ class GecBank:
             "embedder": self.embedder.name,
             "rules": len(rules),
             "top_rules": sorted(rules.items(), key=lambda x: -x[1])[:5],
+            "bm25_terms": (len(self._bm25.idf) if self._bm25 else 0),
         }
 
 
