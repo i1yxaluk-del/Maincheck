@@ -183,7 +183,7 @@ SYSTEM_PROMPT = """Ты — корректор русского языка дл�
 ИСПРАВЛЯЙ ТОЛЬКО ЯВНЫЕ ОШИБКИ:
 • орфография — опечатки, удвоение/пропуск букв, слитное/раздельное написание;
 • управление — «согласно приказу» (не «согласно приказа»), «благодаря решению»;
-• согласование — однородные члены и причастные обороты в одном роде, числе и падеже с главным словом, даже если оно стоит за несколько слов;
+• согласование — однородные члены и причастные обороты в одном роде, числе и падеже с главным словом, даже если оно стоит за несколько слов («актов, …, не предусмотренных», не «предусмотренной»);
 • пунктуация — запятые при однородных членах, обособленных оборотах, придаточных.
 
 НЕ ТРОГАЙ:
@@ -485,6 +485,77 @@ def _drop_eyo_substitutions(text: str, raw_text: str) -> str:
         f"{head}===CORRECTED==={new_corrected}"
         f"===CHANGES===\n{new_changes.lstrip()}===END==={tail}"
     )
+
+
+def _undo_eyo_in_text(corrected: str, raw_text: str) -> str:
+    """Посимвольно откатывает в `corrected` подмены ё→е (и Ё→Е), которые
+    модель сделала «улучшая» написание, но которых нет в `raw_text`.
+
+    Закрывает bypass `_drop_eyo_substitutions`: модель часто упаковывает
+    ё-подмену вместе с реальной правкой в одну compound-цитату вида
+    «повлекших риски ... Подразделения» → «повлёкших риски ... Подразделению»;
+    line-level фильтр такой пункт оставляет (внутри есть и НЕ-ё разница),
+    но в CORRECTED всё равно стоит «повлёкших». Этот фильтр выровнивает
+    raw_text и corrected по символам через difflib и для каждой замены
+    («replace» opcode) с одинаковой длиной сегмента — посимвольно
+    восстанавливает букву из raw_text там, где разница только ё↔е.
+
+    Сегменты разной длины не трогаем — это места реальных правок (вставки
+    или удаления символов).
+    """
+    if "ё" not in corrected and "Ё" not in corrected:
+        return corrected
+    if not raw_text:
+        return corrected
+    matcher = difflib.SequenceMatcher(None, raw_text, corrected, autojunk=False)
+    parts: list[str] = []
+    undone = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            parts.append(corrected[j1:j2])
+        elif tag == "replace":
+            raw_seg = raw_text[i1:i2]
+            corr_seg = corrected[j1:j2]
+            if len(raw_seg) == len(corr_seg):
+                fixed_chars: list[str] = []
+                for r_ch, c_ch in zip(raw_seg, corr_seg):
+                    if c_ch == "ё" and r_ch == "е":
+                        fixed_chars.append("е")
+                        undone += 1
+                    elif c_ch == "Ё" and r_ch == "Е":
+                        fixed_chars.append("Е")
+                        undone += 1
+                    else:
+                        fixed_chars.append(c_ch)
+                parts.append("".join(fixed_chars))
+            else:
+                parts.append(corr_seg)
+        elif tag == "insert":
+            parts.append(corrected[j1:j2])
+        # tag == "delete": в `corrected` ничего нет — пропускаем.
+    if undone == 0:
+        return corrected
+    logger.info(
+        "Откат ё→е в CORRECTED: %d символ(ов) восстановлено по raw_text",
+        undone,
+    )
+    return "".join(parts)
+
+
+def _undo_eyo_in_corrected_block(text: str, raw_text: str) -> str:
+    """Применяет `_undo_eyo_in_text` к содержимому ===CORRECTED===
+    в полном ответе модели. Не трогает ===CHANGES===."""
+    if "===CORRECTED===" not in text or "===CHANGES===" not in text:
+        return text
+    try:
+        head, rest = text.split("===CORRECTED===", 1)
+        corrected_block, tail = rest.split("===CHANGES===", 1)
+    except ValueError:
+        return text
+    new_corrected = _undo_eyo_in_text(corrected_block, raw_text)
+    if new_corrected == corrected_block:
+        return text
+    return f"{head}===CORRECTED==={new_corrected}===CHANGES==={tail}"
 
 
 def _expand_word_context(s: str, lo: int, hi: int) -> tuple[int, int]:
@@ -815,6 +886,14 @@ async def suggest(
             # T-lite стабильно делает такие подмены, не помогает даже
             # явный запрет в SYSTEM_PROMPT (lost-in-the-middle).
             result = _drop_eyo_substitutions(result, raw_text)
+            # v1.6.9: посимвольный откат ё→е в CORRECTED закрывает bypass
+            # для compound-цитат, где модель упаковала ё-подмену вместе с
+            # реальной правкой («повлекших риски … Подразделения» →
+            # «повлёкших риски … Подразделению»). Line-level фильтр таких
+            # не дропает (внутри есть НЕ-ё разница), но в CORRECTED ё всё
+            # равно остаётся. Char-level выравнивание через difflib
+            # восстанавливает букву по raw_text.
+            result = _undo_eyo_in_corrected_block(result, raw_text)
             # Финальная валидация: дропаем пункты, чьё «было» отсутствует
             # в raw_text (галлюцинации модели — например, yandex-corrector
             # пишет «безопасностей» там, где в тексте «безопасности»).

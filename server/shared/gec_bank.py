@@ -407,14 +407,20 @@ class GecBank:
         candidates = set(dense_rank) | set(sparse_rank)
 
         fused: List[Tuple[float, int]] = []
-        for idx in candidates:
+        for idx in sorted(candidates):
             s = 0.0
             if idx in dense_rank:
                 s += 1.0 / (rrf_k + dense_rank[idx])
             if idx in sparse_rank:
                 s += 1.0 / (rrf_k + sparse_rank[idx])
             fused.append((s, idx))
-        fused.sort(key=lambda x: x[0], reverse=True)
+        # При равном RRF-скоре тай-брейк по индексу пары (меньший индекс
+        # выше) — иначе порядок внутри set(candidates) недетерминирован
+        # между процессами и одинаковые запросы возвращают разные пары
+        # между рестартами сервера. Реальный кейс: тот же КС-2 текст в
+        # v1.6.8 первого/второго прогона дал разные top-1 (`Запятая перед
+        # союзом "как"` vs другие) — это симптом этого недетерминизма.
+        fused.sort(key=lambda x: (-x[0], x[1]))
         return [(s, self._entries[i].pair) for s, i in fused[:top_k]]
 
     # --- ранжирование (внутренние) ------------------------------------
