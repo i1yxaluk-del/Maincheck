@@ -285,6 +285,84 @@ def test_local_passes_through_when_raw_text_empty(local_module):
     assert "«X» → «Y»" in out
 
 
+# ─── v1.7.3: _renumber_changes ─────────────────────────────────────────
+
+
+def test_renumber_changes_fills_gaps(local_module):
+    """v1.7.3 prod-кейс: фильтр дропнул пункт «1.», осталось «2. ... 3. ...»
+    в LibreOffice-расширении пользователь видит начало с 2-го пункта.
+    После _renumber_changes нумерация идёт подряд: 1, 2."""
+    raw = (
+        "===CORRECTED===\n"
+        "текст\n"
+        "===CHANGES===\n"
+        "2. «работ,» → «работы,» | согласование\n"
+        "3. «не предусмотренной» → «не предусмотренных» | агремент\n"
+        "===END==="
+    )
+    out = local_module._renumber_changes(raw)
+    assert "1. «работ,» → «работы,»" in out
+    assert "2. «не предусмотренной» → «не предусмотренных»" in out
+    # Старые номера 2/3 не должны остаться
+    assert "2. «работ,»" not in out
+    assert "3. «не предусмотренной»" not in out
+
+
+def test_renumber_changes_already_sequential(local_module):
+    """v1.7.3: если нумерация уже сплошная — оставить как есть."""
+    raw = (
+        "===CORRECTED===\n"
+        "текст\n"
+        "===CHANGES===\n"
+        "1. «X» → «Y»\n"
+        "2. «A» → «B»\n"
+        "3. «C» → «D»\n"
+        "===END==="
+    )
+    out = local_module._renumber_changes(raw)
+    assert "1. «X» → «Y»" in out
+    assert "2. «A» → «B»" in out
+    assert "3. «C» → «D»" in out
+
+
+def test_renumber_changes_empty_lines_preserved(local_module):
+    """v1.7.3: пустые строки между пунктами не считаются и не нумеруются."""
+    raw = (
+        "===CORRECTED===\n"
+        "текст\n"
+        "===CHANGES===\n"
+        "\n"
+        "5. «X» → «Y»\n"
+        "\n"
+        "10. «A» → «B»\n"
+        "===END==="
+    )
+    out = local_module._renumber_changes(raw)
+    assert "1. «X» → «Y»" in out
+    assert "2. «A» → «B»" in out
+    assert "5. «X»" not in out
+    assert "10. «A»" not in out
+
+
+def test_renumber_changes_no_changes_block(local_module):
+    """Если нет ===CHANGES===/===END=== — текст возвращается без изменений."""
+    raw = "просто текст без блоков"
+    assert local_module._renumber_changes(raw) == raw
+
+
+def test_renumber_changes_oshibok_ne_naydeno_unaffected(local_module):
+    """v1.7.3: «Ошибок не найдено» — единственный пункт, всё ок."""
+    raw = (
+        "===CORRECTED===\n"
+        "текст\n"
+        "===CHANGES===\n"
+        "1. Ошибок не найдено. Текст соответствует нормам.\n"
+        "===END==="
+    )
+    out = local_module._renumber_changes(raw)
+    assert "1. Ошибок не найдено" in out
+
+
 # ─── v1.6.8: фильтр стилистических ё-замен ──────────────────────
 
 

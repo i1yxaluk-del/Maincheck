@@ -97,19 +97,107 @@ class MorphFilter:
     def available(self) -> bool:
         return self._morph is not None
 
-    def is_case_only_substitution(self, before: str, after: str) -> bool:
-        """True если `before` и `after` — формы одной леммы, отличающиеся
-        только падежом (не числом, не родом, не POS).
+    # POS, требующие согласования с существительным (case+number+gender).
+    # Если перед `before` стоит слово такой POS, и НИ ОДИН парс `before`
+    # не согласуется с НИ ОДНИМ парсом этого слова — `before` грамматически
+    # рассогласован с контекстом, т.е. реальная ошибка, а не валидная форма.
+    _POS_REQUIRING_AGREEMENT = frozenset({
+        "ADJF",   # полное прилагательное
+        "ADJS",   # краткое прилагательное
+        "PRTF",   # полное причастие
+        "PRTS",   # краткое причастие
+        "NPRO",   # местоимение-существительное
+    })
 
-        Реализация:
+    def _is_grammatically_disagreed_with_prev(
+        self, before: str, raw_text: str
+    ) -> bool:
+        """v1.7.3: True если в `raw_text` непосредственно перед `before`
+        стоит ADJF/ADJS/PRTF/PRTS/NPRO, и **ни один** парс `before` не
+        согласуется с **ни одним** парсом этого предыдущего слова по
+        case+number+gender. Это означает что `before` — реальная
+        грамматическая ошибка согласования, а не валидная падежная форма.
+
+        В таких случаях правка модели (`before` → `after`) — legitimate
+        number/gender/case fix, а не галлюцинация, и мы НЕ должны
+        её откатывать.
+
+        Главный кейс: «Проверочное мероприятия» (ADJF.neut.sing →
+        NOUN.neut.{gent.sing | plur.nomn | plur.accs}) — ни один парс
+        «мероприятия» не согласован с «Проверочное» (для каждого парса
+        либо разное число, либо разный падеж). Значит «Проверочное
+        мероприятия» — disagreement, и правка на «мероприятие»
+        (sing.nomn.neut) — legitimate.
+
+        Анти-кейс: «ущерба Подразделения» — «ущерба» это NOUN (не в
+        POS_REQUIRING_AGREEMENT), поэтому функция возвращает False
+        (нет проверки), и стандартная case-only-логика идёт в работу.
+        """
+        if not raw_text or self._morph is None:
+            return False
+        idx = raw_text.find(before)
+        if idx < 0:
+            return False
+        prefix = raw_text[:idx].rstrip()
+        m = re.search(r"(\S+)\s*$", prefix)
+        if not m:
+            return False
+        prev_word = m.group(1).strip(".,;:!?\"'«»()[]{}—–-")
+        if not prev_word:
+            return False
+        try:
+            prev_parses = self._morph.parse(prev_word)
+            b_parses = self._morph.parse(before)
+        except Exception:
+            return False
+        if not prev_parses or not b_parses:
+            return False
+        # Только парсы предыдущего слова, требующие agreement с noun
+        prev_agree = [p for p in prev_parses
+                      if p.tag.POS in self._POS_REQUIRING_AGREEMENT]
+        if not prev_agree:
+            return False
+        # Хотя бы одна пара (prev_p, b_p) согласована? Тогда before — валиден.
+        for prev_p in prev_agree:
+            for b_p in b_parses:
+                if (prev_p.tag.case is not None
+                        and prev_p.tag.case == b_p.tag.case
+                        and prev_p.tag.number == b_p.tag.number
+                        and prev_p.tag.gender == b_p.tag.gender):
+                    return False  # есть согласование → before валиден
+        # Ни один парс before не согласуется с prev → disagreement
+        return True
+
+    def is_case_only_substitution(
+        self, before: str, after: str, raw_text: Optional[str] = None
+    ) -> bool:
+        """True если `before` и `after` — формы одной леммы, отличающиеся
+        ТОЛЬКО падежом (не числом, не родом, не POS).
+
+        Реализация (v1.7.3 — устраняет false-positive на амбигуитете
+        pymorphy3):
           1. Оба должны быть однословными непустыми токенами.
           2. После нормализации ё/е они НЕ должны совпадать (тогда это
              ё-фильтр, а не наш).
-          3. Лучшие парсы pymorphy3 у обоих должны иметь одинаковую
+          3. Если передан `raw_text` и `before` грамматически
+             рассогласован с предыдущим adj/прич/мест в этом тексте
+             (т.е. ни один парс `before` не согласован с предыдущим
+             словом) — это реальная ошибка согласования, не case-only.
+             Возвращаем False (не блокируем legitimate fix).
+          4. Best-парсы pymorphy3 у обоих должны иметь одинаковую
              лемму и одинаковую POS.
-          4. У обоих должен быть `case` (склоняемые слова).
-          5. `number` должен совпадать (sing↔sing или plur↔plur).
-          6. `case` должен различаться.
+          5. У обоих должен быть `case`.
+          6. `number` best-парсов должен совпадать.
+          7. `case` best-парсов должен различаться.
+
+        Главное отличие от v1.7/v1.7.1: при наличии `raw_text` сначала
+        проверяется adj-noun агремент с предыдущим словом. Это
+        позволяет различить:
+          * «Проверочное (sing) мероприятия (plur)» — disagreement,
+            модель fixит на «мероприятие» (sing) — legitimate, НЕ блокируем;
+          * «ущерба Подразделения» — управление noun-noun, без
+            agreement-проверки идёт стандартная case-only логика и
+            «Подразделения → Подразделению» блокируется как раньше.
         """
         if self._morph is None:
             return False
@@ -120,6 +208,10 @@ class MorphFilter:
         if " " in b or " " in a:
             return False
         if b.lower().replace("ё", "е") == a.lower().replace("ё", "е"):
+            return False
+        # Контекстная проверка: если before рассогласован с предыдущим
+        # adj/прич/мест → реальная ошибка, не блокируем.
+        if raw_text and self._is_grammatically_disagreed_with_prev(b, raw_text):
             return False
         try:
             pb = self._morph.parse(b)
@@ -169,10 +261,14 @@ class MorphFilter:
         падежной формы (одна лемма + тот же number + разный case + НЕТ
         управляющего предлога перед `before` в `raw_text`).
 
+        v1.7.3: передаёт `raw_text` в `is_case_only_substitution`, чтобы
+        тот мог проверить adj-noun агремент и не блокировать legitimate
+        number-фиксы (см. `_is_grammatically_disagreed_with_prev`).
+
         Используется в серверном пайплайне для дропа таких пунктов из
         ===CHANGES=== и отката подмены в ===CORRECTED===.
         """
-        if not self.is_case_only_substitution(before, after):
+        if not self.is_case_only_substitution(before, after, raw_text):
             return False
         if self.has_case_governing_context(before, raw_text):
             return False
