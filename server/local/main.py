@@ -129,6 +129,18 @@ if GEC_RETRIEVAL_MODE not in ("hybrid", "dense", "sparse"):
     # Не падаем, мягко даунгрейдим до hybrid.
     GEC_RETRIEVAL_MODE = "hybrid"
 
+# v1.7: токенизатор для sparse-половины hybrid retrieval.
+#   word    — старое поведение (v1.6), токены = словоформы.
+#   trigram — char-trigram (recall на морфологически близких парах).
+#   both    — параллельные индексы, скоры суммируются (v1.7 default).
+# Дефолт `both`: word-индекс ловит точные совпадения цитат («стоимости
+# выполненных работ»), а trigram-индекс — морфологические близости
+# («стоимостей» ↔ «стоимости»). RAM-overhead ~5-10 МБ, latency на
+# построении +30-60 мс при старте, на запросе пренебрежимо.
+GEC_BM25_TOKENIZER = os.getenv("GEC_BM25_TOKENIZER", "both").strip().lower()
+if GEC_BM25_TOKENIZER not in ("word", "trigram", "both"):
+    GEC_BM25_TOKENIZER = "both"
+
 logger = setup_logger("ai_suggester.local")
 audit = AuditStore()
 
@@ -176,7 +188,7 @@ if USE_FEW_SHOT:
                     GEC_EMBED_MODEL, exc,
                 )
                 _gec_embedder = HashingEmbedder(dim=1024)
-        _gec_bank = GecBank(_gec_embedder)
+        _gec_bank = GecBank(_gec_embedder, bm25_tokenizer=GEC_BM25_TOKENIZER)
         _here = Path(__file__).resolve().parent
         _resolved_paths = [str((_here / p) if not Path(p).is_absolute() else Path(p)) for p in GEC_BANK_FILES]
         n = _gec_bank.load_jsonl(*_resolved_paths)
@@ -189,8 +201,8 @@ if USE_FEW_SHOT:
             _cache_path = Path(_resolved_paths[0]).with_suffix(".index.pkl")
             _gec_bank.build_index(cache_path=_cache_path)
             logger.info(
-                "Few-shot retrieval включён: %d пар, top_k=%d, embedder=%s, mode=%s",
-                n, GEC_TOP_K, _gec_embedder.name, GEC_RETRIEVAL_MODE,
+                "Few-shot retrieval включён: %d пар, top_k=%d, embedder=%s, mode=%s, bm25=%s",
+                n, GEC_TOP_K, _gec_embedder.name, GEC_RETRIEVAL_MODE, GEC_BM25_TOKENIZER,
             )
     except Exception as e:
         logger.warning("Few-shot retrieval не удалось инициализировать: %s", e)

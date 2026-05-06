@@ -62,14 +62,54 @@ _OUTER_QUOTE_CHARS = "«»\"\u201c\u201d\u2018\u2019\u201a\u201b\u201e"
 # официальных документов е и ё взаимозаменяемы, и BM25 не должен их различать).
 _BM25_TOKEN_RE = re.compile(r"[a-zа-яё0-9]+")
 
+# v1.7: Параметры char-n-gram токенизатора. Размер 3 — стандарт для
+# морфологически богатых языков (Robertson 2009 §6.2). Меньше дробит на
+# слишком общие триграммы («то», «ос», ...), больше съедает RAM и делает
+# IDF-коэффициенты слишком разреженными для коротких пар банка.
+_BM25_NGRAM_SIZE = 3
+# Префикс/суффикс маркера слова — чтобы триграммы «$ст», «ть$»
+# отличались от тех же символов внутри слова. Аналог bos/eos в BPE.
+_BM25_NGRAM_PAD = "$"
+
 
 def _tokenize_ru(text: str) -> List[str]:
-    """Лёгкий токенизатор для BM25. Без лемматизации: ловим словоформы
-    напрямую, потому что грамматическая ошибка как раз в словоформе
-    («стоимостей» vs «стоимости», «выполненной» vs «выполненных»).
-    Если стеммировать — потеряем главный сигнал.
+    """Лёгкий **word-level** токенизатор для BM25. Без лемматизации:
+    ловим словоформы напрямую, потому что грамматическая ошибка как раз
+    в словоформе («стоимостей» vs «стоимости», «выполненной» vs
+    «выполненных»). Если стеммировать — потеряем главный сигнал.
     """
     return _BM25_TOKEN_RE.findall(text.lower().replace("ё", "е"))
+
+
+def _tokenize_ru_trigram(text: str) -> List[str]:
+    """v1.7: **char-trigram** токенизатор для BM25. Берёт каждое слово,
+    окаймляет padding-символами `$` и нарезает на триграммы.
+
+    Пример: «стоимости» → ['$ст', 'сто', 'тои', 'оим', 'имо', 'мос',
+                           'ост', 'сти', 'ти$']
+
+    Зачем: word-level BM25 видит «стоимостей» и «стоимости» как два
+    разных токена и не находит общих признаков. Char-trigram BM25
+    вытягивает почти все словоформы одного корня в общий пул триграмм
+    («ст», «то», «ос», «им») — recall на морфологически близкие пары
+    резко растёт.
+
+    Размер словаря: для 894 пар ~5-8K уникальных триграмм (5-10 МБ
+    RAM против ~1 МБ у word). Латентность построения индекса:
+    +30-60 мс при старте.
+
+    Используется через `_BM25Index(docs, tokenizer=_tokenize_ru_trigram)`
+    и переключается env-var-ом `GEC_BM25_TOKENIZER` в `gec_bank` фасаде.
+    """
+    out: List[str] = []
+    for word in _BM25_TOKEN_RE.findall(text.lower().replace("ё", "е")):
+        padded = _BM25_NGRAM_PAD + word + _BM25_NGRAM_PAD
+        if len(padded) <= _BM25_NGRAM_SIZE:
+            out.append(padded)
+            continue
+        for i in range(len(padded) - _BM25_NGRAM_SIZE + 1):
+            out.append(padded[i : i + _BM25_NGRAM_SIZE])
+    return out
 
 
 class _BM25Index:
@@ -153,13 +193,42 @@ class _Indexed:
 
 
 class GecBank:
-    """Банк GEC-пар с эмбеддингами и поиском ближайших соседей."""
+    """Банк GEC-пар с эмбеддингами и поиском ближайших соседей.
 
-    def __init__(self, embedder: Embedder):
+    Args:
+        embedder: эмбеддер для dense retrieval (cosine).
+        bm25_tokenizer: режим токенизации для sparse retrieval (BM25):
+            * `"word"` — только word-level (поведение v1.6, по умолчанию
+              сохраняет существующие индексы и кэши);
+            * `"trigram"` — только char-trigram (повышает recall на
+              морфологически близких парах вроде «стоимостей» ↔
+              «стоимости», но теряет precision на точных фразах);
+            * `"both"` — строит ОБА индекса параллельно, скоры
+              суммируются в `_sparse_rank`. Это рекомендуемый режим
+              для v1.7: word-индекс ловит точные совпадения, trigram —
+              морфологически близкие. RAM-overhead ~5-10 МБ для 894
+              пар, latency-overhead на построении +30-60 мс при старте.
+    """
+
+    def __init__(self, embedder: Embedder, bm25_tokenizer: str = "word"):
         self.embedder = embedder
         self._entries: List[_Indexed] = []
         self._indexed_count = 0
         self._bm25: Optional[_BM25Index] = None
+        # v1.7: параллельный индекс на char-triграммах. Используется
+        # когда bm25_tokenizer in ("trigram", "both"). Скоры
+        # обоих индексов суммируются в `_sparse_rank` без RRF: на
+        # одинаковых documents BM25-абсолютные скоры в одном порядке
+        # величины, простая сумма даёт хорошее ранжирование без
+        # подкрутки.
+        self._bm25_trigram: Optional[_BM25Index] = None
+        if bm25_tokenizer not in ("word", "trigram", "both"):
+            _log.warning(
+                "GecBank: неизвестный bm25_tokenizer=%r, использую 'word'",
+                bm25_tokenizer,
+            )
+            bm25_tokenizer = "word"
+        self.bm25_tokenizer = bm25_tokenizer
 
     # --- загрузка ------------------------------------------------------
     def load_jsonl(self, *paths: Path | str) -> int:
@@ -333,20 +402,35 @@ class GecBank:
         self.build_bm25_index()
 
     def build_bm25_index(self) -> None:
-        """Строит BM25-индекс для sparse retrieval (используется в search_hybrid).
+        """Строит BM25-индекс(ы) для sparse retrieval. В зависимости от
+        `self.bm25_tokenizer` собирает word-индекс, trigram-индекс или
+        оба.
 
         Эмбеддит токенизированные «wrong»-поля. Запускается автоматически
         в конце build_index(), но можно дёрнуть вручную (например, в тестах).
         """
         if not self._entries:
             self._bm25 = None
+            self._bm25_trigram = None
             return
-        docs = [_tokenize_ru(e.pair.wrong) for e in self._entries]
-        self._bm25 = _BM25Index(docs)
-        _log.info(
-            "GEC bank: BM25 sparse-индекс собран (%d пар, словарь %d уникальных токенов)",
-            len(self._entries), len(self._bm25.idf),
-        )
+        if self.bm25_tokenizer in ("word", "both"):
+            word_docs = [_tokenize_ru(e.pair.wrong) for e in self._entries]
+            self._bm25 = _BM25Index(word_docs)
+            _log.info(
+                "GEC bank: BM25 word-индекс собран (%d пар, словарь %d уникальных токенов)",
+                len(self._entries), len(self._bm25.idf),
+            )
+        else:
+            self._bm25 = None
+        if self.bm25_tokenizer in ("trigram", "both"):
+            tri_docs = [_tokenize_ru_trigram(e.pair.wrong) for e in self._entries]
+            self._bm25_trigram = _BM25Index(tri_docs)
+            _log.info(
+                "GEC bank: BM25 trigram-индекс собран (%d пар, словарь %d уникальных триграмм)",
+                len(self._entries), len(self._bm25_trigram.idf),
+            )
+        else:
+            self._bm25_trigram = None
 
     # --- поиск ---------------------------------------------------------
     def search(self, query: str, top_k: int = 3) -> List[Tuple[float, GecPair]]:
@@ -440,12 +524,40 @@ class GecBank:
         return scored
 
     def _sparse_rank(self, query: str) -> List[Tuple[float, int]]:
-        """BM25-ранжирование всех entry; (score, idx) desc. Без BM25-индекса — пусто."""
-        if self._bm25 is None or not self._entries:
+        """BM25-ранжирование всех entry; (score, idx) desc. Если оба
+        индекса (word и trigram) присутствуют — суммируем их скоры.
+
+        Почему сумма (а не RRF): абсолютные BM25-скоры из обоих
+        токенизаторов лежат в одном диапазоне (~0–10 для коротких пар
+        банка), а tie-breaking по индексу всё равно делает финальный
+        порядок детерминированным. RRF имеет смысл когда метрики имеют
+        разные масштабы (cosine ∈[-1,1] vs BM25 ∈[0,∞]) — у нас же
+        обе sparse-половины, не имеет смысла дополнительно нормировать.
+        """
+        if not self._entries:
             return []
-        qtoks = _tokenize_ru(query)
-        scores = self._bm25.score(qtoks)
-        scored = [(s, i) for i, s in enumerate(scores) if s > 0.0]
+        if self._bm25 is None and self._bm25_trigram is None:
+            return []
+
+        # Аккумулятор скоров по индексу пары.
+        n = len(self._entries)
+        combined: List[float] = [0.0] * n
+
+        if self._bm25 is not None:
+            qtoks = _tokenize_ru(query)
+            scores = self._bm25.score(qtoks)
+            for i, s in enumerate(scores):
+                if s > 0.0:
+                    combined[i] += s
+
+        if self._bm25_trigram is not None:
+            qtri = _tokenize_ru_trigram(query)
+            scores = self._bm25_trigram.score(qtri)
+            for i, s in enumerate(scores):
+                if s > 0.0:
+                    combined[i] += s
+
+        scored = [(s, i) for i, s in enumerate(combined) if s > 0.0]
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored
 
@@ -461,6 +573,8 @@ class GecBank:
             "rules": len(rules),
             "top_rules": sorted(rules.items(), key=lambda x: -x[1])[:5],
             "bm25_terms": (len(self._bm25.idf) if self._bm25 else 0),
+            "bm25_trigram_terms": (len(self._bm25_trigram.idf) if self._bm25_trigram else 0),
+            "bm25_tokenizer": self.bm25_tokenizer,
         }
 
 
