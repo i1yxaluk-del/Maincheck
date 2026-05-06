@@ -1,8 +1,19 @@
 """v1.7.2: фильтр alexanderpl/Lexify_RuGEC под админ/деловой стиль с
 балансировкой по типам морфо-агрементов.
 
+Это one-shot reproducibility-скрипт. Output (server/shared/gec_seed/
+lexify_admin.jsonl) уже коммитится в репо и используется в проде —
+запускать скрипт нужно ТОЛЬКО при обновлении исходного датасета или
+при изменении логики фильтра.
+
+Зависимости (НЕ прод-runtime, ставятся вручную перед запуском):
+    pip install datasets pyarrow pymorphy3 pymorphy3-dicts-ru
+
+Запуск:
+    python3 scripts/lexify_filter.py
+
 Шаги:
-  1. Загружаем 593 550 пар.
+  1. Загружаем 593 550 пар через HuggingFace datasets.
   2. Фильтр сорсов: оставляем только src=1 (academic/technical) и
      src=19 (narrative). Остальное — L2 / colloquial / single-word.
   3. На каждой паре считаем word-level diff. Если diff содержит хотя
@@ -13,7 +24,8 @@
      просто top-K.
 
 Output:
-  data/lexify_admin.jsonl — итоговый банк в нашем GecPair-формате.
+  server/shared/gec_seed/lexify_admin.jsonl — итоговый банк в нашем
+  GecPair-формате.
 """
 
 from __future__ import annotations
