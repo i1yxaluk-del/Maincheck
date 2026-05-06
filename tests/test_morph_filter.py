@@ -215,3 +215,162 @@ def test_singleton_reuse():
     a = get_morph_filter()
     b = get_morph_filter()
     assert a is b
+
+
+# ─── v1.7.1: compound CHANGES handling ──────────────────────────────
+
+
+def test_find_hallucinated_pairs_compound_main_prod_case(mf: MorphFilter):
+    """Главный prod-кейс v1.7 (КС-2 6 мая 2026): модель упаковывает
+    несколько правок в одну цитату. Внутри компаунда — одна
+    галлюцинированная падежная подмена («Подразделения» →
+    «Подразделению»), и ё-различие («повлекших» → «повлёкших»),
+    которое обрабатывается отдельно eyo-undo. Single-word метод
+    пропускал такой кейс из-за пробелов; compound метод должен
+    извлечь именно ту пару, которая является падежной подменой.
+    """
+    raw = (
+        "ряд значительных нарушений, повлекших риски причинения "
+        "ущерба Подразделения в размере более 2 млн рублей."
+    )
+    pairs = mf.find_hallucinated_pairs_in_compound(
+        "повлекших риски причинения ущерба Подразделения",
+        "повлёкших риски причинения ущерба Подразделению",
+        raw,
+    )
+    assert pairs == [("Подразделения", "Подразделению")]
+
+
+def test_find_hallucinated_pairs_compound_no_pairs_for_real_change(mf: MorphFilter):
+    """compound с реальной правкой числа причастия не должен
+    объявляться галлюцинацией: «выполненной работ» → «выполненных
+    работ» — agreement fix, не падежная подмена."""
+    raw = "стоимостей выполненной работ путём применения"
+    pairs = mf.find_hallucinated_pairs_in_compound(
+        "выполненной работ",
+        "выполненных работ",
+        raw,
+    )
+    assert pairs == []
+
+
+def test_find_hallucinated_pairs_compound_keeps_governing_prep(mf: MorphFilter):
+    """compound, где падежная подмена прикрыта case-governing
+    предлогом, не должен дропаться: «согласно приказа» (gen) →
+    «согласно приказу» (dat) — реальная ошибка управления."""
+    raw = "был утверждён план согласно приказа Минцифры"
+    pairs = mf.find_hallucinated_pairs_in_compound(
+        "согласно приказа",
+        "согласно приказу",
+        raw,
+    )
+    assert pairs == []
+
+
+def test_find_hallucinated_pairs_compound_different_token_count(mf: MorphFilter):
+    """Если число токенов в before/after различается — это insertion/
+    deletion (не word-by-word substitution), компаунд-фильтр такие
+    кейсы не трогает."""
+    raw = "повлекших риски причинения ущерба Подразделения"
+    pairs = mf.find_hallucinated_pairs_in_compound(
+        "повлекших ущерба Подразделения",
+        "повлёкших риски причинения ущерба Подразделению",
+        raw,
+    )
+    assert pairs == []
+
+
+def test_find_hallucinated_pairs_compound_single_word_compatible(mf: MorphFilter):
+    """compound-метод для одиночных слов работает совместимо с
+    single-word: галлюцинация → одна пара, реальная правка → пусто."""
+    raw_haluc = "ущерба Подразделения в размере"
+    raw_govt = "согласно приказа был"
+    assert mf.find_hallucinated_pairs_in_compound(
+        "Подразделения", "Подразделению", raw_haluc
+    ) == [("Подразделения", "Подразделению")]
+    assert mf.find_hallucinated_pairs_in_compound(
+        "приказа", "приказу", raw_govt
+    ) == []
+
+
+def test_is_compound_fully_hallucinated_main_prod_case(mf: MorphFilter):
+    """v1.7.1 prod-кейс: ВСЕ нетривиальные различия (ё-only +
+    случай-only substitution) — пункт нужно дропать целиком."""
+    raw = "повлекших риски причинения ущерба Подразделения"
+    assert mf.is_compound_fully_hallucinated(
+        "повлекших риски причинения ущерба Подразделения",
+        "повлёкших риски причинения ущерба Подразделению",
+        raw,
+    ) is True
+
+
+def test_is_compound_fully_hallucinated_mixed_keeps_item(mf: MorphFilter):
+    """Если в компаунде есть РЕАЛЬНАЯ правка (например, agreement
+    fix числа) рядом с галлюцинацией — пункт нельзя дропать,
+    `is_compound_fully_hallucinated=False`. _drop_morph_case_*
+    в main.py откатит галлюцинированное слово в CORRECTED, но
+    оставит CHANGES line."""
+    raw = "стоимостей выполненной работ путём ущерба Подразделения"
+    # before → after содержит и реальное число (выполненной → выполненных)
+    # и галлюцинацию (Подразделения → Подразделению)
+    assert mf.is_compound_fully_hallucinated(
+        "выполненной работ ущерба Подразделения",
+        "выполненных работ ущерба Подразделению",
+        raw,
+    ) is False
+
+
+def test_is_compound_fully_hallucinated_no_diff(mf: MorphFilter):
+    """Если before == after — `has_diff=False`, не дропаем (нечего)."""
+    assert mf.is_compound_fully_hallucinated(
+        "повлекших ущерба Подразделения",
+        "повлекших ущерба Подразделения",
+        "raw_text",
+    ) is False
+
+
+def test_is_compound_fully_hallucinated_only_eyo_diff(mf: MorphFilter):
+    """compound, где единственная разница — ё/е (handles by eyo-undo
+    elsewhere). Считаем «обрабатывается»: нечего откатывать
+    morph-фильтру, но сам пункт дропать тоже нет смысла отдельно
+    morph-фильтром (eyo-undo уже разобрался)."""
+    raw = "повлекших ущерба нарушений"
+    # has_diff будет True (есть ё-различие), но since все non-eyo diffs
+    # покрыты галлюцинациями (которых тут 0) — формально fully_hallucinated
+    # возвращает True (нет non-hallucinated reals).
+    # Но это безопасно: в main.py этот return используется только
+    # после прохода find_hallucinated_pairs_in_compound, который для
+    # ё-only diff возвращает []. И dropped_count не увеличится без
+    # пар. Поэтому ё-only compound НЕ дропается no-op.
+    result = mf.is_compound_fully_hallucinated(
+        "повлекших ущерба нарушений",
+        "повлёкших ущерба нарушений",
+        raw,
+    )
+    # Просто фиксируем поведение — поведение semantic; для проверки
+    # реального пайплайна см. test_servers_smoke compound-кейсы.
+    assert result is True  # все non-trivial diffs «не реальные»
+
+
+def test_find_hallucinated_pairs_compound_unavailable():
+    """Если pymorphy3 не загружен — find_*_compound возвращает []
+    (no-op)."""
+
+    class _Fake:
+        _morph = None  # type: ignore[assignment]
+        find_hallucinated_pairs_in_compound = (
+            MorphFilter.find_hallucinated_pairs_in_compound
+        )
+        is_compound_fully_hallucinated = MorphFilter.is_compound_fully_hallucinated
+
+    f = _Fake()
+    assert f.find_hallucinated_pairs_in_compound(
+        "повлекших ущерба Подразделения",
+        "повлёкших ущерба Подразделению",
+        "raw",
+    ) == []
+    assert f.is_compound_fully_hallucinated(
+        "повлекших ущерба Подразделения",
+        "повлёкших ущерба Подразделению",
+        "raw",
+    ) is False

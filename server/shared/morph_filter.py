@@ -178,6 +178,85 @@ class MorphFilter:
             return False
         return True
 
+    def find_hallucinated_pairs_in_compound(
+        self, before: str, after: str, raw_text: str
+    ) -> list[tuple[str, str]]:
+        """v1.7.1: для compound-кейсов вида «before phrase» → «after phrase»
+        (модель упаковывает несколько правок в одну цитату) — возвращает
+        список (b_word, a_word) пар, в которых b_word/a_word отличаются
+        и являются галлюцинированной падежной подменой.
+
+        Главный prod-кейс (КС-2, 6 мая 2026):
+          before = «повлекших риски причинения ущерба Подразделения»
+          after  = «повлёкших риски причинения ущерба Подразделению»
+        Возвращает [("Подразделения", "Подразделению")] —
+        («повлекших», «повлёкших») это ё-разница (handles by eyo-undo
+        elsewhere), не case substitution; остальные слова идентичны.
+
+        Если before и after — одиночные слова (нет пробелов), вернёт
+        либо [(before, after)] если is_hallucinated_case_change(before,
+        after, raw_text) — это совместимо с старым single-word методом
+        — либо пустой список.
+
+        Если число токенов в before и after различается — вернёт пустой
+        список (compound с inserted/deleted словами, не case-only
+        substitution).
+        """
+        if self._morph is None:
+            return []
+        b = (before or "").strip()
+        a = (after or "").strip()
+        if not b or not a:
+            return []
+        b_tokens = b.split()
+        a_tokens = a.split()
+        if len(b_tokens) != len(a_tokens):
+            return []
+        out: list[tuple[str, str]] = []
+        for bw, aw in zip(b_tokens, a_tokens):
+            if bw == aw:
+                continue
+            # Уже обработано ё-фильтром в CORRECTED: пропускаем (но
+            # не считаем «реальной» разницей).
+            if bw.lower().replace("ё", "е") == aw.lower().replace("ё", "е"):
+                continue
+            if self.is_hallucinated_case_change(bw, aw, raw_text):
+                out.append((bw, aw))
+        return out
+
+    def is_compound_fully_hallucinated(
+        self, before: str, after: str, raw_text: str
+    ) -> bool:
+        """True если ВСЕ нетривиальные различия между before и after
+        являются галлюцинированными падежными подменами (или ё-только
+        различиями, обрабатываемыми отдельно ё-фильтром).
+
+        Используется в `_drop_morph_case_substitutions` для решения:
+        дропать ли весь пункт ===CHANGES=== (все различия фантомные)
+        или только откатить подмены отдельных слов в ===CORRECTED===
+        (есть и реальные правки, оставляем пункт).
+        """
+        if self._morph is None:
+            return False
+        b_tokens = (before or "").strip().split()
+        a_tokens = (after or "").strip().split()
+        if not b_tokens or not a_tokens:
+            return False
+        if len(b_tokens) != len(a_tokens):
+            return False
+        has_diff = False
+        for bw, aw in zip(b_tokens, a_tokens):
+            if bw == aw:
+                continue
+            has_diff = True
+            # ё-only различие — считается «обрабатывается отдельно»,
+            # не блокирует дроп
+            if bw.lower().replace("ё", "е") == aw.lower().replace("ё", "е"):
+                continue
+            if not self.is_hallucinated_case_change(bw, aw, raw_text):
+                return False
+        return has_diff
+
 
 # Singleton для переиспользования между запросами (pymorphy3 загружает
 # словари ~50 МБ — повторно делать дорого). Создаётся лениво первым

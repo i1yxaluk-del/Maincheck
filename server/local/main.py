@@ -684,6 +684,7 @@ def _drop_morph_case_substitutions(text: str, raw_text: str) -> str:
     new_corrected = corrected_block
     kept: list[str] = []
     dropped_count = 0
+    reverted_in_corrected = 0  # v1.7.1: число compound-revert'ов в CORRECTED
     for raw_line in changes_block.splitlines():
         line = raw_line.rstrip()
         if not line.strip():
@@ -693,15 +694,15 @@ def _drop_morph_case_substitutions(text: str, raw_text: str) -> str:
         if m:
             quote_before = m.group(1).strip()
             quote_after = m.group(2).strip()
+            # v1.7: single-word path — если вся цитата это одно
+            # слово, и оно подменено падежной формой — дропаем
+            # пункт целиком, откатываем в CORRECTED.
             if (
                 _morph_filter.is_hallucinated_case_change(
                     quote_before, quote_after, raw_text
                 )
                 and quote_after in new_corrected
             ):
-                # Откатываем подмену в CORRECTED. Заменяем все вхождения,
-                # т.к. модель могла «исправить» одно и то же слово
-                # несколько раз в разных предложениях.
                 new_corrected = new_corrected.replace(quote_after, quote_before)
                 logger.info(
                     "Дроп падежной «улучшалки»: «%s» → «%s» "
@@ -710,9 +711,40 @@ def _drop_morph_case_substitutions(text: str, raw_text: str) -> str:
                 )
                 dropped_count += 1
                 continue
+            # v1.7.1: compound path — модель часто упаковывает несколько
+            # правок в одну цитату («повлекших риски причинения ущерба
+            # Подразделения» → «повлёкших риски причинения ущерба
+            # Подразделению»). Single-word check выше пропускает такие
+            # кейсы, но внутри компаунда может прятаться галлюцинация
+            # вроде «Подразделения → Подразделению». Откатываем такие
+            # отдельные слова в CORRECTED. Если ВЕСЬ компаунд состоит
+            # из таких подмен (плюс ё-различий, обрабатываемых
+            # eyo-undo) — дропаем пункт целиком, иначе оставляем
+            # пункт (там есть реальная правка).
+            pairs = _morph_filter.find_hallucinated_pairs_in_compound(
+                quote_before, quote_after, raw_text
+            )
+            if pairs:
+                for bw, aw in pairs:
+                    if aw in new_corrected:
+                        new_corrected = new_corrected.replace(aw, bw)
+                        reverted_in_corrected += 1
+                        logger.info(
+                            "Дроп падежной «улучшалки» (compound): «%s» → «%s» "
+                            "(внутри компаунда «%s» → «%s»; откат в CORRECTED)",
+                            bw, aw, quote_before[:60], quote_after[:60],
+                        )
+                if _morph_filter.is_compound_fully_hallucinated(
+                    quote_before, quote_after, raw_text
+                ):
+                    dropped_count += 1
+                    continue
+                # mixed: реальная правка есть, оставляем пункт CHANGES,
+                # но `reverted_in_corrected` гарантирует, что обновлённый
+                # CORRECTED дойдёт до выхода (см. условие ниже).
         kept.append(line)
 
-    if dropped_count == 0:
+    if dropped_count == 0 and reverted_in_corrected == 0:
         return text
 
     non_empty = [ln for ln in kept if re.search(r"\w", ln)]
@@ -720,10 +752,16 @@ def _drop_morph_case_substitutions(text: str, raw_text: str) -> str:
     if not has_real_item:
         kept = ["", "1. Ошибок не найдено. Текст соответствует нормам.", ""]
 
-    logger.info(
-        "Отфильтровано %d пункт(ов) падежных «улучшений» (pymorphy3 morph-filter)",
-        dropped_count,
-    )
+    if dropped_count > 0:
+        logger.info(
+            "Отфильтровано %d пункт(ов) падежных «улучшений» (pymorphy3 morph-filter)",
+            dropped_count,
+        )
+    if reverted_in_corrected > 0:
+        logger.info(
+            "Откат %d compound-словоподмен в CORRECTED (pymorphy3 morph-filter)",
+            reverted_in_corrected,
+        )
 
     new_changes = "\n".join(kept).rstrip() + "\n"
     return (

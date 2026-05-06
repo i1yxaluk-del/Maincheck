@@ -759,6 +759,102 @@ def test_local_drop_morph_keeps_lexical_change(local_module):
 
 
 @pytest.mark.skipif(not _has_pymorphy3(), reason="pymorphy3 не установлен")
+def test_local_drop_morph_compound_main_prod_case(local_module):
+    """v1.7.1 главный prod-кейс (КС-2 6 мая 2026): модель отдала
+    compound-цитату «повлекших риски причинения ущерба Подразделения»
+    → «повлёкших риски причинения ущерба Подразделению». Внутри
+    ё-различие («повлекших» → «повлёкших») и галлюцинированная
+    падежная подмена («Подразделения» → «Подразделению»). Single-word
+    путь морф-фильтра проигнорировал бы (есть пробелы); compound-путь
+    должен:
+      1. Откатить Подразделению → Подразделения в CORRECTED.
+      2. Дропнуть весь пункт CHANGES (все нетривиальные различия —
+         галлюцинации, реальной правки нет).
+    """
+    f = local_module._drop_morph_case_substitutions
+    if local_module._morph_filter is None or not local_module._morph_filter.available:
+        pytest.skip("MorphFilter не активен в среде теста")
+    raw = (
+        "ряд значительных нарушений, повлекших риски причинения "
+        "ущерба Подразделения в размере более 2 млн рублей."
+    )
+    response = (
+        "===CORRECTED===\n"
+        "ряд значительных нарушений, повлекших риски причинения "
+        "ущерба Подразделению в размере более 2 млн рублей.\n"
+        "===CHANGES===\n"
+        "1. «повлекших риски причинения ущерба Подразделения» "
+        "→ «повлёкших риски причинения ущерба Подразделению» "
+        "| согласование причастий и существительных\n"
+        "===END==="
+    )
+    out = f(response, raw)
+    # Compound-пункт должен быть выкинут.
+    assert "повлёкших риски причинения ущерба Подразделению" not in out
+    # CORRECTED должен быть откатан: Подразделению → Подразделения.
+    assert "ущерба Подразделения" in out
+    assert "ущерба Подразделению" not in out
+
+
+@pytest.mark.skipif(not _has_pymorphy3(), reason="pymorphy3 не установлен")
+def test_local_drop_morph_compound_mixed_keeps_item(local_module):
+    """v1.7.1: compound с реальной правкой числа («выполненной» →
+    «выполненных») И галлюцинацией («Подразделения» → «Подразделению»)
+    — пункт CHANGES должен остаться (там реальная правка), но
+    галлюцинированное слово должно быть откатано в CORRECTED."""
+    f = local_module._drop_morph_case_substitutions
+    if local_module._morph_filter is None or not local_module._morph_filter.available:
+        pytest.skip("MorphFilter не активен в среде теста")
+    raw = "выполненной работ ущерба Подразделения"
+    response = (
+        "===CORRECTED===\n"
+        "выполненных работ ущерба Подразделению\n"
+        "===CHANGES===\n"
+        "1. «выполненной работ ущерба Подразделения» "
+        "→ «выполненных работ ущерба Подразделению» "
+        "| согласование причастия с дополнением\n"
+        "===END==="
+    )
+    out = f(response, raw)
+    corrected = out.split("===CORRECTED===", 1)[1].split("===CHANGES===", 1)[0]
+    changes = out.split("===CHANGES===", 1)[1].split("===END===", 1)[0]
+    # CHANGES line должна остаться (там есть реальная правка числа).
+    assert "выполненных работ ущерба Подразделению" in changes
+    # Но Подразделению должно быть откатано в CORRECTED, а реальная
+    # правка числа сохранена.
+    assert "выполненных работ" in corrected
+    assert "ущерба Подразделения" in corrected
+    assert "Подразделению" not in corrected
+
+
+@pytest.mark.skipif(not _has_pymorphy3(), reason="pymorphy3 не установлен")
+def test_local_drop_morph_compound_keeps_governing_prep(local_module):
+    """v1.7.1: compound, где падежная подмена прикрыта case-governing
+    предлогом («согласно приказа» → «согласно приказу»), не должен
+    дропаться даже внутри компаунда."""
+    f = local_module._drop_morph_case_substitutions
+    if local_module._morph_filter is None or not local_module._morph_filter.available:
+        pytest.skip("MorphFilter не активен в среде теста")
+    raw = "согласно приказа от 12.05.2026 проведено мероприятие"
+    response = (
+        "===CORRECTED===\n"
+        "согласно приказу от 12.05.2026 проведено мероприятие\n"
+        "===CHANGES===\n"
+        "1. «согласно приказа от» → «согласно приказу от» "
+        "| предлог согласно требует дательного падежа\n"
+        "===END==="
+    )
+    out = f(response, raw)
+    corrected = out.split("===CORRECTED===", 1)[1].split("===CHANGES===", 1)[0]
+    changes = out.split("===CHANGES===", 1)[1].split("===END===", 1)[0]
+    # CHANGES line должна сохраниться (реальная ошибка управления).
+    assert "согласно приказу от" in changes
+    # CORRECTED НЕ откатан: остаётся в исправленной форме (приказу).
+    assert "согласно приказу от" in corrected
+    assert "согласно приказа от" not in corrected
+
+
+@pytest.mark.skipif(not _has_pymorphy3(), reason="pymorphy3 не установлен")
 def test_local_drop_morph_safe_on_malformed(local_module):
     """На некорректном формате не падает, возвращает вход без изменений."""
     f = local_module._drop_morph_case_substitutions
