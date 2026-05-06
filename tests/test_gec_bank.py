@@ -349,6 +349,56 @@ def test_extended_bank_file_is_valid() -> None:
         assert pair.wrong and pair.right and pair.wrong != pair.right
 
 
+def test_lexify_admin_bank_file_is_valid() -> None:
+    """v1.7.2: банк морфо-агрементов из alexanderpl/Lexify_RuGEC парсится."""
+    here = Path(__file__).resolve().parent
+    lexify = here.parent / "server" / "shared" / "gec_seed" / "lexify_admin.jsonl"
+    assert lexify.exists(), f"lexify_admin банк отсутствует: {lexify}"
+    bank = GecBank(HashingEmbedder(dim=64))
+    n = bank.load_jsonl(lexify)
+    # Целевой размер фильтра — 1500-2000 пар (4 категории × 1500 каждая
+    # с балансом по реально найденным).
+    assert n >= 1000, f"lexify_admin банк слишком маленький: {n} пар"
+    bank.build_index()
+    # В банке должны быть представлены ВСЕ 4 морфо-категории.
+    rules = {p.rule for p in (e.pair for e in bank._entries)}
+    assert "Lexify-case_agreement" in rules
+    assert "Lexify-number_agreement" in rules
+    assert "Lexify-verb_form" in rules
+    assert "Lexify-case_and_number" in rules
+
+
+def test_full_bank_v1_7_2_helps_kvartalakh_query() -> None:
+    """v1.7.2 регрессия-тест: full-stack банк (3 файла) находит relevant
+    пары для prod-кейса «Во 2-м кварталах планируется направление...»
+
+    До v1.7.2 (только seed + extended, 927 пар) топ-3 для этого запроса
+    были: «меч и лук и стрелы», «не соприкасающиеся темы», «3 1/2-тысячный
+    коллектив» — все нерелевантные.
+
+    После v1.7.2 топ-3 должны содержать минимум 1 пару из Lexify-*
+    (морфо-агременты) — это и есть основной выигрыш ретривала.
+    """
+    here = Path(__file__).resolve().parent
+    seed = here.parent / "server" / "shared" / "gec_seed" / "gec_bank.jsonl"
+    extended = here.parent / "server" / "shared" / "gec_seed" / "gec_bank_extended.jsonl"
+    lexify = here.parent / "server" / "shared" / "gec_seed" / "lexify_admin.jsonl"
+    bank = GecBank(HashingEmbedder(dim=64), bm25_tokenizer="both")
+    n = bank.load_jsonl(seed, extended, lexify)
+    assert n >= 2000, f"full-stack банк слишком маленький: {n} пар"
+    bank.build_index()
+
+    query = "Во 2-м кварталах планируется направление материалов проверки"
+    results = bank.search_sparse(query, top_k=5)
+    rules = [pair.rule for _, pair in results]
+    # Минимум 1 Lexify-* пара в топ-5 — иначе ретривал не починен.
+    lexify_hits = [r for r in rules if r.startswith("Lexify-")]
+    assert lexify_hits, (
+        f"Lexify-пары не попали в топ-5 для prod-запроса. "
+        f"Топ-5 rules: {rules}. Расширение банка не работает."
+    )
+
+
 # ─── v1.6.7: BM25 + hybrid retrieval ──────────────────────────────
 
 

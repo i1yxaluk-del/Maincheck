@@ -109,7 +109,12 @@ RAG_EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "nomic-embed-text")
 # с v1.5.11. Включение → USE_FEW_SHOT=true.
 USE_FEW_SHOT = os.getenv("USE_FEW_SHOT", "false").lower() in ("1", "true", "yes", "on")
 GEC_BANK_FILES = [
-    s.strip() for s in os.getenv("GEC_BANK_FILES", "../shared/gec_seed/gec_bank.jsonl").split(",")
+    s.strip() for s in os.getenv(
+        "GEC_BANK_FILES",
+        "../shared/gec_seed/gec_bank.jsonl"
+        ",../shared/gec_seed/gec_bank_extended.jsonl"
+        ",../shared/gec_seed/lexify_admin.jsonl",
+    ).split(",")
     if s.strip()
 ]
 GEC_TOP_K = int(os.getenv("GEC_TOP_K", "3"))
