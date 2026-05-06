@@ -8,3 +8,12 @@ python-dotenv>=1.0.0
 python-docx>=1.1.0
 pypdf>=4.2.0
 beautifulsoup4>=4.12.0
+
+# v1.7: морфологический фильтр галлюцинированных «улучшений» падежных
+# форм (см. server/shared/morph_filter.py). Без этих пакетов сервер
+# работает, но фильтр будет отключён — закрытый раньше в v1.6.10
+# bypass «Подразделения → Подразделению» снова возможен.
+# pymorphy3 — pure Python (не требует gcc), ~2 МБ; pymorphy3-dicts-ru
+# — словарь OpenCorpora ~50 МБ. Полностью offline после установки.
+pymorphy3>=2.0.0
+pymorphy3-dicts-ru>=2.4.0

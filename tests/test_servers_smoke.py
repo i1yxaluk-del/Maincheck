@@ -652,6 +652,150 @@ def test_local_call_ollama_default_temperature_zero(local_module, monkeypatch):
     )
 
 
+# ─── v1.7: pymorphy3 фильтр падежных «улучшений» ──────────────────
+
+
+def _has_pymorphy3() -> bool:
+    try:
+        import pymorphy3  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _has_pymorphy3(), reason="pymorphy3 не установлен")
+def test_local_drop_morph_case_substitution_подразделения(local_module):
+    """v1.7 главный prod-кейс: модель упаковала compound-цитату с
+    ё-заменой и падежной подменой. После v1.6.9 ё откатывается, но
+    падежная подмена «Подразделения → Подразделению» остаётся в CORRECTED.
+    Морф-фильтр должен дропнуть и откатить.
+
+    Важно: тест эмулирует случай, когда модель отдала ОДИНОЧНУЮ цитату
+    «Подразделения» → «Подразделению» (после того, как другие фильтры
+    разобрали compound). Морф-фильтр работает на одиночных словах."""
+    f = local_module._drop_morph_case_substitutions
+    if local_module._morph_filter is None or not local_module._morph_filter.available:
+        pytest.skip("MorphFilter не активен в среде теста")
+    raw = (
+        "повлекших риски причинения ущерба Подразделения в размере более "
+        "2 млн рублей"
+    )
+    response = (
+        "===CORRECTED===\n"
+        "повлекших риски причинения ущерба Подразделению в размере более "
+        "2 млн рублей\n"
+        "===CHANGES===\n"
+        "1. «Подразделения» → «Подразделению» | согласование падежа\n"
+        "===END==="
+    )
+    out = f(response, raw)
+    # Пункт CHANGES должен быть выкинут (если он был единственным —
+    # заменён на «Ошибок не найдено»).
+    assert "«Подразделения» → «Подразделению»" not in out
+    # CORRECTED должен быть откатан до исходной формы Подразделения.
+    assert "Подразделения" in out
+    assert "Подразделению" not in out
+
+
+@pytest.mark.skipif(not _has_pymorphy3(), reason="pymorphy3 не установлен")
+def test_local_drop_morph_keeps_согласно_приказа(local_module):
+    """Реальная ошибка управления: «согласно приказа» (gent) → «согласно
+    приказу» (datv). «согласно» — case-governing предлог, фильтр должен
+    ОСТАВИТЬ правку (НЕ дропать)."""
+    f = local_module._drop_morph_case_substitutions
+    if local_module._morph_filter is None or not local_module._morph_filter.available:
+        pytest.skip("MorphFilter не активен в среде теста")
+    raw = "согласно приказа №5 от 12.05.2026 проведено мероприятие"
+    response = (
+        "===CORRECTED===\n"
+        "согласно приказу №5 от 12.05.2026 проведено мероприятие\n"
+        "===CHANGES===\n"
+        "1. «приказа» → «приказу» | предлог согласно требует дательного падежа\n"
+        "===END==="
+    )
+    out = f(response, raw)
+    # Пункт CHANGES должен сохраниться.
+    assert "«приказа» → «приказу»" in out
+    # CORRECTED должен остаться в исправленной форме (НЕ откатан).
+    assert "согласно приказу" in out
+
+
+@pytest.mark.skipif(not _has_pymorphy3(), reason="pymorphy3 не установлен")
+def test_local_drop_morph_keeps_number_change(local_module):
+    """Изменение числа — agreement fix, должен остаться:
+    «выполненной» (sing) → «выполненных» (plur)."""
+    f = local_module._drop_morph_case_substitutions
+    if local_module._morph_filter is None or not local_module._morph_filter.available:
+        pytest.skip("MorphFilter не активен в среде теста")
+    raw = "стоимостей выполненной работ путём завышения расценок"
+    response = (
+        "===CORRECTED===\n"
+        "стоимостей выполненных работ путём завышения расценок\n"
+        "===CHANGES===\n"
+        "1. «выполненной» → «выполненных» | согласование числа с однородными\n"
+        "===END==="
+    )
+    out = f(response, raw)
+    assert "«выполненной» → «выполненных»" in out
+    assert "выполненных работ" in out
+
+
+@pytest.mark.skipif(not _has_pymorphy3(), reason="pymorphy3 не установлен")
+def test_local_drop_morph_keeps_lexical_change(local_module):
+    """Лексическая замена (разные леммы) — должен остаться."""
+    f = local_module._drop_morph_case_substitutions
+    if local_module._morph_filter is None or not local_module._morph_filter.available:
+        pytest.skip("MorphFilter не активен в среде теста")
+    raw = "комиссия должна принимать решение оперативно"
+    response = (
+        "===CORRECTED===\n"
+        "комиссия должна принять решение оперативно\n"
+        "===CHANGES===\n"
+        "1. «принимать» → «принять» | вид глагола\n"
+        "===END==="
+    )
+    out = f(response, raw)
+    assert "«принимать» → «принять»" in out
+
+
+@pytest.mark.skipif(not _has_pymorphy3(), reason="pymorphy3 не установлен")
+def test_local_drop_morph_safe_on_malformed(local_module):
+    """На некорректном формате не падает, возвращает вход без изменений."""
+    f = local_module._drop_morph_case_substitutions
+    assert f("просто текст", "raw") == "просто текст"
+    assert f("===CORRECTED=== без CHANGES", "raw") == "===CORRECTED=== без CHANGES"
+
+
+@pytest.mark.skipif(not _has_pymorphy3(), reason="pymorphy3 не установлен")
+def test_local_drop_morph_safe_on_empty_raw(local_module):
+    """Пустой raw_text — фильтр пропускает (нет контекста для проверки)."""
+    f = local_module._drop_morph_case_substitutions
+    response = (
+        "===CORRECTED===\nок\n"
+        "===CHANGES===\n1. «Подразделения» → «Подразделению» | падеж\n"
+        "===END==="
+    )
+    # При пустом raw_text фильтр должен выйти на гарде (return text).
+    assert f(response, "") == response
+
+
+def test_local_drop_morph_disabled_when_filter_unavailable(local_module, monkeypatch):
+    """Если _morph_filter is None или not available — фильтр no-op,
+    пайплайн возвращает input без изменений."""
+    f = local_module._drop_morph_case_substitutions
+    monkeypatch.setattr(local_module, "_morph_filter", None)
+    raw = "повлекших риски причинения ущерба Подразделения в размере"
+    response = (
+        "===CORRECTED===\n"
+        "повлекших риски причинения ущерба Подразделению в размере\n"
+        "===CHANGES===\n"
+        "1. «Подразделения» → «Подразделению» | согласование падежа\n"
+        "===END==="
+    )
+    # _morph_filter=None → no-op, текст возвращается as-is.
+    assert f(response, raw) == response
+
+
 def test_local_call_ollama_respects_temperature_override(local_module, monkeypatch):
     """OLLAMA_TEMPERATURE можно переопределить (например, для exploration
     в исследовательских прогонах). Проверяем, что значение пробрасывается

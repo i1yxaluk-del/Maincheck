@@ -398,6 +398,175 @@ def test_bm25_index_empty_collection() -> None:
     assert idx.score(["foo"]) == []
 
 
+# ─── v1.7: char-trigram BM25 ────────────────────────────────────────
+
+
+def test_tokenize_ru_trigram_basic() -> None:
+    """Char-trigram токенизатор: padding `$`, lower, ё→е, размер 3."""
+    from shared.gec_bank import _tokenize_ru_trigram
+
+    # «ок» (2 символа) → padded «$ок$» (4 символа), 4-3+1=2 триграммы
+    assert _tokenize_ru_trigram("ок") == ["$ок", "ок$"]
+
+    # «стои» (4 символа) → padded «$стои$», 6-3+1=4 триграммы
+    assert _tokenize_ru_trigram("стои") == ["$ст", "сто", "тои", "ои$"]
+
+    # ё нормализуется к е
+    assert _tokenize_ru_trigram("прошёл") == _tokenize_ru_trigram("прошел")
+
+    # Регистр не важен
+    assert _tokenize_ru_trigram("СТО") == _tokenize_ru_trigram("сто")
+
+    # Пунктуация и пробелы — разделители слов, не попадают в триграммы
+    out = _tokenize_ru_trigram("Привет, мир!")
+    assert "$пр" in out
+    assert "ет$" in out  # «привет» закрывается на $
+    assert "$ми" in out
+    # Не должно быть триграмм с запятой
+    assert all("," not in t for t in out)
+    assert all(" " not in t for t in out)
+
+
+def test_tokenize_ru_trigram_morphological_overlap() -> None:
+    """Главная польза trigram-токенизатора: разные словоформы одного
+    корня делят триграммы. word-токенизатор их различает, trigram —
+    объединяет."""
+    from shared.gec_bank import _tokenize_ru_trigram
+
+    a = set(_tokenize_ru_trigram("стоимостей"))
+    b = set(_tokenize_ru_trigram("стоимости"))
+    # Word-tokenizer вернул бы 0 совпадений; у trigram-токенизатора
+    # должно быть много общих триграмм (общий корень «стоимост-»).
+    overlap = a & b
+    assert len(overlap) >= 6, f"ожидалось ≥6 общих триграмм, получено {overlap}"
+
+
+def test_bm25_trigram_index_finds_morphologically_close() -> None:
+    """BM25 на trigram-токенах должен находить doc с похожей
+    словоформой (разные падежи/числа одного корня)."""
+    from shared.gec_bank import _BM25Index, _tokenize_ru_trigram
+
+    docs = [
+        _tokenize_ru_trigram("выполненных работ путём применения"),
+        _tokenize_ru_trigram("совершенно посторонний документ"),
+        _tokenize_ru_trigram("согласно приказа утверждён план"),
+    ]
+    idx = _BM25Index(docs)
+    # Запрос «выполненной работы» — другая падежно-числовая форма
+    # того же корня. Word-BM25 не нашёл бы — у «выполненной» и
+    # «выполненных» нет общих токенов. Trigram должен найти.
+    scores = idx.score(_tokenize_ru_trigram("выполненной работы"))
+    top = max(range(len(scores)), key=lambda i: scores[i])
+    assert top == 0, f"trigram BM25 должен поднять doc 0, поднял {top}: {scores}"
+    assert scores[0] > scores[1]
+    assert scores[0] > scores[2]
+
+
+def test_gec_bank_tokenizer_mode_default_is_word(sample_bank_file: Path) -> None:
+    """Без явного аргумента GecBank создаётся в режиме `word` —
+    backward-compatible с v1.6: только word-индекс, нет trigram."""
+    bank = GecBank(HashingEmbedder(dim=64))
+    bank.load_jsonl(sample_bank_file)
+    bank.build_index()
+    assert bank.bm25_tokenizer == "word"
+    assert bank._bm25 is not None
+    assert bank._bm25_trigram is None
+
+
+def test_gec_bank_tokenizer_mode_trigram(sample_bank_file: Path) -> None:
+    """В режиме `trigram` строится только trigram-индекс."""
+    bank = GecBank(HashingEmbedder(dim=64), bm25_tokenizer="trigram")
+    bank.load_jsonl(sample_bank_file)
+    bank.build_index()
+    assert bank.bm25_tokenizer == "trigram"
+    assert bank._bm25 is None
+    assert bank._bm25_trigram is not None
+
+
+def test_gec_bank_tokenizer_mode_both(sample_bank_file: Path) -> None:
+    """В режиме `both` строятся оба индекса параллельно."""
+    bank = GecBank(HashingEmbedder(dim=64), bm25_tokenizer="both")
+    bank.load_jsonl(sample_bank_file)
+    bank.build_index()
+    assert bank.bm25_tokenizer == "both"
+    assert bank._bm25 is not None
+    assert bank._bm25_trigram is not None
+
+
+def test_gec_bank_tokenizer_mode_invalid_falls_back_to_word(sample_bank_file: Path) -> None:
+    """Некорректный mode — мягкий даунгрейд до word, без падений."""
+    bank = GecBank(HashingEmbedder(dim=64), bm25_tokenizer="hieroglyph")
+    bank.load_jsonl(sample_bank_file)
+    bank.build_index()
+    assert bank.bm25_tokenizer == "word"
+    assert bank._bm25 is not None
+    assert bank._bm25_trigram is None
+
+
+def test_search_sparse_with_trigram_finds_morphological_match(sample_bank_file: Path) -> None:
+    """Главный кейс v1.7: запрос с другой словоформой того же корня.
+    word-only sparse не находит, trigram/both — находят.
+
+    Берём пару из банка с «приказа» (gent). Word-BM25 для запроса с
+    «приказе» (locv) должен дать score=0 (нет общих словоформ).
+    Trigram-BM25 — должен поднять эту пару (общие триграммы корня
+    «приказ-»).
+    """
+    word_bank = GecBank(HashingEmbedder(dim=64), bm25_tokenizer="word")
+    word_bank.load_jsonl(sample_bank_file)
+    word_bank.build_index()
+    # «приказе» нет в банке как словоформа, но есть «приказа», «приказу».
+    word_hits = word_bank.search_sparse("Решение о приказе вынесено", top_k=3)
+    word_rules = {p.rule for _, p in word_hits}
+
+    tri_bank = GecBank(HashingEmbedder(dim=64), bm25_tokenizer="trigram")
+    tri_bank.load_jsonl(sample_bank_file)
+    tri_bank.build_index()
+    tri_hits = tri_bank.search_sparse("Решение о приказе вынесено", top_k=3)
+    tri_rules = {p.rule for _, p in tri_hits}
+
+    # trigram должен покрыть хотя бы то же или больше — главное,
+    # вытаскивает пару с «приказ-» корнем («Падежное управление»).
+    assert "Падежное управление" in tri_rules, (
+        f"trigram не нашёл «приказ-» матч. word={word_rules}, tri={tri_rules}"
+    )
+
+
+def test_search_sparse_both_sums_scores(sample_bank_file: Path) -> None:
+    """В режиме `both` скоры word и trigram суммируются. Проверяем
+    что результат ранжирования согласован — top-1 пара должна
+    получить высокий score (>= max from word-only)."""
+    word_bank = GecBank(HashingEmbedder(dim=64), bm25_tokenizer="word")
+    word_bank.load_jsonl(sample_bank_file)
+    word_bank.build_index()
+    both_bank = GecBank(HashingEmbedder(dim=64), bm25_tokenizer="both")
+    both_bank.load_jsonl(sample_bank_file)
+    both_bank.build_index()
+
+    q = "Согласно приказа был утверждён план."
+    word_hits = word_bank.search_sparse(q, top_k=1)
+    both_hits = both_bank.search_sparse(q, top_k=1)
+    # На точном запросе и word, и both должны вернуть ту же пару топом.
+    assert word_hits and both_hits
+    assert word_hits[0][1].rule == both_hits[0][1].rule
+    # both score >= word score (т.к. тригграммы добавляют положительный
+    # вклад на любых пересекающихся корнях).
+    assert both_hits[0][0] >= word_hits[0][0]
+
+
+def test_gec_bank_stats_includes_trigram_terms(sample_bank_file: Path) -> None:
+    """stats() в режиме `both` показывает количество триграмм."""
+    bank = GecBank(HashingEmbedder(dim=64), bm25_tokenizer="both")
+    bank.load_jsonl(sample_bank_file)
+    bank.build_index()
+    s = bank.stats()
+    assert s["bm25_tokenizer"] == "both"
+    assert s["bm25_terms"] > 0
+    assert s["bm25_trigram_terms"] > 0
+    # У trigram-индекса всегда больше «терминов» (триграмм >> словоформ).
+    assert s["bm25_trigram_terms"] > s["bm25_terms"]
+
+
 def test_search_sparse_returns_lexically_close(sample_bank_file: Path) -> None:
     """search_sparse находит пару по точному совпадению словоформ,
     минуя dense (где hashing-embedder может не сойтись)."""
