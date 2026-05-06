@@ -424,6 +424,46 @@ def _drop_idempotent_changes(text: str) -> str:
     return f"{before}===CHANGES===\n{new_changes.lstrip()}===END==={tail}"
 
 
+_CHANGE_NUM_RE = re.compile(r"^(\s*)(\d+)\.(\s*)(.*)$")
+
+
+def _renumber_changes(text: str) -> str:
+    """v1.7.3: пере-нумеровывает пункты ===CHANGES=== подряд (1, 2, 3...)
+    после того как ранее работающие фильтры (`_drop_idempotent_changes`,
+    `_drop_changes_not_in_text`, `_drop_eyo_substitutions`,
+    `_drop_morph_case_substitutions`) могли удалить часть пунктов и
+    оставить «дырки» в нумерации (например, «2. ... 4. ...»).
+
+    Пользователь в LibreOffice-расширении видел: «правки начались со
+    2го пункта». Это происходит когда модель отдала «1. X 2. Y 3. Z»,
+    фильтр дропнул «1. X», осталось «2. Y 3. Z». Эта функция превратит
+    их обратно в «1. Y 2. Z».
+
+    Не трогает строки без пронумерованного префикса (пустые строки,
+    «Ошибок не найдено» как стаб, etc.). Не меняет порядок пунктов.
+    """
+    if "===CHANGES===" not in text or "===END===" not in text:
+        return text
+    try:
+        before, rest = text.split("===CHANGES===", 1)
+        changes_block, tail = rest.split("===END===", 1)
+    except ValueError:
+        return text
+    new_lines: list[str] = []
+    next_num = 1
+    for raw_line in changes_block.splitlines():
+        line = raw_line.rstrip()
+        m = _CHANGE_NUM_RE.match(line)
+        if m:
+            indent, _old_num, sep, content = m.group(1), m.group(2), m.group(3), m.group(4)
+            new_lines.append(f"{indent}{next_num}.{sep}{content}")
+            next_num += 1
+        else:
+            new_lines.append(line)
+    new_changes = "\n".join(new_lines).rstrip() + "\n"
+    return f"{before}===CHANGES===\n{new_changes.lstrip()}===END==={tail}"
+
+
 def _drop_changes_not_in_text(text: str, raw_text: str) -> str:
     """Дропает пункты ===CHANGES===, чьё «было» не является подстрокой
     исходного текста пользователя.
@@ -1145,6 +1185,12 @@ async def suggest(
                             "(модель забыла рапорт)", len(rebuilt),
                         )
                         result = _replace_changes_block(result, rebuilt)
+            # v1.7.3: финальная пере-нумерация CHANGES (после всех drop'ов
+            # и возможной реконструкции). Закрывает кейс «правки начались
+            # со 2го пункта» в LibreOffice-расширении: если фильтр дропнул
+            # пункт 1 — нужно перенумеровать оставшиеся, чтобы клиент
+            # видел сплошную нумерацию 1, 2, 3, а не 2, 3.
+            result = _renumber_changes(result)
         except Exception as e:
             ok = False
             error = f"{type(e).__name__}: {e}"

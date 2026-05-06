@@ -374,3 +374,110 @@ def test_find_hallucinated_pairs_compound_unavailable():
         "повлёкших ущерба Подразделению",
         "raw",
     ) is False
+
+
+# ─── v1.7.3: контекстная проверка adj-noun агремента ───────────────────
+
+
+def test_v173_meropriyatie_in_adj_context_not_hallucination(mf: MorphFilter):
+    """v1.7.3 prod-кейс (LibreOffice extension test, 6 мая 2026):
+    «Проверочное мероприятия» — adj «Проверочное» (sing.neut.nomn) в
+    disagreement с «мероприятия» (любой парс — gent.sing, plur.nomn,
+    plur.accs — не согласуется по case или number с «Проверочное»).
+
+    Модель правильно меняет на «мероприятие» (sing.nomn.neut). Это
+    legitimate fix, и фильтр НЕ должен его откатывать.
+
+    Раньше (v1.7.1) фильтр брал best-парс «мероприятия» (gent.sing) и
+    видел same-number с «мероприятие» (sing.nomn) → классифицировал как
+    case-only sub → откатывал → REGRESSION. v1.7.3 проверяет
+    contextual agreement и видит что before рассогласован → не откатывает.
+    """
+    raw_text = "Проверочное мероприятия по факту допущенных нарушений"
+    assert mf.is_hallucinated_case_change(
+        "мероприятия", "мероприятие", raw_text
+    ) is False
+
+
+def test_v173_compound_meropriyatie_not_pulled_as_hallucination(mf: MorphFilter):
+    """v1.7.3: compound case «Проверочное мероприятия» → «Проверочное
+    мероприятие» — find_hallucinated_pairs_in_compound должен вернуть [],
+    т.е. не считать «мероприятия → мероприятие» галлюцинацией."""
+    raw_text = "Проверочное мероприятия по факту допущенных нарушений"
+    assert mf.find_hallucinated_pairs_in_compound(
+        "Проверочное мероприятия", "Проверочное мероприятие", raw_text
+    ) == []
+
+
+def test_v173_podrazdeleniye_still_hallucination_after_noun(mf: MorphFilter):
+    """v1.7.3 anti-regression: «Подразделения → Подразделению» в
+    контексте «ущерба Подразделения» по-прежнему должна детектироваться
+    как галлюцинация. «ущерба» это NOUN (приименное управление, не
+    agreement), поэтому contextual проверка возвращает False, и
+    стандартная case-only логика срабатывает."""
+    raw_text = "повлекших риски причинения ущерба Подразделения в размере"
+    assert mf.is_hallucinated_case_change(
+        "Подразделения", "Подразделению", raw_text
+    ) is True
+
+
+def test_v173_compound_podrazdeleniye_still_caught(mf: MorphFilter):
+    """v1.7.3 anti-regression: главный prod-кейс v1.7.1 (КС-2,
+    «повлекших...Подразделения» → «повлёкших...Подразделению») должен
+    по-прежнему ловиться compound-фильтром."""
+    raw_text = "повлекших риски причинения ущерба Подразделения в размере"
+    pairs = mf.find_hallucinated_pairs_in_compound(
+        "повлекших риски причинения ущерба Подразделения",
+        "повлёкших риски причинения ущерба Подразделению",
+        raw_text,
+    )
+    assert pairs == [("Подразделения", "Подразделению")]
+
+
+def test_v173_case_only_without_raw_text_is_strict(mf: MorphFilter):
+    """v1.7.3: backward compat — is_case_only_substitution без raw_text
+    использует только best-парс (как раньше). Это нужно для совместимости
+    с теми вызовами, которые не имеют контекста (юнит-тесты, диагностика).
+
+    Без raw_text «мероприятия → мероприятие» = case-only=True (best-парс
+    gent.sing совпадает по number с sing.nomn у мероприятие). С raw_text
+    это становится False через contextual disambiguation."""
+    # Без context'а — старая логика, амбигуитет → True
+    assert mf.is_case_only_substitution("мероприятия", "мероприятие") is True
+    # С context'а — disambiguation, → False
+    raw = "Проверочное мероприятия по факту"
+    assert mf.is_case_only_substitution("мероприятия", "мероприятие", raw) is False
+
+
+def test_v173_disagreement_with_participle(mf: MorphFilter):
+    """v1.7.3: prev=ПРИЧАСТИЕ. «Подписанные документа» — «Подписанные»
+    (PRTF, plur, nomn) рассогласовано с «документа» (любой парс —
+    gent.sing, ничего не plur). Поэтому правка на «документы» legitimate."""
+    raw = "Подписанные документа в архив"
+    # «документа → документы»: documents in plural to agree with adj plural
+    assert mf.is_hallucinated_case_change(
+        "документа", "документы", raw
+    ) is False
+
+
+def test_v173_no_prev_word(mf: MorphFilter):
+    """v1.7.3: edge case — before в начале предложения, нет prev word.
+    Должен fall through к стандартной case-only логике (без context)."""
+    raw = "Подразделения отвечают за это"
+    # Тут «Подразделения» в начале → нет prev word → не рассогласовано
+    # → старая логика: case-only=True → hallucinated=True (нет govern prep'а)
+    assert mf.is_hallucinated_case_change(
+        "Подразделения", "Подразделению", raw
+    ) is True
+
+
+def test_v173_prev_word_is_noun_no_check(mf: MorphFilter):
+    """v1.7.3: prev=NOUN — agreement не требуется (приименное управление),
+    contextual check возвращает False, стандартная case-only логика
+    идёт в работу."""
+    raw = "копия приказа подписана"
+    # «приказа → приказу»: case-only=True (нет agreement context'а с
+    # «копия» как с adj — «копия» это NOUN), prev «копия» — NOUN, не
+    # ADJF, поэтому contextual disambiguation возвращает False, и
+    # стандартная логика case-only применяется → True.
+    assert mf.is_case_only_substitution("приказа", "приказу", raw) is True
