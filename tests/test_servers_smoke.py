@@ -1725,3 +1725,156 @@ def test_v18c_sage_category_filter_drops_orthography(local_module, monkeypatch):
     out = local_module._filter_changes_with_sage(raw_in, "Слово опечтка.")
     # Категория содержит «орфограф», sage DISAGREE → правка дропнута
     assert "«опечтка»" not in out
+
+
+# ============================================================
+# v1.8.4: _complete_changes_from_corrected — CHANGES↔CORRECTED desync
+# ============================================================
+
+
+def test_v184_completes_missing_agreement_change(local_module):
+    """Реальный прод-кейс v1.8c прогона (05.05.2026): T-lite склеила две
+    правки в один пункт. CHANGES перечисляет только «ремонтова → ремонта»
+    (орфография), но CORRECTED содержит ещё и «капитальных → капитального»
+    (согласование). Функция должна добавить недостающую правку."""
+    raw = "выполнением капитальных ремонтова помещений"
+    text = (
+        "===CORRECTED===\n"
+        "выполнением капитального ремонта помещений\n"
+        "===CHANGES===\n"
+        "1. «ремонтова» → «ремонта» | орфография — пропущена буква «н»\n"
+        "===END===\n"
+    )
+    out = local_module._complete_changes_from_corrected(text, raw)
+    # Старый пункт остался
+    assert "«ремонтова» → «ремонта»" in out
+    # И добавился новый — какая-то правка вокруг «капитальных»
+    # (точная формулировка зависит от _expand_word_context).
+    assert "капитальных" in out
+    assert "капитального" in out
+
+
+def test_v184_noop_when_changes_fully_cover_corrected(local_module):
+    """Если применение CHANGES к raw даёт ровно CORRECTED — функция
+    не должна ничего менять."""
+    raw = "ремонтова помещений"
+    text = (
+        "===CORRECTED===\n"
+        "ремонта помещений\n"
+        "===CHANGES===\n"
+        "1. «ремонтова» → «ремонта» | орфография\n"
+        "===END===\n"
+    )
+    out = local_module._complete_changes_from_corrected(text, raw)
+    assert out == text
+
+
+def test_v184_noop_when_raw_equals_corrected(local_module):
+    """Если CORRECTED == raw_text (ошибок нет), функция — no-op."""
+    raw = "Текст без ошибок."
+    text = (
+        "===CORRECTED===\n"
+        "Текст без ошибок.\n"
+        "===CHANGES===\n"
+        "1. Ошибок не найдено. Текст соответствует нормам.\n"
+        "===END===\n"
+    )
+    out = local_module._complete_changes_from_corrected(text, raw)
+    assert out == text
+
+
+def test_v184_noop_when_changes_empty(local_module):
+    """Пустой CHANGES + CORRECTED == raw → no-op."""
+    raw = "Текст."
+    text = (
+        "===CORRECTED===\n"
+        "Текст.\n"
+        "===CHANGES===\n"
+        "===END===\n"
+    )
+    out = local_module._complete_changes_from_corrected(text, raw)
+    assert out == text
+
+
+def test_v184_noop_when_no_corrected_block(local_module):
+    """Если в text нет ===CORRECTED=== — no-op."""
+    raw = "raw text"
+    text = "просто текст без маркеров"
+    out = local_module._complete_changes_from_corrected(text, raw)
+    assert out == text
+
+
+def test_v184_noop_when_no_changes_block(local_module):
+    """Если в text нет ===CHANGES=== — no-op."""
+    raw = "raw text"
+    text = "===CORRECTED===\ncorrected\n"
+    out = local_module._complete_changes_from_corrected(text, raw)
+    assert out == text
+
+
+def test_v184_dedupes_already_existing_before(local_module):
+    """Если diff даёт правку с тем же `before`, что уже в CHANGES —
+    не дублируем."""
+    raw = "опечтка слово"
+    text = (
+        "===CORRECTED===\n"
+        "опечатка слово\n"
+        "===CHANGES===\n"
+        "1. «опечтка» → «опечатка» | орфография\n"
+        "===END===\n"
+    )
+    out = local_module._complete_changes_from_corrected(text, raw)
+    # Симуляция применения CHANGES даёт ровно CORRECTED, новых правок нет
+    assert out == text
+
+
+def test_v184_strips_stub_when_adding_real_changes(local_module):
+    """Если CHANGES содержит только стаб «Ошибок не найдено», но
+    CORRECTED отличается от raw — стаб должен быть затерт, новые
+    правки добавлены."""
+    raw = "Это ошибк."
+    text = (
+        "===CORRECTED===\n"
+        "Это ошибка.\n"
+        "===CHANGES===\n"
+        "1. Ошибок не найдено. Текст соответствует нормам.\n"
+        "===END===\n"
+    )
+    out = local_module._complete_changes_from_corrected(text, raw)
+    # Стаб исчез
+    assert "Ошибок не найдено" not in out
+    # И появилась реальная правка
+    assert "ошибк" in out
+    assert "ошибка" in out
+
+
+def test_v184_skips_missing_before_in_simulation(local_module):
+    """Если `before` пункта CHANGES не найдён в raw_text — пропускаем
+    его при симуляции (это уже отфильтровано _drop_changes_not_in_text,
+    но защищаемся от багов). Diff всё равно построится правильно."""
+    raw = "Реальный текст."
+    text = (
+        "===CORRECTED===\n"
+        "Реальный текст.\n"
+        "===CHANGES===\n"
+        "1. «несуществующий» → «фрагмент» | мусор\n"
+        "===END===\n"
+    )
+    out = local_module._complete_changes_from_corrected(text, raw)
+    # simulated == raw == CORRECTED.strip() → no-op
+    assert out == text
+
+
+def test_v184_preserves_other_block_structure(local_module):
+    """Хвост после ===END=== должен быть сохранён без изменений."""
+    raw = "ремонтова"
+    text = (
+        "===CORRECTED===\n"
+        "ремонта\n"
+        "===CHANGES===\n"
+        "1. «ремонтова» → «ремонта» | орфография\n"
+        "===END===\n"
+        "Дополнительный хвост\n"
+    )
+    out = local_module._complete_changes_from_corrected(text, raw)
+    assert "Дополнительный хвост" in out

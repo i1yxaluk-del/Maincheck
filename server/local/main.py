@@ -687,6 +687,126 @@ def _filter_changes_with_sage(text: str, raw_text: str) -> str:
     )
 
 
+def _complete_changes_from_corrected(text: str, raw_text: str) -> str:
+    """v1.8.4: закрывает рассинхрон ===CHANGES=== ↔ ===CORRECTED===.
+
+    Симулирует применение CHANGES к raw_text (как это делает клиент
+    LibreOffice через InStr+Replace) и сверяет результат с CORRECTED.
+    Если CORRECTED содержит правки, не покрытые ни одним пунктом
+    CHANGES — добавляет недостающие правки в конец CHANGES через diff.
+
+    Реальный прод-кейс (v1.8c прогон, 05.05.2026): T-lite склеила две
+    правки «капитальных → капитального» (согласование) и «ремонтова
+    → ремонта» (орфография) в один пункт `«ремонтова» → «ремонта»`.
+    CORRECTED содержит «капитального ремонта», но CHANGES — только
+    орфо-правку. Клиент применит CHANGES → получит «капитальных
+    ремонта» (несогласованно). Эта функция добавляет пункт
+    «капитальных → капитального» через diff(simulated, corrected).
+
+    Не модифицирует CORRECTED — только дополняет CHANGES до полного
+    покрытия. Если diff не находит новых правок — no-op.
+
+    Идёт ПОСЛЕ всех фильтров (drop_idempotent, drop_eyo, morph_filter,
+    drop_changes_not_in_text, drop_user_dict, enrich_with_detector,
+    filter_with_sage) и ДО _renumber_changes (новые пункты получат
+    последовательные номера).
+    """
+    if not text or not raw_text:
+        return text
+    if "===CHANGES===" not in text or "===END===" not in text:
+        return text
+    if "===CORRECTED===" not in text:
+        return text
+
+    corrected_body = _extract_corrected_body(text)
+    if not corrected_body or corrected_body == raw_text:
+        return text
+
+    try:
+        head, rest = text.split("===CHANGES===", 1)
+        changes_block, tail = rest.split("===END===", 1)
+    except ValueError:
+        return text
+
+    # Парсим существующие (before, after) пары из CHANGES.  Сохраняем
+    # порядок — нужно для корректной симуляции применения.
+    existing_pairs: list[tuple[str, str]] = []
+    for raw_line in changes_block.splitlines():
+        line = raw_line.strip()
+        if not line or "Ошибок не найдено" in line:
+            continue
+        pair = _parse_change_pair_robust(line)
+        if pair is None:
+            m = _CHANGE_PAIR_RE.search(line)
+            if m:
+                pair = (m.group(1), m.group(2))
+        if pair is None:
+            continue
+        before_q, after_q = pair[0].strip(), pair[1].strip()
+        if not before_q or not after_q or before_q == after_q:
+            continue
+        existing_pairs.append((before_q, after_q))
+
+    # Симулируем то, что сделает клиент: для каждого пункта ищем первое
+    # вхождение `before` в текущем тексте и заменяем на `after`. Если
+    # `before` не найден — пропускаем (клиент покажет «фрагмент не
+    # найден», но это уже отфильтровано _drop_changes_not_in_text).
+    simulated = raw_text
+    for before_q, after_q in existing_pairs:
+        idx = simulated.find(before_q)
+        if idx < 0:
+            continue
+        simulated = simulated[:idx] + after_q + simulated[idx + len(before_q):]
+
+    # Нормализуем хвосты пробелов/переносов для сравнения — клиент тоже
+    # сохраняет finalNewline, а CORRECTED-блок может содержать лишние
+    # переносы по краям.
+    if simulated.strip() == corrected_body.strip():
+        return text
+
+    # diff(simulated → corrected_body) даст ровно те правки, которых
+    # не хватает в CHANGES для полного воспроизведения CORRECTED.
+    missing_entries = _rebuild_changes_from_diff(simulated, corrected_body)
+    if not missing_entries:
+        return text
+
+    # Дедупликация: исключаем пункты, чей `before` уже есть в CHANGES
+    # (защита от двойного эмита, если diff поймал перекрытие).
+    existing_befores = {b.strip().lower() for b, _ in existing_pairs}
+    new_entries: list[str] = []
+    for entry in missing_entries:
+        m = _CHANGE_PAIR_RE.search(entry)
+        if m is None:
+            continue
+        b_norm = m.group(1).strip().lower()
+        if b_norm in existing_befores:
+            continue
+        new_entries.append(entry)
+        existing_befores.add(b_norm)
+
+    if not new_entries:
+        return text
+
+    logger.info(
+        "v1.8.4: добавлено %d пункт(ов) CHANGES для синхронизации с "
+        "CORRECTED (T-lite не перечислил все правки)", len(new_entries),
+    )
+
+    # Приклеиваем новые пункты в конец changes_block (с переносами).
+    # _renumber_changes ниже нормализует нумерацию подряд (1, 2, 3...).
+    suffix = "\n".join(new_entries)
+    existing_kept = changes_block.rstrip("\n")
+    # Если в блоке остался только стаб «Ошибок не найдено» — затираем
+    # его, теперь у нас реальные пункты.
+    if existing_kept.strip() and "Ошибок не найдено" in existing_kept:
+        existing_kept = ""
+    if existing_kept:
+        new_changes = existing_kept + "\n" + suffix + "\n"
+    else:
+        new_changes = "\n" + suffix + "\n"
+    return f"{head}===CHANGES==={new_changes}===END==={tail}"
+
+
 def _renumber_changes(text: str) -> str:
     """v1.7.3: пере-нумеровывает пункты ===CHANGES=== подряд (1, 2, 3...)
     после того как ранее работающие фильтры (`_drop_idempotent_changes`,
@@ -1717,6 +1837,14 @@ async def suggest(
             # sage оценивал ТОЛЬКО правки от LLM (детектор уже отфильтрован
             # по precision на уровне правил). Latency cost ~1-3 с warm.
             result = _filter_changes_with_sage(result, raw_text)
+            # v1.8.4: закрываем рассинхрон CHANGES↔CORRECTED. T-lite иногда
+            # склеивает несколько правок (орфография+согласование) в один
+            # пункт CHANGES, а CORRECTED показывает обе. Клиент применит
+            # только пункт CHANGES — получит частично-исправленный текст.
+            # Эта функция симулирует применение CHANGES к raw_text, сверяет
+            # с CORRECTED и при desync дописывает недостающие правки в
+            # конец CHANGES (через diff). CORRECTED не трогает.
+            result = _complete_changes_from_corrected(result, raw_text)
             # v1.7.3: финальная пере-нумерация CHANGES (после всех drop'ов
             # и возможной реконструкции). Закрывает кейс «правки начались
             # со 2го пункта» в LibreOffice-расширении: если фильтр дропнул
