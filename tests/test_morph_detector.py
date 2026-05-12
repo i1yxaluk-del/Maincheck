@@ -251,3 +251,53 @@ def test_grammar_error_to_change_line():
 def test_empty_text_no_errors(detector: MorphDetector):
     assert detector.detect_errors("") == []
     assert detector.detect_errors(" \n\t ") == []
+
+
+# ─── v1.8.1 регрессионные тесты ──────────────────────────────────────
+
+
+def test_v181_no_fp_chain_with_oov_neighbour(detector: MorphDetector):
+    """v1.8.1 регрессия: «капитальных ремонтова помещений административного
+    здания» — «ремонтова» — OOV. Раньше детектор парсил его как ADJS через
+    FakeDictionary и выдавал ДВА FP: «ремонтова → ремонтовых» (adj_noun) и
+    «помещений → помещения» (adj_noun, ремонтова в роли prev-adj). Теперь
+    OOV-сосед пропускается в adj_noun/numeral_noun, и оба FP исчезают.
+    «ремонтова» по-прежнему ловится OOV-детектором.
+    """
+    text = (
+        "за выполнением капитальных ремонтова помещений "
+        "административного здания «ЦСН ВО»"
+    )
+    errs = detector.detect_errors(text)
+    befores = [e.before for e in errs]
+    # «помещений» НЕ флагуется (был FP до v1.8.1)
+    assert "помещений" not in befores
+    # «ремонтова» ловится OOV-детектором (а не adj_noun)
+    kinds_by_before = {e.before: e.kind for e in errs}
+    assert kinds_by_before.get("ремонтова") == "oov"
+
+
+def test_v181_oov_word_with_fake_surn_parse_flagged(detector: MorphDetector):
+    """v1.8.1: выдуманные слова на «-ова», «-ин», «-ский» получают
+    FakeDictionary-парс с Surn-тегом, но is_known=False. Должны
+    флагаться как OOV, не пропускаться как «фамилия».
+    """
+    errs = detector.detect_errors("При проведении капитальных ремонтова в ЦСН.")
+    befores = {e.before for e in errs}
+    assert "ремонтова" in befores
+    # Параллельно: реальная фамилия Иванов (is_known=True, Surn) НЕ флагуется
+    errs2 = detector.detect_errors("Подписано Ивановым.")
+    befores2 = {e.before for e in errs2}
+    assert "Ивановым" not in befores2
+
+
+def test_v181_no_fp_on_chain_with_real_noun_genitive(detector: MorphDetector):
+    """v1.8.1: «административного здания» — adj.sing.gent + noun.sing.gent
+    (согласованы). Детектор не должен флагать связку, и не должен флагать
+    «помещений» через «административного» — оно НЕ соседний noun.
+    """
+    text = "помещений административного здания"
+    errs = detector.detect_errors(text)
+    befores = [e.before for e in errs]
+    assert "помещений" not in befores
+    assert "здания" not in befores

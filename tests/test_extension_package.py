@@ -19,8 +19,10 @@ def test_description_version():
     root = _parse(EXT_DIR / "description.xml")
     version = root.find("{http://openoffice.org/extensions/description/2006}version")
     assert version is not None
-    # v1.8: добавлен Dict-модуль (пользовательский словарь) + кнопка m002.
-    assert version.get("value") == "1.8.0"
+    # v1.8.1: фикс Basic-синтаксиса в Dict.xba (As String() → As String,
+    # отказ от ReDim с отрицательными границами; функция ExtractWordsArray
+    # переименована в ExtractWordsJoined и возвращает плоскую строку).
+    assert version.get("value") == "1.8.1"
 
 
 def test_manifest_lists_library_and_xcu():

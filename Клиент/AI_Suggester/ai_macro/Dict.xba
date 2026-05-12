@@ -118,10 +118,18 @@ Sub AIDictListWords()
         Exit Sub
     End If
 
-    ' Парсим "words": ["a", "b", ...]
-    Dim aWords() As String : aWords = ExtractWordsArray(sResp)
-    Dim nTotal As Integer : nTotal = -1
-    If Not (UBound(aWords) = -1 And LBound(aWords) = 0) Then nTotal = UBound(aWords) + 1
+    ' Парсим "words": ["a", "b", ...] в одну строку с разделителем |. Причина отказа
+    ' от нативного массива: StarBasic-компилятор не всегда принимает
+    ' возврат типизированного массива из Function и отрицательные ReDim-границы
+    ' (-1 To -1) — компилятор падает с «Неожиданный символ: (.». Поэтому возвращаем
+    ' плоскую строку, потом Split() на стороне вызывающего.
+    Dim sJoined As String : sJoined = ExtractWordsJoined(sResp)
+    Dim aWords() As String
+    Dim nTotal As Integer : nTotal = 0
+    If sJoined <> "" Then
+        aWords = Split(sJoined, Chr(10))
+        nTotal = UBound(aWords) + 1
+    End If
 
     Dim sMsg As String
     If nTotal <= 0 Then
@@ -341,19 +349,22 @@ Function ExtractTotal(sJson As String) As String
     If r = "" Then ExtractTotal = "?" Else ExtractTotal = r
 End Function
 
-' Достаёт массив "words": ["a","b",...] из JSON-ответа /dict/list.
-' Простой парсер: ищет первую открывающую [ после "words", далее пары "...".
-Function ExtractWordsArray(sJson As String) As String()
-    Dim aEmpty() As String : ReDim aEmpty(-1 To -1)  ' пустой массив
+' Достаёт массив "words": ["a","b",...] из JSON-ответа /dict/list и возвращает
+' плоскую строку — слова разделены Chr(10) (LF). Возврат массива из Function
+' в StarBasic не поддерживается стабильно (As String() / Variant с типизированным
+' массивом — компилятор может упасть с «Неожиданный символ: (.»). Поэтому
+' конкатенируем и оставляем Split() на стороне вызывающего.
+Function ExtractWordsJoined(sJson As String) As String
+    ExtractWordsJoined = ""
     Dim p As Integer : p = InStr(sJson, """words""")
-    If p = 0 Then ExtractWordsArray = aEmpty : Exit Function
+    If p = 0 Then Exit Function
     Dim pBr As Integer : pBr = InStr(p, sJson, "[")
-    If pBr = 0 Then ExtractWordsArray = aEmpty : Exit Function
+    If pBr = 0 Then Exit Function
     Dim pEnd As Integer : pEnd = InStr(pBr, sJson, "]")
     If pEnd = 0 Then pEnd = Len(sJson)
 
     Dim sBody As String : sBody = Mid(sJson, pBr + 1, pEnd - pBr - 1)
-    Dim aBuf() As String : ReDim aBuf(0 To 0)
+    Dim sOut As String : sOut = ""
     Dim nCount As Integer : nCount = 0
 
     Dim i As Integer : i = 1
@@ -382,19 +393,14 @@ Function ExtractWordsArray(sJson As String) As String()
                     i = i + 1
                 End If
             Loop
-            If nCount > UBound(aBuf) Then ReDim Preserve aBuf(0 To nCount)
-            aBuf(nCount) = sWord
+            If nCount > 0 Then sOut = sOut & Chr(10)
+            sOut = sOut & sWord
             nCount = nCount + 1
         End If
         i = i + 1
     Loop
 
-    If nCount = 0 Then
-        ExtractWordsArray = aEmpty
-    Else
-        ReDim Preserve aBuf(0 To nCount - 1)
-        ExtractWordsArray = aBuf
-    End If
+    ExtractWordsJoined = sOut
 End Function
 
 ]]></script:module>
