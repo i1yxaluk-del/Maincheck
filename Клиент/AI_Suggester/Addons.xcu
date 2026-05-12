@@ -21,16 +21,35 @@
           <prop oor:name="Target" oor:type="xs:string"><value>_self</value></prop>
           <prop oor:name="Context" oor:type="xs:string"><value>com.sun.star.text.TextDocument</value></prop>
         </node>
+        <node oor:name="m002" oor:op="replace">
+          <prop oor:name="URL" oor:type="xs:string">
+            <value>vnd.sun.star.script:ai_macro.Dict.AIDictAddSelection?language=Basic&amp;location=application</value>
+          </prop>
+          <prop oor:name="ImageIdentifier" oor:type="xs:string"><value/></prop>
+          <prop oor:name="Title" oor:type="xs:string">
+            <value xml:lang="ru">AI: В словарь</value>
+            <value xml:lang="en">AI: Add to dict</value>
+          </prop>
+          <prop oor:name="Target" oor:type="xs:string"><value>_self</value></prop>
+          <prop oor:name="Context" oor:type="xs:string"><value>com.sun.star.text.TextDocument</value></prop>
+        </node>
       </node>
     </node>
   </node>
 </oor:component-data>
 <!--
-  На панели инструментов сотрудника показывается ТОЛЬКО одна кнопка —
-  «AI: Улучшить текст» (m001). Диагностический макрос Health.AICheckServer
-  зарегистрирован в script.xlb и доступен администратору через
-  «Сервис → Макросы → Мои макросы → ai_macro → Health → AICheckServer»,
-  но намеренно не вынесен на панель: сотрудник не должен видеть и менять
-  адрес сервера.
+  На панели инструментов сотрудника показываются ДВЕ кнопки:
+    • «AI: Улучшить текст» (m001) — основной макрос Main.AISuggestSelection.
+    • «AI: В словарь» (m002) — Dict.AIDictAddSelection: добавить выделенное
+      слово (аббревиатуру / служебный термин / исключение) в пользовательский
+      словарь на сервере. Сервер хранит слова в data/user_dict.json и инжектит
+      их в SYSTEM_PROMPT при каждом /suggest, чтобы модель считала их
+      корректными.
+
+  Диагностический макрос Health.AICheckServer и сервисные Dict.AIDictListWords
+  / Dict.AIDictRemoveWord зарегистрированы в script.xlb и доступны через
+  «Сервис → Макросы → Мои макросы → ai_macro», но намеренно не вынесены на
+  панель: сотрудник не должен видеть и менять адрес сервера или массово
+  редактировать словарь.
 -->
 

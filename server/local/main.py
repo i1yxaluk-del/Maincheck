@@ -97,6 +97,20 @@ OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
 # Подробности: server/shared/morph_filter.py.
 MORPH_FILTER_ENABLED = os.getenv("MORPH_FILTER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
+# v1.8a: морфологический ДЕТЕКТОР грамматических ошибок (numeral-noun
+# disagreement, adj-noun disagreement, OOV). Запускается ПОСЛЕ T-lite,
+# обогащает CHANGES пунктами, которых модель не дала. По умолчанию
+# включён, latency-overhead <50 мс. Если pymorphy3 не загрузился —
+# тихо отключается. Подробности: server/shared/morph_detector.py.
+MORPH_DETECTOR_ENABLED = os.getenv("MORPH_DETECTOR_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+# v1.8b: пользовательский словарь (аббревиатуры, спец-термины, имена).
+# По умолчанию включён, файл хранится в data/user_dict.json (можно
+# переопределить через AI_SUGGESTER_USER_DICT_PATH). Слова инжектируются
+# в SYSTEM_PROMPT и в morph_detector whitelist. REST API: GET /dict/list,
+# POST /dict/add, POST /dict/remove. Подробности: server/shared/user_dict.py.
+USER_DICT_ENABLED = os.getenv("USER_DICT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
 # RAG
 RAG_ENABLED = os.getenv("RAG_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 RAG_STORE_DIR = os.getenv("RAG_STORE_DIR", "data/rag_store")
@@ -153,6 +167,8 @@ _rag_store = None
 _rag_embedder = None
 _gec_bank = None
 _morph_filter = None  # v1.7: lazy singleton, инициализируется ниже если MORPH_FILTER_ENABLED
+_morph_detector = None  # v1.8a: детектор ошибок (lazy singleton)
+_user_dict = None  # v1.8b: пользовательский словарь (lazy singleton)
 
 if RAG_ENABLED:
     try:
@@ -232,6 +248,39 @@ if MORPH_FILTER_ENABLED:
     except Exception as e:
         logger.warning("MorphFilter не удалось инициализировать: %s", e)
         _morph_filter = None
+
+# v1.8a: морфо-детектор. Переиспользует pymorphy3 из morph_filter
+# (singleton); init почти no-op если фильтр уже подгрузил словари.
+if MORPH_DETECTOR_ENABLED:
+    try:
+        from shared.morph_detector import get_morph_detector  # noqa: E402
+
+        _morph_detector = get_morph_detector()
+        if _morph_detector.available:
+            logger.info("MorphDetector включён: детектор грамматических ошибок (pymorphy3) активен")
+        else:
+            logger.info(
+                "MorphDetector: pymorphy3 не доступен — детектор отключён "
+                "(установите pymorphy3 + pymorphy3-dicts-ru, см. requirements.txt)"
+            )
+    except Exception as e:
+        logger.warning("MorphDetector не удалось инициализировать: %s", e)
+        _morph_detector = None
+
+# v1.8b: пользовательский словарь. Загружается из data/user_dict.json
+# (или AI_SUGGESTER_USER_DICT_PATH). Если файла нет — пустой словарь.
+if USER_DICT_ENABLED:
+    try:
+        from shared.user_dict import get_user_dict  # noqa: E402
+
+        _user_dict = get_user_dict()
+        logger.info(
+            "UserDict включён: загружено %d слов(а) из %s",
+            len(_user_dict.list_words()), _user_dict.path,
+        )
+    except Exception as e:
+        logger.warning("UserDict не удалось инициализировать: %s", e)
+        _user_dict = None
 
 
 SYSTEM_PROMPT = """Ты — корректор русского языка для официальных документов. Не рассуждай, сразу выдавай ответ в нужном формате.
@@ -462,6 +511,164 @@ def _renumber_changes(text: str) -> str:
             new_lines.append(line)
     new_changes = "\n".join(new_lines).rstrip() + "\n"
     return f"{before}===CHANGES===\n{new_changes.lstrip()}===END==={tail}"
+
+
+def _drop_user_dict_changes(text: str) -> str:
+    """v1.8b: Дропает пункты ===CHANGES===, в которых модель пытается
+    «исправить» whitelisted-термин из пользовательского словаря.
+
+    Логика: если в `before` или `after` пункта встречается слово из
+    словаря (case-insensitive, по границе слова), пункт удаляется.
+    Это защищает от регрессии случаев типа «ЦСН → ЦНС», «КС-2 → КС2»
+    которые юзер уже однажды пометил как корректные.
+
+    Если `_user_dict` не инициализирован или пуст — no-op.
+    """
+    if _user_dict is None:
+        return text
+    words = _user_dict.list_words()
+    if not words:
+        return text
+    if "===CHANGES===" not in text or "===END===" not in text:
+        return text
+    try:
+        before_block, rest = text.split("===CHANGES===", 1)
+        changes_block, tail = rest.split("===END===", 1)
+    except ValueError:
+        return text
+    # Для производительности: один регэксп всех whitelisted-слов через alternation
+    word_patterns = [re.escape(w) for w in words]
+    word_re = re.compile(
+        r"(?<![\w-])(?:" + "|".join(word_patterns) + r")(?![\w-])",
+        re.IGNORECASE,
+    )
+    kept: list[str] = []
+    dropped = 0
+    for line in changes_block.splitlines():
+        m = _CHANGE_PAIR_RE.search(line)
+        if m:
+            before_q, after_q = m.group(1), m.group(2)
+            if word_re.search(before_q) or word_re.search(after_q):
+                logger.info(
+                    "Дроп правки whitelisted-термина (user_dict): «%s» → «%s»",
+                    before_q.strip(), after_q.strip(),
+                )
+                dropped += 1
+                continue
+        kept.append(line)
+    if dropped == 0:
+        return text
+    # Если ничего не осталось — стандартное «Ошибок не найдено»
+    non_empty = [ln for ln in kept if re.search(r"\w", ln)]
+    has_real = any(re.match(r"\s*\d+\.\s*\S", ln) for ln in non_empty)
+    if not has_real:
+        kept = ["", "1. Ошибок не найдено. Текст соответствует нормам.", ""]
+    new_changes = "\n".join(kept).rstrip() + "\n"
+    return f"{before_block}===CHANGES===\n{new_changes.lstrip()}===END==={tail}"
+
+
+def _enrich_changes_with_detector(text: str, raw_text: str) -> str:
+    """v1.8a: Запускает morph_detector на raw_text и добавляет в CHANGES
+    пункты, которых модель не дала.
+
+    Если детектор отключён или не нашёл ошибок — no-op. Дедупликация:
+    пункты с тем же `before` (case-insensitive) что уже есть в CHANGES,
+    не добавляются повторно.
+
+    Также применяется CORRECTED-патч: если детектор нашёл numeral_noun
+    или adj_noun ошибку, его suggestion применяется к CORRECTED-блоку
+    (заменой первого вхождения `before` на `suggestion`). Это позволяет
+    клиенту LibreOffice применить правку через diff. OOV-ошибки с
+    пустым suggestion не патчат CORRECTED — их пользователь правит сам.
+    """
+    if _morph_detector is None or not _morph_detector.available:
+        return text
+    if not raw_text:
+        return text
+    if "===CHANGES===" not in text or "===END===" not in text:
+        return text
+    if "===CORRECTED===" not in text:
+        return text
+    # Детектор: получаем список GrammarError, фильтруем whitelist'ом
+    whitelist = _user_dict.as_frozenset() if _user_dict is not None else None
+    try:
+        errors = _morph_detector.detect_errors(raw_text, whitelist=whitelist)
+    except Exception as exc:
+        logger.warning("MorphDetector упал на raw_text (size=%d): %s", len(raw_text), exc)
+        return text
+    if not errors:
+        return text
+    # Извлекаем существующие `before` из CHANGES для дедупликации
+    try:
+        before_block, rest = text.split("===CHANGES===", 1)
+        changes_block, tail = rest.split("===END===", 1)
+    except ValueError:
+        return text
+    existing_befores: set[str] = set()
+    for line in changes_block.splitlines():
+        m = _CHANGE_PAIR_RE.search(line)
+        if m:
+            existing_befores.add(m.group(1).strip().lower())
+    # Извлекаем CORRECTED тело
+    corrected_body = _extract_corrected_body(text) or raw_text
+    new_lines: list[str] = []
+    added_pairs = 0
+    patched_corrected = corrected_body
+    for err in errors:
+        if err.before.strip().lower() in existing_befores:
+            continue
+        # Не дублируем тот же before если уже добавлен детектором
+        if err.before.strip().lower() in {e.split("«")[1].split("»")[0].lower() for e in new_lines if "«" in e}:
+            continue
+        # Если у ошибки есть suggestion и он отличается от before —
+        # формируем нормальную «X → Y» строку. Иначе (OOV без suggestion)
+        # пишем «X» → «X» с пометкой "проверьте написание" — НЕТ, это
+        # будет дропнуто `_drop_idempotent_changes`. Поэтому для OOV
+        # просто не добавляем CHANGES, а только лог пишем.
+        if not err.suggestion or err.suggestion == err.before:
+            logger.info(
+                "MorphDetector: OOV-слово в raw_text «%s» (offset=%d) — не добавляем в CHANGES (suggestion отсутствует)",
+                err.before, err.offset,
+            )
+            continue
+        new_lines.append(err.to_change_line(0))  # number перенумеруется ниже
+        existing_befores.add(err.before.strip().lower())
+        added_pairs += 1
+        # Патч CORRECTED — заменяем first occurrence
+        if err.before in patched_corrected:
+            patched_corrected = patched_corrected.replace(err.before, err.suggestion, 1)
+    if added_pairs == 0:
+        return text
+    # Соединяем существующие + новые пункты
+    existing_kept = changes_block.rstrip()
+    if existing_kept and "Ошибок не найдено" in existing_kept:
+        # Если был стаб — затираем его, т.к. теперь у нас реальные пункты
+        existing_kept = ""
+    if existing_kept:
+        merged_changes = existing_kept + "\n" + "\n".join(new_lines) + "\n"
+    else:
+        merged_changes = "\n" + "\n".join(new_lines) + "\n"
+    logger.info(
+        "MorphDetector: добавлено %d пункт(ов) в CHANGES "
+        "(пропущено моделью)", added_pairs,
+    )
+    # Заменяем CORRECTED тело и CHANGES блок
+    new_text = before_block + "===CHANGES===" + merged_changes + "===END===" + tail
+    if patched_corrected != corrected_body:
+        new_text = _replace_corrected_body(new_text, patched_corrected)
+    return new_text
+
+
+def _replace_corrected_body(text: str, new_body: str) -> str:
+    """Заменяет содержимое блока ===CORRECTED===…===CHANGES=== на new_body."""
+    if "===CORRECTED===" not in text or "===CHANGES===" not in text:
+        return text
+    try:
+        before, rest = text.split("===CORRECTED===", 1)
+        _, tail = rest.split("===CHANGES===", 1)
+    except ValueError:
+        return text
+    return f"{before}===CORRECTED===\n{new_body.strip()}\n===CHANGES==={tail}"
 
 
 def _drop_changes_not_in_text(text: str, raw_text: str) -> str:
@@ -1057,7 +1264,85 @@ async def metrics(hours: int = 24):
             _gec_bank.stats().get("bm25_terms", 0) if _gec_bank is not None else 0
         ),
         "audit": audit.stats(hours=hours),
+        "morph_detector_enabled": _morph_detector is not None and _morph_detector.available,
+        "user_dict_enabled": _user_dict is not None,
+        "user_dict_size": len(_user_dict.list_words()) if _user_dict is not None else 0,
     })
+
+
+# ─── v1.8b: REST endpoints для пользовательского словаря ─────────────
+
+
+@app.get("/dict/list")
+async def dict_list():
+    """Возвращает текущий список слов пользовательского словаря.
+
+    Response: {"words": ["ЦСН", "КС-2", ...]} (отсортированный).
+
+    Если словарь отключён (USER_DICT_ENABLED=false) — 503.
+    """
+    if _user_dict is None:
+        return JSONResponse(
+            {"error": "пользовательский словарь отключён"}, status_code=503,
+        )
+    return JSONResponse({"words": _user_dict.list_words()})
+
+
+@app.post("/dict/add")
+async def dict_add(request: Request):
+    """Добавляет слово в пользовательский словарь.
+
+    Request body: {"word": "ЦСН"} (JSON).
+    Response: {"added": true, "total": 5} либо {"added": false, ...} если уже было.
+    Errors: 400 на невалидный ввод, 503 если словарь отключён.
+    """
+    if _user_dict is None:
+        return JSONResponse(
+            {"error": "пользовательский словарь отключён"}, status_code=503,
+        )
+    try:
+        from shared.user_dict import UserDictError  # noqa: E402
+        body = await request.json()
+        word = body.get("word") if isinstance(body, dict) else None
+        if not isinstance(word, str):
+            return JSONResponse({"error": "ожидается JSON-поле 'word'"}, status_code=400)
+        added = _user_dict.add(word)
+        return JSONResponse({
+            "added": added, "total": len(_user_dict.list_words()),
+        })
+    except UserDictError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("dict/add failed")
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+@app.post("/dict/remove")
+async def dict_remove(request: Request):
+    """Удаляет слово из пользовательского словаря.
+
+    Request body: {"word": "ЦСН"} (JSON).
+    Response: {"removed": true, "total": 4} либо {"removed": false, ...} если не было.
+    """
+    if _user_dict is None:
+        return JSONResponse(
+            {"error": "пользовательский словарь отключён"}, status_code=503,
+        )
+    try:
+        from shared.user_dict import UserDictError  # noqa: E402
+        body = await request.json()
+        word = body.get("word") if isinstance(body, dict) else None
+        if not isinstance(word, str):
+            return JSONResponse({"error": "ожидается JSON-поле 'word'"}, status_code=400)
+        removed = _user_dict.remove(word)
+        return JSONResponse({
+            "removed": removed, "total": len(_user_dict.list_words()),
+        })
+    except UserDictError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("dict/remove failed")
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
 
 
 @app.post("/suggest", response_class=PlainTextResponse)
@@ -1101,17 +1386,25 @@ async def suggest(
             logger.warning("Few-shot retrieval провалился (0-shot fallback): %s", e)
             few_shot_examples = []
 
+    # v1.8b: подмешиваем пользовательский словарь в SYSTEM_PROMPT.
+    # Если словарь пустой — суффикс пустой, промпт совпадает с базовым.
+    effective_system_prompt = SYSTEM_PROMPT
+    if _user_dict is not None:
+        dict_suffix = _user_dict.render_for_prompt()
+        if dict_suffix:
+            effective_system_prompt = SYSTEM_PROMPT + "\n\n" + dict_suffix
+
     if few_shot_examples:
         from shared.gec_bank import build_few_shot_messages  # noqa: E402
 
         messages = build_few_shot_messages(
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=effective_system_prompt,
             user_text=user_msg,
             examples=few_shot_examples,
         )
     else:
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": effective_system_prompt},
             {"role": "user", "content": user_msg},
         ]
 
@@ -1185,6 +1478,16 @@ async def suggest(
                             "(модель забыла рапорт)", len(rebuilt),
                         )
                         result = _replace_changes_block(result, rebuilt)
+            # v1.8b: дропаем пункты, в которых модель «исправляет»
+            # whitelisted-термины пользовательского словаря (ЦСН, КС-2,
+            # имена организаций и т.п.). Если словарь пуст — no-op.
+            result = _drop_user_dict_changes(result)
+            # v1.8a: обогащаем CHANGES пунктами, которые морфо-детектор
+            # нашёл в raw_text (numeral-noun «во 2-м кварталах»,
+            # adj-noun «капитальных ремонтова», и т.п.). Если детектор
+            # отключён или ошибок не найдено — no-op. Дедупликация по
+            # `before` чтобы не дублировать пункты, уже отданные моделью.
+            result = _enrich_changes_with_detector(result, raw_text)
             # v1.7.3: финальная пере-нумерация CHANGES (после всех drop'ов
             # и возможной реконструкции). Закрывает кейс «правки начались
             # со 2го пункта» в LibreOffice-расширении: если фильтр дропнул

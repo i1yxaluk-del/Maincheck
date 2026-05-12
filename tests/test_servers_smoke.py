@@ -1197,3 +1197,230 @@ def test_cloud_missing_key(monkeypatch, tmp_path):
         assert "ОШИБКА" in r.text and "OPENROUTER_API_KEY" in r.text
     finally:
         sys.path.remove(str(cloud_dir))
+
+
+# ─── v1.8a / v1.8b tests ───────────────────────────────────────────────
+
+
+def test_v18_dict_list_endpoint(local_module, monkeypatch, tmp_path):
+    """GET /dict/list возвращает пустой список из свежего словаря."""
+    from fastapi.testclient import TestClient
+    # Изолируем словарь через AI_SUGGESTER_USER_DICT_PATH
+    dict_path = tmp_path / "test_dict.json"
+    monkeypatch.setattr(local_module, "_user_dict",
+                        local_module.shared.user_dict.UserDictionary(dict_path)
+                        if hasattr(local_module, "shared") else None)
+    # Импорт через модуль если выше не сработал
+    from shared.user_dict import UserDictionary
+    local_module._user_dict = UserDictionary(dict_path)
+    client = TestClient(local_module.app)
+    r = client.get("/dict/list")
+    assert r.status_code == 200
+    assert r.json() == {"words": []}
+
+
+def test_v18_dict_add_endpoint(local_module, monkeypatch, tmp_path):
+    """POST /dict/add добавляет слово, GET /dict/list его возвращает."""
+    from fastapi.testclient import TestClient
+    from shared.user_dict import UserDictionary
+    dict_path = tmp_path / "test_dict.json"
+    local_module._user_dict = UserDictionary(dict_path)
+    client = TestClient(local_module.app)
+    r = client.post("/dict/add", json={"word": "ЦСН"})
+    assert r.status_code == 200
+    assert r.json() == {"added": True, "total": 1}
+    r2 = client.post("/dict/add", json={"word": "ЦСН"})
+    assert r2.json() == {"added": False, "total": 1}
+    r3 = client.get("/dict/list")
+    assert r3.json() == {"words": ["ЦСН"]}
+
+
+def test_v18_dict_add_validates_input(local_module, monkeypatch, tmp_path):
+    """POST /dict/add отвергает мусор."""
+    from fastapi.testclient import TestClient
+    from shared.user_dict import UserDictionary
+    dict_path = tmp_path / "test_dict.json"
+    local_module._user_dict = UserDictionary(dict_path)
+    client = TestClient(local_module.app)
+    # Пустое слово
+    r = client.post("/dict/add", json={"word": ""})
+    assert r.status_code == 400
+    # Не строка
+    r2 = client.post("/dict/add", json={"word": 123})
+    assert r2.status_code == 400
+    # С запрещёнными символами
+    r3 = client.post("/dict/add", json={"word": "<script>"})
+    assert r3.status_code == 400
+
+
+def test_v18_dict_remove_endpoint(local_module, monkeypatch, tmp_path):
+    """POST /dict/remove удаляет слово."""
+    from fastapi.testclient import TestClient
+    from shared.user_dict import UserDictionary
+    dict_path = tmp_path / "test_dict.json"
+    local_module._user_dict = UserDictionary(dict_path)
+    client = TestClient(local_module.app)
+    client.post("/dict/add", json={"word": "ЦСН"})
+    r = client.post("/dict/remove", json={"word": "ЦСН"})
+    assert r.status_code == 200
+    assert r.json() == {"removed": True, "total": 0}
+    r2 = client.post("/dict/remove", json={"word": "ЦСН"})
+    assert r2.json() == {"removed": False, "total": 0}
+
+
+def test_v18_dict_disabled_returns_503(local_module, monkeypatch):
+    """Если USER_DICT_ENABLED=false (или _user_dict=None) — 503."""
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(local_module, "_user_dict", None)
+    client = TestClient(local_module.app)
+    r = client.get("/dict/list")
+    assert r.status_code == 503
+    r2 = client.post("/dict/add", json={"word": "ЦСН"})
+    assert r2.status_code == 503
+
+
+def test_v18_drop_user_dict_changes_no_op_when_empty(local_module):
+    """_drop_user_dict_changes — no-op если словарь пустой."""
+    from shared.user_dict import UserDictionary
+    import tempfile
+    import os as _os
+    fd, path = tempfile.mkstemp(suffix=".json")
+    _os.close(fd)
+    _os.unlink(path)
+    try:
+        local_module._user_dict = UserDictionary(__import__("pathlib").Path(path))
+        text = (
+            "===CORRECTED===\nтекст\n===CHANGES===\n"
+            "1. «ЦСН» → «ЦНС» | опечатка\n===END==="
+        )
+        out = local_module._drop_user_dict_changes(text)
+        assert out == text  # no-op
+    finally:
+        if _os.path.exists(path):
+            _os.unlink(path)
+
+
+def test_v18_drop_user_dict_changes_drops_whitelisted(local_module, tmp_path):
+    """_drop_user_dict_changes дропает пункты, в которых модель «исправляет»
+    whitelisted-термин."""
+    from shared.user_dict import UserDictionary
+    dict_path = tmp_path / "ud.json"
+    local_module._user_dict = UserDictionary(dict_path)
+    local_module._user_dict.add("ЦСН")
+    text = (
+        "===CORRECTED===\nтекст\n===CHANGES===\n"
+        "1. «ЦСН» → «ЦНС» | опечатка\n"
+        "2. «работ» → «работы» | согласование\n"
+        "===END==="
+    )
+    out = local_module._drop_user_dict_changes(text)
+    assert "«ЦСН» → «ЦНС»" not in out
+    assert "«работ» → «работы»" in out
+
+
+def test_v18_drop_user_dict_changes_case_insensitive(local_module, tmp_path):
+    """Whitelist должен быть case-insensitive."""
+    from shared.user_dict import UserDictionary
+    dict_path = tmp_path / "ud.json"
+    local_module._user_dict = UserDictionary(dict_path)
+    local_module._user_dict.add("ЦСН")
+    text = (
+        "===CORRECTED===\nтекст\n===CHANGES===\n"
+        "1. «цсн» → «ЦНС» | опечатка\n===END==="
+    )
+    out = local_module._drop_user_dict_changes(text)
+    # «цсн» (lowercase) — то же что «ЦСН» в whitelist (case-insensitive)
+    assert "опечатка" not in out
+
+
+def test_v18_enrich_changes_with_detector_adds_kvartalakh(local_module):
+    """enrich-функция добавляет «во 2-м кварталах» если детектор нашёл."""
+    text = (
+        "===CORRECTED===\n"
+        "Во 2-м кварталах планируется направление материалов проверки.\n"
+        "===CHANGES===\n"
+        "1. Ошибок не найдено. Текст соответствует нормам.\n"
+        "===END==="
+    )
+    raw = "Во 2-м кварталах планируется направление материалов проверки."
+    out = local_module._enrich_changes_with_detector(text, raw)
+    # Должна появиться правка «кварталах» → «квартале»
+    assert "кварталах" in out
+    assert "квартале" in out
+    # Должно быть в CHANGES блоке
+    changes_block = out.split("===CHANGES===")[1].split("===END===")[0]
+    assert "«кварталах» → «квартале»" in changes_block
+
+
+def test_v18_enrich_changes_dedupes_existing(local_module):
+    """Если модель уже отдала пункт с тем же before — детектор не дублирует."""
+    text = (
+        "===CORRECTED===\n"
+        "Во 2-м квартале планируется.\n"
+        "===CHANGES===\n"
+        "1. «кварталах» → «квартале» | согласование с числительным\n"
+        "===END==="
+    )
+    raw = "Во 2-м кварталах планируется."
+    out = local_module._enrich_changes_with_detector(text, raw)
+    changes_block = out.split("===CHANGES===")[1].split("===END===")[0]
+    # Пункт встречается ровно один раз
+    assert changes_block.count("«кварталах»") == 1
+
+
+def test_v18_enrich_changes_no_op_if_disabled(local_module, monkeypatch):
+    """Если детектор отключён — функция no-op."""
+    monkeypatch.setattr(local_module, "_morph_detector", None)
+    text = (
+        "===CORRECTED===\nтекст\n===CHANGES===\n1. Ошибок не найдено.\n===END==="
+    )
+    raw = "Во 2-м кварталах ошибок."
+    out = local_module._enrich_changes_with_detector(text, raw)
+    assert out == text
+
+
+def test_v18_metrics_includes_detector_and_dict_state(local_module, tmp_path):
+    """GET /metrics возвращает morph_detector_enabled и user_dict_size."""
+    from fastapi.testclient import TestClient
+    from shared.user_dict import UserDictionary
+    dict_path = tmp_path / "ud.json"
+    local_module._user_dict = UserDictionary(dict_path)
+    local_module._user_dict.add("ЦСН")
+    client = TestClient(local_module.app)
+    r = client.get("/metrics")
+    data = r.json()
+    assert "morph_detector_enabled" in data
+    assert "user_dict_enabled" in data
+    assert data["user_dict_size"] == 1
+
+
+def test_v18_full_pipeline_meropriyatie_and_kvartalakh(local_module, monkeypatch):
+    """E2E: модель ничего не правит, детектор находит «мероприятия» и «кварталах»."""
+    from fastapi.testclient import TestClient
+
+    async def fake_call_ollama(messages):
+        # Модель не нашла ошибок (как в проде — пропустила «кварталах»)
+        return (
+            "===CORRECTED===\n"
+            "Проверочное мероприятия. Во 2-м кварталах планируется.\n"
+            "===CHANGES===\n"
+            "1. Ошибок не найдено. Текст соответствует нормам.\n"
+            "===END==="
+        )
+
+    monkeypatch.setattr(local_module, "call_ollama", fake_call_ollama)
+    client = TestClient(local_module.app)
+    raw = "Проверочное мероприятия. Во 2-м кварталах планируется."
+    files = {
+        "text": ("t.txt", io.BytesIO(raw.encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    body = r.text
+    # Детектор добавил минимум одну правку
+    assert "кварталах" in body or "мероприятия" in body
+    changes = body.split("===CHANGES===")[1].split("===END===")[0]
+    has_meropr = "«мероприятия»" in changes
+    has_kvar = "«кварталах»" in changes
+    assert has_meropr or has_kvar, f"Детектор не сработал. CHANGES:\n{changes}"
