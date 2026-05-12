@@ -19,7 +19,8 @@ def test_description_version():
     root = _parse(EXT_DIR / "description.xml")
     version = root.find("{http://openoffice.org/extensions/description/2006}version")
     assert version is not None
-    assert version.get("value") == "1.5.8"
+    # v1.8: добавлен Dict-модуль (пользовательский словарь) + кнопка m002.
+    assert version.get("value") == "1.8.0"
 
 
 def test_manifest_lists_library_and_xcu():
@@ -34,10 +35,10 @@ def test_script_xlb_lists_modules():
     root = _parse(EXT_DIR / "ai_macro" / "script.xlb")
     ns = "{http://openoffice.org/2000/library}"
     names = {e.get("library:name") or e.get(f"{ns}name") for e in root.findall(f"{ns}element")}
-    assert {"Main", "Settings", "Health"}.issubset(names)
+    assert {"Main", "Settings", "Health", "Dict"}.issubset(names)
 
 
-@pytest.mark.parametrize("name", ["Main.xba", "Settings.xba", "Health.xba"])
+@pytest.mark.parametrize("name", ["Main.xba", "Settings.xba", "Health.xba", "Dict.xba"])
 def test_basic_modules_are_parseable(name):
     p = EXT_DIR / "ai_macro" / name
     assert p.exists(), f"Отсутствует {p}"
@@ -49,18 +50,37 @@ def test_basic_modules_are_parseable(name):
     assert "]]>" in body
 
 
-def test_addons_xcu_has_single_user_toolbar_entry():
+def test_addons_xcu_has_user_toolbar_entries():
     """
-    У сотрудника на панели — ровно одна кнопка «AI: Улучшить текст» (m001).
-    Диагностический Health.AICheckServer намеренно не вынесен на панель:
-    сотрудник не должен видеть/менять URL сервера.
+    На панели сотрудника две кнопки:
+      m001 — Main.AISuggestSelection («AI: Улучшить текст»);
+      m002 — Dict.AIDictAddSelection («AI: В словарь», v1.8b).
+    Диагностический Health.AICheckServer и сервисные Dict.AIDictListWords
+    / Dict.AIDictRemoveWord намеренно не вынесены на панель — доступны
+    через меню макросов администратору.
     """
     root = _parse(EXT_DIR / "Addons.xcu")
     ns = "{http://openoffice.org/2001/registry}"
-    nodes = root.iter("node")
+    nodes = list(root.iter("node"))
     names = {n.get(f"{ns}name") for n in nodes}
-    assert "m001" in names  # AISuggestSelection — единственная кнопка работника
-    assert "m002" not in names  # AICheckServer вынесен в меню макросов
+    assert "m001" in names  # AISuggestSelection
+    assert "m002" in names  # AIDictAddSelection (v1.8b)
+    assert "m003" not in names  # больше кнопок не добавляли
+    # m002 действительно ссылается на Dict.AIDictAddSelection
+    prop_ns = "{http://openoffice.org/2001/registry}"
+    for node in nodes:
+        if node.get(f"{prop_ns}name") == "m002":
+            urls = [
+                v.text or ""
+                for v in node.iter()
+                if v.tag.endswith("value")
+            ]
+            assert any(
+                "Dict.AIDictAddSelection" in u for u in urls
+            ), f"m002 должна вызывать Dict.AIDictAddSelection, найдены: {urls}"
+            break
+    else:
+        pytest.fail("node m002 не найден в Addons.xcu")
 
 
 def test_oxt_artifact_can_be_rebuilt(tmp_path):
@@ -80,6 +100,7 @@ def test_oxt_artifact_can_be_rebuilt(tmp_path):
             "ai_macro/Main.xba",
             "ai_macro/Settings.xba",
             "ai_macro/Health.xba",
+            "ai_macro/Dict.xba",
             "ai_macro/script.xlb",
             "ai_macro/dialog.xlb",
         ):

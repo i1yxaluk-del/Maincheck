@@ -4,4 +4,5 @@
   <library:element library:name="Settings"/>
   <library:element library:name="Main"/>
   <library:element library:name="Health"/>
+  <library:element library:name="Dict"/>
 </library:library>

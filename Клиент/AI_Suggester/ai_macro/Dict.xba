@@ -1,0 +1,400 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE script:module PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "module.dtd">
+<script:module xmlns:script="http://openoffice.org/2000/script" script:name="Dict" script:language="StarBasic"><![CDATA[
+' ═══════════════════════════════════════════════════════════════════════════
+'  ПОЛЬЗОВАТЕЛЬСКИЙ СЛОВАРЬ (v1.8b)
+'
+'  Сотрудник выделяет аббревиатуру/служебное слово/исключение, нажимает
+'  кнопку «AI: В словарь», и слово отправляется на сервер через POST
+'  /dict/add. Сервер хранит словарь в data/user_dict.json и при каждом
+'  /suggest:
+'    1) инжектит список в SYSTEM_PROMPT («считать корректными: ...»);
+'    2) фильтрует CHANGES, где before/after содержат слово из словаря;
+'    3) передаёт whitelist в morph-детектор, чтобы тот не флагал OOV.
+'
+'  Доступны три макроса:
+'    • Dict.AIDictAddSelection() — добавить выделенное слово (на панели).
+'    • Dict.AIDictListWords()    — показать текущий список (диалог).
+'    • Dict.AIDictRemoveWord()   — удалить слово из словаря (диалог).
+'
+'  Адрес /dict берётся из Settings.GetDictBase() (выводится из GetServerList).
+' ═══════════════════════════════════════════════════════════════════════════
+
+' ═══════════════════════════════════════════════════
+'  ДОБАВИТЬ ВЫДЕЛЕННЫЙ ТЕРМИН В СЛОВАРЬ
+' ═══════════════════════════════════════════════════
+Sub AIDictAddSelection()
+    On Error GoTo ErrorHandler
+
+    Dim oDoc  As Object : oDoc  = ThisComponent
+    Dim oSels As Object : oSels = oDoc.getCurrentSelection()
+    If IsNull(oSels) Or IsEmpty(oSels) Then
+        MsgBox "Выделите слово (аббревиатуру/термин), которое нужно добавить в словарь.", _
+               64, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    Dim oSel As Object : oSel = oSels.getByIndex(0)
+    Dim sWord As String : sWord = Trim(oSel.getString())
+    If sWord = "" Then
+        MsgBox "Выделенный фрагмент пустой.", 64, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    ' Валидация на стороне клиента: одно слово без пробелов/переносов
+    If InStr(sWord, " ") > 0 Or InStr(sWord, Chr(10)) > 0 Or InStr(sWord, Chr(13)) > 0 Then
+        MsgBox "В словарь добавляется ОДНО слово. Выделено: «" & sWord & "».", _
+               48, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+    If Len(sWord) < 2 Or Len(sWord) > 64 Then
+        MsgBox "Длина слова должна быть от 2 до 64 символов. Выделено " & _
+               CStr(Len(sWord)) & " симв.: «" & sWord & "».", _
+               48, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    Dim sUrl As String : sUrl = DictAddUrl()
+    If sUrl = "" Then
+        MsgBox "Не настроен адрес сервера (Settings.GetServerList).", _
+               16, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    Dim sResp As String, sHttp As String
+    If Not PostJson(sUrl, "{""word"":""" & EscapeJsonString(sWord) & """}", sResp, sHttp) Then
+        MsgBox "Не удалось связаться с сервером:" & Chr(10) & sUrl & Chr(10) & _
+               "HTTP: " & sHttp & Chr(10) & "Ответ: " & Left(sResp, 300), _
+               16, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    If Left(sHttp, 1) = "2" Then
+        ' 200 OK: разбираем "added":true/false и "total":N
+        Dim sMsg As String
+        If InStr(sResp, """added"":true") > 0 Then
+            sMsg = "Слово «" & sWord & "» добавлено в словарь." & Chr(10) & Chr(10) & _
+                   "Всего слов: " & ExtractTotal(sResp) & Chr(10) & Chr(10) & _
+                   "При следующих проверках сервер будет считать его корректным."
+        Else
+            sMsg = "Слово «" & sWord & "» уже было в словаре." & Chr(10) & Chr(10) & _
+                   "Всего слов: " & ExtractTotal(sResp)
+        End If
+        MsgBox sMsg, 64, "AI Suggester — Словарь"
+    Else
+        ' 400 (валидация), 503 (отключён), 500 (внутренняя)
+        MsgBox "Сервер отверг запрос (HTTP " & sHttp & "):" & Chr(10) & _
+               Left(sResp, 400), 48, "AI Suggester — Словарь"
+    End If
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "Внутренняя ошибка (#" & Err & "): " & Error, 16, "AI Suggester — Словарь"
+End Sub
+
+' ═══════════════════════════════════════════════════
+'  ПОКАЗАТЬ ТЕКУЩИЙ СПИСОК СЛОВАРЯ
+' ═══════════════════════════════════════════════════
+Sub AIDictListWords()
+    On Error GoTo ErrorHandler
+
+    Dim sUrl As String : sUrl = DictListUrl()
+    If sUrl = "" Then
+        MsgBox "Не настроен адрес сервера (Settings.GetServerList).", _
+               16, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    Dim sResp As String, sHttp As String
+    If Not GetUrl(sUrl, sResp, sHttp) Then
+        MsgBox "Не удалось связаться с сервером:" & Chr(10) & sUrl & Chr(10) & _
+               "HTTP: " & sHttp, 16, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    If Left(sHttp, 1) <> "2" Then
+        MsgBox "Сервер вернул HTTP " & sHttp & ":" & Chr(10) & Left(sResp, 400), _
+               48, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    ' Парсим "words": ["a", "b", ...]
+    Dim aWords() As String : aWords = ExtractWordsArray(sResp)
+    Dim nTotal As Integer : nTotal = -1
+    If Not (UBound(aWords) = -1 And LBound(aWords) = 0) Then nTotal = UBound(aWords) + 1
+
+    Dim sMsg As String
+    If nTotal <= 0 Then
+        sMsg = "Словарь пуст." & Chr(10) & Chr(10) & _
+               "Чтобы добавить слово: выделите его в тексте и нажмите кнопку «AI: В словарь»."
+    Else
+        sMsg = "В словаре " & CStr(nTotal) & " слов(а):" & Chr(10) & Chr(10)
+        Dim i As Integer
+        For i = 0 To UBound(aWords)
+            sMsg = sMsg & "  • " & aWords(i) & Chr(10)
+            If i >= 60 Then
+                sMsg = sMsg & "  … и ещё " & CStr(UBound(aWords) - i) & Chr(10)
+                Exit For
+            End If
+        Next i
+    End If
+    MsgBox sMsg, 64, "AI Suggester — Словарь"
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "Внутренняя ошибка (#" & Err & "): " & Error, 16, "AI Suggester — Словарь"
+End Sub
+
+' ═══════════════════════════════════════════════════
+'  УДАЛИТЬ СЛОВО ИЗ СЛОВАРЯ
+' ═══════════════════════════════════════════════════
+Sub AIDictRemoveWord()
+    On Error GoTo ErrorHandler
+
+    Dim sWord As String
+    sWord = Trim(InputBox("Введите слово для удаления из словаря:", _
+                          "AI Suggester — Словарь", ""))
+    If sWord = "" Then Exit Sub
+
+    Dim sUrl As String : sUrl = DictRemoveUrl()
+    If sUrl = "" Then
+        MsgBox "Не настроен адрес сервера (Settings.GetServerList).", _
+               16, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    Dim sResp As String, sHttp As String
+    If Not PostJson(sUrl, "{""word"":""" & EscapeJsonString(sWord) & """}", sResp, sHttp) Then
+        MsgBox "Не удалось связаться с сервером:" & Chr(10) & sUrl & Chr(10) & _
+               "HTTP: " & sHttp & Chr(10) & "Ответ: " & Left(sResp, 300), _
+               16, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    If Left(sHttp, 1) = "2" Then
+        Dim sMsg As String
+        If InStr(sResp, """removed"":true") > 0 Then
+            sMsg = "Слово «" & sWord & "» удалено из словаря." & Chr(10) & Chr(10) & _
+                   "Всего слов: " & ExtractTotal(sResp)
+        Else
+            sMsg = "Слова «" & sWord & "» не было в словаре." & Chr(10) & Chr(10) & _
+                   "Всего слов: " & ExtractTotal(sResp)
+        End If
+        MsgBox sMsg, 64, "AI Suggester — Словарь"
+    Else
+        MsgBox "Сервер отверг запрос (HTTP " & sHttp & "):" & Chr(10) & _
+               Left(sResp, 400), 48, "AI Suggester — Словарь"
+    End If
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "Внутренняя ошибка (#" & Err & "): " & Error, 16, "AI Suggester — Словарь"
+End Sub
+
+
+' ═══════════════════════════════════════════════════
+'  ВНУТРЕННИЕ ХЕЛПЕРЫ — URL-ы
+' ═══════════════════════════════════════════════════
+' Берём ПЕРВЫЙ из списка серверов (Settings.GetServerList "url1|url2"),
+' меняем /suggest → /dict/add | /dict/list | /dict/remove.
+Function DictBaseUrl() As String
+    Dim sList As String : sList = Settings.GetServerList()
+    If sList = "" Then DictBaseUrl = "" : Exit Function
+    Dim aUrls() As String : aUrls = Split(sList, "|")
+    DictBaseUrl = Trim(aUrls(0))
+End Function
+
+Function DictAddUrl() As String
+    Dim s As String : s = DictBaseUrl()
+    If s = "" Then DictAddUrl = "" : Exit Function
+    DictAddUrl = Replace(s, "/suggest", "/dict/add")
+End Function
+
+Function DictListUrl() As String
+    Dim s As String : s = DictBaseUrl()
+    If s = "" Then DictListUrl = "" : Exit Function
+    DictListUrl = Replace(s, "/suggest", "/dict/list")
+End Function
+
+Function DictRemoveUrl() As String
+    Dim s As String : s = DictBaseUrl()
+    If s = "" Then DictRemoveUrl = "" : Exit Function
+    DictRemoveUrl = Replace(s, "/suggest", "/dict/remove")
+End Function
+
+
+' ═══════════════════════════════════════════════════
+'  HTTP ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+' ═══════════════════════════════════════════════════
+' POST JSON через curl. Возвращает True при успешном HTTP-ответе (любой 2xx).
+' sResp получает тело ответа, sHttp — код (например "200" / "400" / "503").
+Function PostJson(sUrl As String, sJson As String, ByRef sResp As String, _
+                  ByRef sHttp As String) As Boolean
+    PostJson = False
+    sResp = "" : sHttp = ""
+
+    Dim oPS As Object : oPS = CreateUnoService("com.sun.star.util.PathSettings")
+    Dim sTmp As String : sTmp = ConvertFromURL(oPS.Temp)
+    Dim sSep As String : sSep = IIf(GetGUIType() = 1, "\", "/")
+    Dim sIn  As String : sIn  = sTmp & sSep & "ai_dict_in.json"
+    Dim sOut As String : sOut = sTmp & sSep & "ai_dict_out.txt"
+    Dim sSt  As String : sSt  = sTmp & sSep & "ai_dict_status.txt"
+
+    Main.WriteUTF8 sIn, sJson
+    If FileExists(sOut) Then Kill sOut
+    If FileExists(sSt) Then Kill sSt
+
+    Dim sCmd As String
+    If GetGUIType() = 1 Then
+        ' Windows: %% → одинарный % (см. комментарий в Main.xba про cmd.exe)
+        sCmd = "/c curl.exe -s --max-time 15 -X POST -H ""Content-Type: application/json"" " & _
+               "--data-binary ""@" & sIn & """ " & sUrl & " -o """ & sOut & """ -w ""%%{http_code}"" > """ & sSt & """"
+        Shell "cmd.exe", 1, sCmd, True
+    Else
+        sCmd = "curl -s --max-time 15 -X POST -H 'Content-Type: application/json' " & _
+               "--data-binary '@" & sIn & "' " & sUrl & " -o '" & sOut & "' -w '%{http_code}' > '" & sSt & "'"
+        Shell "/bin/sh", 1, "-c " & Chr(34) & sCmd & Chr(34), True
+    End If
+
+    If FileExists(sSt) Then sHttp = Main.ExtractDigits(Main.ReadUTF8(sSt))
+    If FileExists(sOut) Then sResp = Trim(Main.ReadUTF8(sOut))
+
+    ' Если HTTP вернулся (даже 4xx/5xx) — считаем что связь была.
+    ' False возвращаем только при полном отсутствии ответа.
+    If sHttp = "" And sResp = "" Then Exit Function
+    PostJson = True
+End Function
+
+' GET URL через curl.
+Function GetUrl(sUrl As String, ByRef sResp As String, ByRef sHttp As String) As Boolean
+    GetUrl = False
+    sResp = "" : sHttp = ""
+
+    Dim oPS As Object : oPS = CreateUnoService("com.sun.star.util.PathSettings")
+    Dim sTmp As String : sTmp = ConvertFromURL(oPS.Temp)
+    Dim sSep As String : sSep = IIf(GetGUIType() = 1, "\", "/")
+    Dim sOut As String : sOut = sTmp & sSep & "ai_dict_out.txt"
+    Dim sSt  As String : sSt  = sTmp & sSep & "ai_dict_status.txt"
+
+    If FileExists(sOut) Then Kill sOut
+    If FileExists(sSt) Then Kill sSt
+
+    Dim sCmd As String
+    If GetGUIType() = 1 Then
+        sCmd = "/c curl.exe -s --max-time 10 " & sUrl & _
+               " -o """ & sOut & """ -w ""%%{http_code}"" > """ & sSt & """"
+        Shell "cmd.exe", 1, sCmd, True
+    Else
+        sCmd = "curl -s --max-time 10 " & sUrl & _
+               " -o '" & sOut & "' -w '%{http_code}' > '" & sSt & "'"
+        Shell "/bin/sh", 1, "-c " & Chr(34) & sCmd & Chr(34), True
+    End If
+
+    If FileExists(sSt) Then sHttp = Main.ExtractDigits(Main.ReadUTF8(sSt))
+    If FileExists(sOut) Then sResp = Trim(Main.ReadUTF8(sOut))
+    If sHttp = "" And sResp = "" Then Exit Function
+    GetUrl = True
+End Function
+
+
+' ═══════════════════════════════════════════════════
+'  МИНИМАЛЬНЫЙ JSON
+' ═══════════════════════════════════════════════════
+' Экранируем символы для JSON-строки. На стороне клиента валидируем заранее,
+' но безопаснее экранировать всё что может встретиться.
+Function EscapeJsonString(s As String) As String
+    Dim r As String : r = ""
+    Dim i As Integer
+    For i = 1 To Len(s)
+        Dim ch As String : ch = Mid(s, i, 1)
+        Select Case ch
+            Case Chr(34) : r = r & "\" & Chr(34)
+            Case "\"     : r = r & "\\"
+            Case Chr(8)  : r = r & "\b"
+            Case Chr(9)  : r = r & "\t"
+            Case Chr(10) : r = r & "\n"
+            Case Chr(12) : r = r & "\f"
+            Case Chr(13) : r = r & "\r"
+            Case Else    : r = r & ch
+        End Select
+    Next i
+    EscapeJsonString = r
+End Function
+
+' Достаёт число после "total": из JSON-ответа сервера. На ошибки возвращает "?".
+Function ExtractTotal(sJson As String) As String
+    Dim p As Integer : p = InStr(sJson, """total"":")
+    If p = 0 Then ExtractTotal = "?" : Exit Function
+    Dim i As Integer : i = p + Len("""total"":")
+    Dim r As String : r = ""
+    Do While i <= Len(sJson)
+        Dim ch As String : ch = Mid(sJson, i, 1)
+        If ch >= "0" And ch <= "9" Then
+            r = r & ch
+        ElseIf r <> "" Then
+            Exit Do
+        ElseIf ch <> " " Then
+            Exit Do
+        End If
+        i = i + 1
+    Loop
+    If r = "" Then ExtractTotal = "?" Else ExtractTotal = r
+End Function
+
+' Достаёт массив "words": ["a","b",...] из JSON-ответа /dict/list.
+' Простой парсер: ищет первую открывающую [ после "words", далее пары "...".
+Function ExtractWordsArray(sJson As String) As String()
+    Dim aEmpty() As String : ReDim aEmpty(-1 To -1)  ' пустой массив
+    Dim p As Integer : p = InStr(sJson, """words""")
+    If p = 0 Then ExtractWordsArray = aEmpty : Exit Function
+    Dim pBr As Integer : pBr = InStr(p, sJson, "[")
+    If pBr = 0 Then ExtractWordsArray = aEmpty : Exit Function
+    Dim pEnd As Integer : pEnd = InStr(pBr, sJson, "]")
+    If pEnd = 0 Then pEnd = Len(sJson)
+
+    Dim sBody As String : sBody = Mid(sJson, pBr + 1, pEnd - pBr - 1)
+    Dim aBuf() As String : ReDim aBuf(0 To 0)
+    Dim nCount As Integer : nCount = 0
+
+    Dim i As Integer : i = 1
+    Do While i <= Len(sBody)
+        Dim ch As String : ch = Mid(sBody, i, 1)
+        If ch = Chr(34) Then
+            ' Начало строки, ищем закрывающую "; учитываем \" внутри.
+            Dim sWord As String : sWord = ""
+            i = i + 1
+            Do While i <= Len(sBody)
+                Dim ch2 As String : ch2 = Mid(sBody, i, 1)
+                If ch2 = "\" And i < Len(sBody) Then
+                    Dim ch3 As String : ch3 = Mid(sBody, i + 1, 1)
+                    Select Case ch3
+                        Case Chr(34) : sWord = sWord & Chr(34)
+                        Case "\"     : sWord = sWord & "\"
+                        Case "n"     : sWord = sWord & Chr(10)
+                        Case "t"     : sWord = sWord & Chr(9)
+                        Case Else    : sWord = sWord & ch3
+                    End Select
+                    i = i + 2
+                ElseIf ch2 = Chr(34) Then
+                    Exit Do
+                Else
+                    sWord = sWord & ch2
+                    i = i + 1
+                End If
+            Loop
+            If nCount > UBound(aBuf) Then ReDim Preserve aBuf(0 To nCount)
+            aBuf(nCount) = sWord
+            nCount = nCount + 1
+        End If
+        i = i + 1
+    Loop
+
+    If nCount = 0 Then
+        ExtractWordsArray = aEmpty
+    Else
+        ReDim Preserve aBuf(0 To nCount - 1)
+        ExtractWordsArray = aBuf
+    End If
+End Function
+
+]]></script:module>
