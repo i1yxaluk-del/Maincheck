@@ -169,6 +169,7 @@ _gec_bank = None
 _morph_filter = None  # v1.7: lazy singleton, инициализируется ниже если MORPH_FILTER_ENABLED
 _morph_detector = None  # v1.8a: детектор ошибок (lazy singleton)
 _user_dict = None  # v1.8b: пользовательский словарь (lazy singleton)
+_sage_validator = None  # v1.8c: sage-95m пост-валидатор (lazy singleton)
 
 if RAG_ENABLED:
     try:
@@ -281,6 +282,37 @@ if USER_DICT_ENABLED:
     except Exception as e:
         logger.warning("UserDict не удалось инициализировать: %s", e)
         _user_dict = None
+
+# v1.8c: sage-95m post-валидатор. Опционально — выключен по умолчанию,
+# чтобы пакет можно было ставить без `transformers`/`torch`. Если
+# SAGE_VALIDATOR_ENABLED=true, sage_validator.is_available() лениво
+# загрузит модель при первом обращении (или на старте, если задан warmup).
+try:
+    from shared.sage_validator import get_validator as _get_sage_validator  # noqa: E402
+
+    _sage_validator = _get_sage_validator()
+    if _sage_validator.config.enabled:
+        # Прокидываем загрузку при старте, чтобы первый /suggest не страдал
+        # на cold-start (~3-5 c). Если transformers/torch не установлены,
+        # is_available() вернёт False и валидатор станет no-op'ом.
+        if _sage_validator.is_available():
+            logger.info(
+                "SageValidator включён: model=%s, domain=%s, device=%s",
+                _sage_validator.config.model_name,
+                _sage_validator.config.domain,
+                _sage_validator.config.device,
+            )
+        else:
+            logger.warning(
+                "SageValidator: SAGE_VALIDATOR_ENABLED=true, но модель не "
+                "загрузилась — валидатор работает как no-op. Проверьте, что "
+                "установлены transformers/torch и доступен HuggingFace Hub."
+            )
+    else:
+        logger.info("SageValidator: отключён (SAGE_VALIDATOR_ENABLED=false)")
+except Exception as e:  # noqa: BLE001
+    logger.warning("SageValidator не удалось инициализировать: %s", e)
+    _sage_validator = None
 
 
 SYSTEM_PROMPT = """Ты — корректор русского языка для официальных документов. Не рассуждай, сразу выдавай ответ в нужном формате.
@@ -514,6 +546,145 @@ def _drop_idempotent_changes(text: str) -> str:
 
 
 _CHANGE_NUM_RE = re.compile(r"^(\s*)(\d+)\.(\s*)(.*)$")
+
+
+def _filter_changes_with_sage(text: str, raw_text: str) -> str:
+    """v1.8c: пост-валидация ===CHANGES=== через sage-fredt5-distilled-95m.
+
+    Алгоритм:
+      1. Sage один раз корректирует raw_text → sage_corrected.
+      2. Для каждой пары (before → after) из CHANGES берём verdict у
+         SageValidator.judge():
+           - AGREE: sage воспроизвёл `after` → правку оставляем.
+           - DISAGREE: sage оставил `before` → возможно FP T-lite.
+           - UNKNOWN: sage сделал что-то третье → неоднозначно.
+      3. По domain'у решаем, дропать или нет:
+           - admin: дропаем только DISAGREE (recall важнее).
+           - general: дропаем DISAGREE и UNKNOWN.
+      4. Если правка дропнута — пытаемся откатить её и в CORRECTED-блоке
+         (заменой первого вхождения `after` обратно на `before`).
+         Это критично для консистентности: иначе пользователь видит
+         CORRECTED с правкой, которую нельзя применить — пункт CHANGES
+         удалён.
+
+    No-op если sage недоступен, отключён или CHANGES пуст.
+    """
+    if _sage_validator is None or not _sage_validator.is_available():
+        return text
+    if not raw_text or not raw_text.strip():
+        return text
+    if "===CHANGES===" not in text or "===END===" not in text:
+        return text
+    if "===CORRECTED===" not in text:
+        return text
+
+    # Один прогон sage на исходный текст. Если упадёт — return text.
+    try:
+        sage_text = _sage_validator.correct(raw_text)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Sage: ошибка correct(), пропускаю валидацию: %s", e)
+        return text
+    if not sage_text or sage_text == raw_text:
+        # Sage не нашёл ошибок — это сильный сигнал, что T-lite, возможно,
+        # перестарался. НО для admin-режима не доверяем «sage молчит ==
+        # ошибок нет» — sage-95m модель компактная, может пропускать.
+        # Поэтому в admin-режиме при пустом изменении sage'a не делаем
+        # ничего (не дропаем все правки). В general — тоже не дропаем
+        # автоматически, чтобы избежать catastrophic-фильтра. Sage
+        # используется только для **позитивной проверки** конкретной
+        # правки, не для отрицательного приговора всему документу.
+        return text
+
+    # Извлекаем блоки
+    try:
+        before_block, rest = text.split("===CHANGES===", 1)
+        changes_block, tail = rest.split("===END===", 1)
+        # CORRECTED — между «===CORRECTED===» и «===CHANGES===»
+        corrected_start = before_block.find("===CORRECTED===")
+        if corrected_start < 0:
+            return text
+        head = before_block[:corrected_start]
+        corrected_full = before_block[corrected_start:]
+        corrected_body_match = re.match(
+            r"===CORRECTED===\s*\n?(.*)\Z", corrected_full, flags=re.DOTALL
+        )
+        if corrected_body_match is None:
+            return text
+        corrected_body = corrected_body_match.group(1)
+    except ValueError:
+        return text
+
+    kept_lines: list[str] = []
+    dropped = 0
+    new_corrected = corrected_body
+
+    for raw_line in changes_block.splitlines():
+        line = raw_line.rstrip()
+        pair = _parse_change_pair_robust(line)
+        if pair is None:
+            m = _CHANGE_PAIR_RE.search(line)
+            if m:
+                pair = (m.group(1), m.group(2))
+        if pair is None:
+            # Не пункт-CHANGE (заголовок/комментарий/пустая) — сохраняем
+            kept_lines.append(line)
+            continue
+
+        before_q, after_q = pair[0], pair[1]
+        # Извлекаем «категорию» — это всё после первого «|» в строке
+        # (формат: «X → Y | орфография — пропущена буква…»). Используется
+        # для category-aware фильтрации: sage обучена на орфографии,
+        # для согласования/управления — ненадёжна.
+        category = ""
+        if "|" in line:
+            category = line.split("|", 1)[1].strip()
+        verdict = _sage_validator.judge(before_q, after_q, sage_text)
+        # Логируем verdict ВСЕГДА (даже в dryrun) — это основной способ
+        # собрать прод-данные перед переключением в enforce.
+        logger.info(
+            "Sage[%s/%s/cat=%r]: verdict=%s для %r→%r",
+            _sage_validator.config.mode, _sage_validator.config.domain,
+            category[:40], verdict, before_q, after_q,
+        )
+        if _sage_validator.should_drop(verdict, category=category):
+            logger.info(
+                "Sage[enforce]: ДРОП правки %r→%r (verdict=%s, cat=%r)",
+                before_q, after_q, verdict, category[:40],
+            )
+            dropped += 1
+            # Пробуем откатить правку в CORRECTED.  Заменяем первое
+            # вхождение `after_q` обратно на `before_q`. Если `after_q`
+            # не находится (whitespace shift / multiword разница) —
+            # пропускаем revert, оставляем CORRECTED как есть. В таком
+            # случае пункт всё равно дропнут из CHANGES, но CORRECTED
+            # останется частично «исправленным» — для admin-режима это
+            # приемлемо: пользователь увидит CORRECTED с правкой, и
+            # сам решит, применять её или нет.
+            idx = new_corrected.find(after_q)
+            if idx >= 0:
+                new_corrected = (
+                    new_corrected[:idx] + before_q + new_corrected[idx + len(after_q):]
+                )
+            continue
+        kept_lines.append(line)
+
+    if dropped == 0:
+        return text
+
+    # Если все правки дропнуты — стандартная заглушка
+    non_empty = [ln for ln in kept_lines if re.search(r"\w", ln)]
+    has_real = any(re.match(r"\s*\d+\.\s*\S", ln) for ln in non_empty)
+    if not has_real:
+        kept_lines = ["", "1. Ошибок не найдено. Текст соответствует нормам.", ""]
+
+    new_changes = "\n".join(kept_lines).rstrip() + "\n"
+    new_corrected_block = "===CORRECTED===\n" + new_corrected.lstrip("\n")
+    if not new_corrected_block.endswith("\n"):
+        new_corrected_block += "\n"
+    return (
+        f"{head}{new_corrected_block}"
+        f"===CHANGES===\n{new_changes.lstrip()}===END==={tail}"
+    )
 
 
 def _renumber_changes(text: str) -> str:
@@ -1307,6 +1478,19 @@ async def metrics(hours: int = 24):
         "morph_detector_enabled": _morph_detector is not None and _morph_detector.available,
         "user_dict_enabled": _user_dict is not None,
         "user_dict_size": len(_user_dict.list_words()) if _user_dict is not None else 0,
+        # v1.8c: статус sage-95m post-валидатора
+        "sage_validator_enabled": (
+            _sage_validator is not None and _sage_validator.config.enabled
+        ),
+        "sage_validator_available": (
+            _sage_validator is not None and _sage_validator.is_available()
+        ),
+        "sage_validator_domain": (
+            _sage_validator.config.domain if _sage_validator is not None else None
+        ),
+        "sage_validator_model": (
+            _sage_validator.config.model_name if _sage_validator is not None else None
+        ),
     })
 
 
@@ -1528,6 +1712,11 @@ async def suggest(
             # отключён или ошибок не найдено — no-op. Дедупликация по
             # `before` чтобы не дублировать пункты, уже отданные моделью.
             result = _enrich_changes_with_detector(result, raw_text)
+            # v1.8c: пост-валидация sage-95m. Если SAGE_VALIDATOR_ENABLED=false
+            # или модель не загрузилась — no-op. Идёт ПОСЛЕ детектора, чтобы
+            # sage оценивал ТОЛЬКО правки от LLM (детектор уже отфильтрован
+            # по precision на уровне правил). Latency cost ~1-3 с warm.
+            result = _filter_changes_with_sage(result, raw_text)
             # v1.7.3: финальная пере-нумерация CHANGES (после всех drop'ов
             # и возможной реконструкции). Закрывает кейс «правки начались
             # со 2го пункта» в LibreOffice-расширении: если фильтр дропнул

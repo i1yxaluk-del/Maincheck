@@ -217,3 +217,119 @@ curl -F "text=<(echo 'согласно распоряжения №5')" \
      http://ai-gw:8000/suggest
 ```
 Должен вернуть структурированный ответ с блоками `===CORRECTED=== / ===CHANGES=== / ===END===`.
+
+---
+
+## 8. v1.8c: sage-95m post-валидатор (опционально, default OFF)
+
+Sage — компактная (95M параметров) русская GEC-модель `ai-forever/sage-fredt5-distilled-95m`,
+которая работает как **«второе мнение»** поверх T-lite. Для каждой правки, предложенной T-lite,
+sage решает «согласен / не согласен», и сомнительные правки фильтруются.
+
+### ⚠ Важно: ограничения sage
+
+В апреле 2026 sage уже тестировалась как **primary corrector** (см. `ЖУРНАЛ_v1.6.md`, секция
+«Контекст»):
+
+- 0/3 запятых нашла на структурной пунктуации
+- стабильно галлюцинировала числа («2025» → «2015», «ТопСервис» → «Топ-Сервис»)
+- обучена на типо/орфо-ошибках из Wikipedia, не на ведомственных документах
+
+Поэтому в v1.8c sage используется **строго узко**:
+- ТОЛЬКО как post-validator (фильтр правок T-lite, не как сам корректор)
+- ТОЛЬКО для категории «орфография» (по default, см. `SAGE_VALIDATOR_CATEGORIES`)
+- ТОЛЬКО в DRY-RUN режиме по default (только логирует, ничего не дропает)
+
+### Рекомендованный rollout
+
+1. **Включить `ENABLED=true`, `MODE=dryrun`** (default) на 1 неделю — sage отработает,
+   и каждый verdict уйдёт в `journalctl`. Сервер по-прежнему отдаёт правки T-lite как раньше.
+2. **Проанализировать логи**:
+   ```bash
+   sudo journalctl -u ai-suggester --since "1 week ago" | grep "Sage\["
+   # Считаем: сколько DISAGREE, на каких категориях,
+   # совпадают ли DISAGREE с реальными FP T-lite.
+   ```
+3. **Если sage уверенно ловит FP** (и редко даёт ложные DISAGREE на TP):
+   `SAGE_VALIDATOR_MODE=enforce` + restart.
+4. **Если sage даёт много ложных DISAGREE**: оставить в `dryrun` или выключить
+   (`SAGE_VALIDATOR_ENABLED=false`).
+
+### Установка зависимостей
+
+```bash
+cd /path/to/MainCheck
+source .venv/bin/activate
+pip install transformers torch sentencepiece huggingface_hub
+# При первом старте сервер загрузит модель с HuggingFace (~190 МБ на диск)
+```
+
+### Включение в `.env`
+
+```env
+SAGE_VALIDATOR_ENABLED=true
+SAGE_VALIDATOR_MODE=dryrun        # dryrun (default) | enforce
+SAGE_VALIDATOR_DOMAIN=admin       # admin (default) | general
+SAGE_VALIDATOR_CATEGORIES=орфограф  # default; "" = все категории
+SAGE_VALIDATOR_DEVICE=cpu         # или cuda, если есть GPU
+SAGE_VALIDATOR_WARMUP=true        # один forward pass на старте
+```
+
+Перезапустить сервер:
+```bash
+sudo systemctl restart ai-suggester
+```
+
+### Параметры
+
+#### `SAGE_VALIDATOR_MODE`
+
+- **dryrun** (default) — sage оценивает каждую правку и пишет verdict в журнал,
+  **но ничего не дропает**. Безопасно: пайплайн отдаёт правки T-lite как до v1.8c.
+- **enforce** — реально дропает правки по verdict + domain + categories. **Только после
+  анализа dryrun-логов!**
+
+#### `SAGE_VALIDATOR_DOMAIN` (применяется в enforce-режиме)
+
+- **admin** (default) — приоритет **recall**. Sage дропает правку **только** если явно
+  «не согласен» (verdict=DISAGREE, sage оставил `before` в своём варианте). UNKNOWN
+  (sage сделал что-то третье) — правку T-lite оставляем. Рекомендуется для документов
+  ведомства, КС-2, актов и т.п., где лучше показать сомнительную правку, чем пропустить
+  настоящую ошибку.
+- **general** — балансированно. Дропает и DISAGREE, и UNKNOWN. Для произвольных текстов,
+  где precision важнее recall.
+
+#### `SAGE_VALIDATOR_CATEGORIES` (применяется в enforce-режиме)
+
+Substring-фильтр по тексту правки после `|`. Default: `орфограф` — только орфографические
+правки могут быть дропнуты. Это страховка: sage обучена на орфографии (RUSpellRU), для
+согласования/управления/пунктуации её мнение ненадёжно.
+
+Примеры:
+- `SAGE_VALIDATOR_CATEGORIES=орфограф` — только орфография (default).
+- `SAGE_VALIDATOR_CATEGORIES=орфограф,пунктуация` — орфография и пунктуация.
+- `SAGE_VALIDATOR_CATEGORIES=` (пустая) — все категории (НЕ рекомендуется).
+
+### Проверка работы
+
+```bash
+curl -s http://localhost:8000/metrics | python3 -m json.tool
+# Ожидаем:
+#   "sage_validator_enabled": true,
+#   "sage_validator_available": true,
+#   "sage_validator_domain": "admin",
+#   "sage_validator_model": "ai-forever/sage-fredt5-distilled-95m"
+```
+
+В логах после `/suggest`:
+```
+Sage[dryrun/admin/cat='согласование']: verdict=disagree для 'мероприятия'→'мероприятие'
+Sage[enforce]: ДРОП правки 'опечтка'→'опечатка' (verdict=disagree, cat='орфография')
+```
+
+### Откат
+
+`SAGE_VALIDATOR_ENABLED=false` в `.env` + `systemctl restart ai-suggester`.
+Модель остаётся скачанной на диске (`~/.cache/huggingface/`), но в RAM не загружается.
+
+Подробности архитектуры → код [`server/shared/sage_validator.py`](../server/shared/sage_validator.py).

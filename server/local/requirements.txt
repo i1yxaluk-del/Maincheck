@@ -17,3 +17,17 @@ beautifulsoup4>=4.12.0
 # — словарь OpenCorpora ~50 МБ. Полностью offline после установки.
 pymorphy3>=2.0.0
 pymorphy3-dicts-ru>=2.4.0
+
+# v1.8c: sage-95m post-валидатор (опционально, default OFF).
+# `ai-forever/sage-fredt5-distilled-95m` — компактная русская GEC-модель,
+# проверяет каждую правку T-lite как «второе мнение». Включается через
+# SAGE_VALIDATOR_ENABLED=true в .env. Если transformers/torch не
+# установлены, валидатор отключается автоматически (no-op) — сервер
+# работает без него. Не делаем эти пакеты required, потому что они
+# тяжёлые (≈1.5 ГБ install) и не всем нужны: админ-only установки
+# могут жить на morph-детекторе v1.8a.
+# Раскомментируйте если планируете включить SAGE_VALIDATOR_ENABLED:
+# transformers>=4.40
+# torch>=2.2
+# huggingface_hub>=0.23
+# sentencepiece>=0.2  # для T5-токенизатора

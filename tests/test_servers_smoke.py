@@ -1466,3 +1466,262 @@ def test_v18_full_pipeline_meropriyatie_and_kvartalakh(local_module, monkeypatch
     has_meropr = "«мероприятия»" in changes
     has_kvar = "«кварталах»" in changes
     assert has_meropr or has_kvar, f"Детектор не сработал. CHANGES:\n{changes}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v1.8c: тесты sage-95m post-валидатора (filter_changes_with_sage)
+# ═══════════════════════════════════════════════════════════════════════════
+# Реальная sage-fredt5 модель НЕ загружается — тесты подменяют валидатор
+# мок-объектом с фиксированным judge() поведением.
+
+class _MockSageValidator:
+    """Мок-валидатор: возвращает заранее заданные verdict'ы по before-строке.
+
+    is_available=True, чтобы пайплайн прошёл через _filter_changes_with_sage.
+    sage_text возвращается фиксированный — пайплайн им не пользуется напрямую,
+    кроме как условием sage_text != raw_text (чтобы не вернуть text сразу).
+    """
+    def __init__(self, *, verdicts_by_before, sage_text, domain="admin",
+                 mode="enforce", categories=()):
+        from server.shared.sage_validator import SageConfig
+        self.config = SageConfig(
+            enabled=True, mode=mode, domain=domain, categories=categories,
+            model_name="mock", device="cpu", max_input_len=512, warmup=False,
+        )
+        self._verdicts = verdicts_by_before
+        self._sage_text = sage_text
+
+    def is_available(self):
+        return True
+
+    def correct(self, text):
+        return self._sage_text
+
+    def judge(self, before, after, sage_text):
+        from server.shared.sage_validator import VERDICT_UNKNOWN
+        return self._verdicts.get(before, VERDICT_UNKNOWN)
+
+    def category_matches(self, category):
+        if not self.config.categories:
+            return True
+        cat_lower = (category or "").lower()
+        return any(c in cat_lower for c in self.config.categories)
+
+    def should_drop(self, verdict, *, category=""):
+        from server.shared.sage_validator import (
+            VERDICT_AGREE, VERDICT_DISAGREE, VERDICT_UNKNOWN,
+        )
+        if self.config.mode == "dryrun":
+            return False
+        if not self.category_matches(category):
+            return False
+        if verdict == VERDICT_DISAGREE:
+            return True
+        if verdict == VERDICT_UNKNOWN and self.config.domain == "general":
+            return True
+        return False
+
+
+def test_v18c_sage_drops_disagree_in_admin(local_module, monkeypatch):
+    """admin-режим: пункт DISAGREE должен быть отфильтрован."""
+    from server.shared.sage_validator import VERDICT_DISAGREE, VERDICT_AGREE
+    mock = _MockSageValidator(
+        verdicts_by_before={"мероприятие": VERDICT_DISAGREE, "кварталах": VERDICT_AGREE},
+        sage_text="Во 2-м квартале проведено мероприятие.",
+        domain="admin",
+    )
+    monkeypatch.setattr(local_module, "_sage_validator", mock)
+    raw_in = (
+        "===CORRECTED===\n"
+        "Во 2-м квартале проведено мероприятия.\n"
+        "===CHANGES===\n"
+        "1. «кварталах» → «квартале» | согласование\n"
+        "2. «мероприятие» → «мероприятия» | согласование\n"
+        "===END===\n"
+    )
+    out = local_module._filter_changes_with_sage(
+        raw_in, "Во 2-м кварталах проведено мероприятие."
+    )
+    # Sage не согласен с правкой «мероприятие→мероприятия» — она должна быть дропнута
+    assert "«мероприятие»" not in out or "мероприятие→мероприятия" not in out
+    # Sage согласен с «кварталах→квартале» — правка должна остаться
+    assert "«кварталах»" in out and "«квартале»" in out
+    # CORRECTED откатил «мероприятия» обратно в «мероприятие»
+    corrected_body = out.split("===CORRECTED===")[1].split("===CHANGES===")[0]
+    assert "мероприятие" in corrected_body
+    assert "мероприятия" not in corrected_body
+
+
+def test_v18c_sage_keeps_unknown_in_admin(local_module, monkeypatch):
+    """admin-режим: UNKNOWN не дропается, recall важнее."""
+    from server.shared.sage_validator import VERDICT_UNKNOWN, VERDICT_AGREE
+    mock = _MockSageValidator(
+        verdicts_by_before={"редкоеслово": VERDICT_UNKNOWN, "кварталах": VERDICT_AGREE},
+        sage_text="Совсем другой текст от sage'a.",
+        domain="admin",
+    )
+    monkeypatch.setattr(local_module, "_sage_validator", mock)
+    raw_in = (
+        "===CORRECTED===\n"
+        "Во 2-м квартале редкоеновое слово.\n"
+        "===CHANGES===\n"
+        "1. «кварталах» → «квартале» | согласование\n"
+        "2. «редкоеслово» → «редкоеновое» | редкая правка\n"
+        "===END===\n"
+    )
+    out = local_module._filter_changes_with_sage(
+        raw_in, "Во 2-м кварталах редкоеслово слово."
+    )
+    # Обе правки остались, потому что admin не дропает UNKNOWN
+    assert "«редкоеслово»" in out
+    assert "«кварталах»" in out
+
+
+def test_v18c_sage_drops_unknown_in_general(local_module, monkeypatch):
+    """general-режим: UNKNOWN тоже дропается."""
+    from server.shared.sage_validator import VERDICT_UNKNOWN, VERDICT_AGREE
+    mock = _MockSageValidator(
+        verdicts_by_before={"редкоеслово": VERDICT_UNKNOWN, "кварталах": VERDICT_AGREE},
+        sage_text="Совсем другой текст от sage'a.",
+        domain="general",
+    )
+    monkeypatch.setattr(local_module, "_sage_validator", mock)
+    raw_in = (
+        "===CORRECTED===\n"
+        "Во 2-м квартале редкоеновое слово.\n"
+        "===CHANGES===\n"
+        "1. «кварталах» → «квартале» | согласование\n"
+        "2. «редкоеслово» → «редкоеновое» | редкая правка\n"
+        "===END===\n"
+    )
+    out = local_module._filter_changes_with_sage(
+        raw_in, "Во 2-м кварталах редкоеслово слово."
+    )
+    # «редкоеслово» дропнут (UNKNOWN в general), «кварталах» оставлен (AGREE)
+    assert "«редкоеслово»" not in out
+    assert "«кварталах»" in out
+
+
+def test_v18c_sage_noop_when_disabled(local_module, monkeypatch):
+    """SAGE_VALIDATOR_ENABLED=false → пайплайн возвращает text как есть."""
+    # _sage_validator = None означает «недоступен/отключён»
+    monkeypatch.setattr(local_module, "_sage_validator", None)
+    raw_in = (
+        "===CORRECTED===\n"
+        "Что-то.\n"
+        "===CHANGES===\n"
+        "1. «a» → «б» | проверка\n"
+        "===END===\n"
+    )
+    out = local_module._filter_changes_with_sage(raw_in, "Что-то.")
+    assert out == raw_in
+
+
+def test_v18c_sage_noop_when_sage_text_unchanged(local_module, monkeypatch):
+    """Если sage не нашёл ошибок (вернул тот же raw_text), не дропаем НИЧЕГО.
+
+    Это критично: sage-95m может пропускать ошибки, нельзя по его «всё ОК»
+    обнулять CHANGES от T-lite + детектора.
+    """
+    raw = "Текст без изменений."
+    mock = _MockSageValidator(
+        verdicts_by_before={"a": "disagree"},
+        sage_text=raw,  # sage вернул ТОТ ЖЕ текст
+        domain="admin",
+    )
+    monkeypatch.setattr(local_module, "_sage_validator", mock)
+    raw_in = (
+        "===CORRECTED===\n"
+        "Текст с правкой.\n"
+        "===CHANGES===\n"
+        "1. «a» → «б» | проверка\n"
+        "===END===\n"
+    )
+    out = local_module._filter_changes_with_sage(raw_in, raw)
+    # Ничего не дропнуто — text возвращён без изменений
+    assert "«a»" in out
+
+
+def test_v18c_sage_handles_no_changes_block(local_module, monkeypatch):
+    """Если CHANGES блока нет — no-op, без падения."""
+    mock = _MockSageValidator(
+        verdicts_by_before={}, sage_text="другой", domain="admin",
+    )
+    monkeypatch.setattr(local_module, "_sage_validator", mock)
+    # raw без маркера CHANGES
+    out = local_module._filter_changes_with_sage("Просто текст.", "raw")
+    assert out == "Просто текст."
+
+
+def test_v18c_sage_dryrun_never_drops(local_module, monkeypatch):
+    """dryrun-режим: даже DISAGREE-правки остаются в выводе (только логи).
+
+    Это default-режим. Прод включает sage сначала в dryrun, чтобы собрать
+    verdict'ы, и только после анализа логов переключает в enforce.
+    """
+    from server.shared.sage_validator import VERDICT_DISAGREE
+    mock = _MockSageValidator(
+        verdicts_by_before={"мероприятие": VERDICT_DISAGREE},
+        sage_text="Другой текст — sage что-то править.",
+        domain="admin",
+        mode="dryrun",  # ← ключевое отличие
+    )
+    monkeypatch.setattr(local_module, "_sage_validator", mock)
+    raw_in = (
+        "===CORRECTED===\n"
+        "Проведено мероприятия.\n"
+        "===CHANGES===\n"
+        "1. «мероприятие» → «мероприятия» | согласование\n"
+        "===END===\n"
+    )
+    out = local_module._filter_changes_with_sage(raw_in, "Проведено мероприятие.")
+    # В dryrun ничего не дропаем
+    assert "«мероприятие»" in out
+
+
+def test_v18c_sage_category_filter_keeps_non_orthography(local_module, monkeypatch):
+    """enforce-режим с categories=("орфограф",): согласование НЕ дропается,
+    даже если verdict=DISAGREE — sage обучена на орфографии, для других
+    классов её мнение ненадёжно."""
+    from server.shared.sage_validator import VERDICT_DISAGREE
+    mock = _MockSageValidator(
+        verdicts_by_before={"кварталах": VERDICT_DISAGREE},
+        sage_text="Что-то другое.",
+        domain="admin",
+        mode="enforce",
+        categories=("орфограф",),
+    )
+    monkeypatch.setattr(local_module, "_sage_validator", mock)
+    raw_in = (
+        "===CORRECTED===\n"
+        "Во 2-м квартале.\n"
+        "===CHANGES===\n"
+        "1. «кварталах» → «квартале» | согласование\n"
+        "===END===\n"
+    )
+    out = local_module._filter_changes_with_sage(raw_in, "Во 2-м кварталах.")
+    # Категория «согласование» не входит в фильтр («орфограф»), правка остаётся
+    assert "«кварталах»" in out
+
+
+def test_v18c_sage_category_filter_drops_orthography(local_module, monkeypatch):
+    """enforce-режим с categories=("орфограф",): орфо-правки дропаются."""
+    from server.shared.sage_validator import VERDICT_DISAGREE
+    mock = _MockSageValidator(
+        verdicts_by_before={"опечтка": VERDICT_DISAGREE},
+        sage_text="Без слова опечтка.",
+        domain="admin",
+        mode="enforce",
+        categories=("орфограф",),
+    )
+    monkeypatch.setattr(local_module, "_sage_validator", mock)
+    raw_in = (
+        "===CORRECTED===\n"
+        "Слово опечатка.\n"
+        "===CHANGES===\n"
+        "1. «опечтка» → «опечатка» | орфография — пропущена буква\n"
+        "===END===\n"
+    )
+    out = local_module._filter_changes_with_sage(raw_in, "Слово опечтка.")
+    # Категория содержит «орфограф», sage DISAGREE → правка дропнута
+    assert "«опечтка»" not in out
