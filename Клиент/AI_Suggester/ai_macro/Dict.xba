@@ -12,12 +12,15 @@
 '    2) фильтрует CHANGES, где before/after содержат слово из словаря;
 '    3) передаёт whitelist в morph-детектор, чтобы тот не флагал OOV.
 '
-'  Доступны три макроса:
-'    • Dict.AIDictAddSelection() — добавить выделенное слово (на панели).
-'    • Dict.AIDictListWords()    — показать текущий список (диалог).
-'    • Dict.AIDictRemoveWord()   — удалить слово из словаря (диалог).
+'  Доступны макросы:
+'    • Dict.AIDictAddSelection() — добавить выделенное слово (на панели, m002).
+'    • Dict.AIDictManage()       — диалог управления словарём (на панели, m003,
+'                                  v1.8.3): ListBox + кнопки «Удалить»/
+'                                  «Добавить»/«Закрыть».
+'    • Dict.AIDictListWords()    — короткий список (MsgBox) для совместимости.
+'    • Dict.AIDictRemoveWord()   — удалить по InputBox-вводу, для совместимости.
 '
-'  Адрес /dict берётся из Settings.GetDictBase() (выводится из GetServerList).
+'  Адрес /dict берётся из DictBaseUrl() (выводится из Settings.GetServerList).
 ' ═══════════════════════════════════════════════════════════════════════════
 
 ' ═══════════════════════════════════════════════════
@@ -216,6 +219,339 @@ Sub AIDictRemoveWord()
 
 ErrorHandler:
     MsgBox "Внутренняя ошибка (#" & Err & "): " & Error, 16, "AI Suggester — Словарь"
+End Sub
+
+
+' ═══════════════════════════════════════════════════════════════════════════
+'  УПРАВЛЕНИЕ СЛОВАРЁМ — ДИАЛОГ (v1.8.3)
+' ═══════════════════════════════════════════════════════════════════════════
+'  Один экран: список слов + кнопки «Удалить выделенные» / «Добавить
+'  новое» / «Закрыть».  После каждого изменения диалог переоткрывается
+'  с актуальным списком от сервера. Это удобнее, чем три отдельных макроса
+'  (AIDictListWords / AIDictAddSelection / AIDictRemoveWord) из v1.8b,
+'  которые остаются для совместимости и REST-первого workflow.
+'
+'  Диалог строится программно (UnoControlDialogModel), без .xdl-файла,
+'  чтобы не плодить парные xdl/xlb-файлы в OXT.
+' ═══════════════════════════════════════════════════════════════════════════
+
+' Состояние диалога во время вызова. Записывается из listener'а кнопки
+' «Добавить» (см. AIDictDlg_BtnAdd_actionPerformed), читается обратно
+' в AIDictManage(). g_DictDlg_Dialog нужен listener'у, чтобы вызвать
+' endExecute() и закрыть диалог.
+Private g_DictDlg_Dialog As Object
+Private g_DictDlg_Action As String
+
+Sub AIDictManage()
+    On Error GoTo ErrorHandler
+
+    Do
+        Dim sError As String : sError = ""
+        Dim sJoined As String : sJoined = LoadDictWordsJoined(sError)
+        If sError <> "" Then
+            MsgBox sError, 48, "AI Suggester — Словарь"
+            Exit Sub
+        End If
+
+        g_DictDlg_Action = "close"
+        Dim aSelected() As String
+        Dim nSelCount As Integer : nSelCount = 0
+        Call AIDictManage_ShowDialog(sJoined, aSelected, nSelCount)
+
+        Select Case g_DictDlg_Action
+            Case "add"
+                Call AIDictManage_DoAdd()
+            Case "delete"
+                Call AIDictManage_DoDelete(aSelected, nSelCount)
+            Case Else
+                Exit Do
+        End Select
+    Loop
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "Внутренняя ошибка (#" & Err & "): " & Error, 16, "AI Suggester — Словарь"
+End Sub
+
+' Загружает /dict/list и возвращает слова через Chr(10). При ошибке
+' пишет понятное сообщение в sError (caller покажет MsgBox).
+Function LoadDictWordsJoined(ByRef sError As String) As String
+    LoadDictWordsJoined = ""
+    sError = ""
+
+    Dim sUrl As String : sUrl = DictListUrl()
+    If sUrl = "" Then
+        sError = "Не настроен адрес сервера (Settings.GetServerList)."
+        Exit Function
+    End If
+
+    Dim sResp As String, sHttp As String
+    If Not GetUrl(sUrl, sResp, sHttp) Then
+        sError = "Не удалось связаться с сервером:" & Chr(10) & sUrl & Chr(10) & _
+                 "HTTP: " & sHttp
+        Exit Function
+    End If
+
+    ' v1.8.2 fallback: пустой sHttp при наличии "words" — считаем 200 OK
+    Dim bOk As Boolean : bOk = (Left(sHttp, 1) = "2")
+    If Not bOk And sHttp = "" And InStr(sResp, """words""") > 0 Then bOk = True
+    If Not bOk Then
+        Dim sHttpShown As String : sHttpShown = sHttp
+        If sHttpShown = "" Then sHttpShown = "?"
+        sError = "Сервер вернул HTTP " & sHttpShown & ":" & Chr(10) & Left(sResp, 400)
+        Exit Function
+    End If
+
+    LoadDictWordsJoined = ExtractWordsJoined(sResp)
+End Function
+
+' Строит диалог программно. По выходу заполняет aSelected/nSelCount
+' (выделенные слова, если пользователь нажал «Удалить»). Глобальный
+' g_DictDlg_Action содержит "close" | "add" | "delete".
+Sub AIDictManage_ShowDialog(sJoined As String, ByRef aSelected() As String, _
+                            ByRef nSelCount As Integer)
+    nSelCount = 0
+
+    ' Разбираем JSON-список слов (joined через Chr(10), см. ExtractWordsJoined)
+    Dim aWords() As String
+    Dim nCount As Integer : nCount = 0
+    If sJoined <> "" Then
+        aWords = Split(sJoined, Chr(10))
+        nCount = UBound(aWords) + 1
+    End If
+
+    ' === Dialog model ===
+    Dim oDlgModel As Object
+    oDlgModel = createUnoService("com.sun.star.awt.UnoControlDialogModel")
+    oDlgModel.PositionX = 100
+    oDlgModel.PositionY = 100
+    oDlgModel.Width  = 220
+    oDlgModel.Height = 180
+    oDlgModel.Title  = "AI Suggester — Управление словарём"
+
+    ' Header label
+    Dim oLbl As Object
+    oLbl = oDlgModel.createInstance("com.sun.star.awt.UnoControlFixedTextModel")
+    oLbl.Name      = "lblHdr"
+    oLbl.PositionX = 5
+    oLbl.PositionY = 5
+    oLbl.Width     = 210
+    oLbl.Height    = 10
+    If nCount = 0 Then
+        oLbl.Label = "Словарь пуст. Нажмите «Добавить новое...» чтобы пополнить."
+    Else
+        oLbl.Label = "Слов в словаре: " & CStr(nCount) & ". Выделите для удаления:"
+    End If
+    oDlgModel.insertByName("lblHdr", oLbl)
+
+    ' ListBox (multi-select)
+    Dim oLst As Object
+    oLst = oDlgModel.createInstance("com.sun.star.awt.UnoControlListBoxModel")
+    oLst.Name           = "lstWords"
+    oLst.PositionX      = 5
+    oLst.PositionY      = 18
+    oLst.Width          = 210
+    oLst.Height         = 130
+    oLst.MultiSelection = True
+    If nCount > 0 Then oLst.StringItemList = aWords
+    oDlgModel.insertByName("lstWords", oLst)
+
+    ' Button: «Удалить выделенные» — OK (PushButtonType=1)
+    Dim oBtnDel As Object
+    oBtnDel = oDlgModel.createInstance("com.sun.star.awt.UnoControlButtonModel")
+    oBtnDel.Name           = "btnDelete"
+    oBtnDel.PositionX      = 5
+    oBtnDel.PositionY      = 158
+    oBtnDel.Width          = 80
+    oBtnDel.Height         = 14
+    oBtnDel.Label          = "Удалить выделенные"
+    oBtnDel.PushButtonType = 1
+    If nCount = 0 Then oBtnDel.Enabled = False
+    oDlgModel.insertByName("btnDelete", oBtnDel)
+
+    ' Button: «Добавить новое...» — STANDARD (с listener'ом)
+    Dim oBtnAdd As Object
+    oBtnAdd = oDlgModel.createInstance("com.sun.star.awt.UnoControlButtonModel")
+    oBtnAdd.Name           = "btnAdd"
+    oBtnAdd.PositionX      = 88
+    oBtnAdd.PositionY      = 158
+    oBtnAdd.Width          = 80
+    oBtnAdd.Height         = 14
+    oBtnAdd.Label          = "Добавить новое..."
+    oBtnAdd.PushButtonType = 0
+    oDlgModel.insertByName("btnAdd", oBtnAdd)
+
+    ' Button: «Закрыть» — CANCEL (PushButtonType=2)
+    Dim oBtnCls As Object
+    oBtnCls = oDlgModel.createInstance("com.sun.star.awt.UnoControlButtonModel")
+    oBtnCls.Name           = "btnClose"
+    oBtnCls.PositionX      = 171
+    oBtnCls.PositionY      = 158
+    oBtnCls.Width          = 44
+    oBtnCls.Height         = 14
+    oBtnCls.Label          = "Закрыть"
+    oBtnCls.PushButtonType = 2
+    oDlgModel.insertByName("btnClose", oBtnCls)
+
+    ' === Dialog control ===
+    Dim oDlg As Object
+    oDlg = createUnoService("com.sun.star.awt.UnoControlDialog")
+    oDlg.setModel(oDlgModel)
+
+    ' createPeer обязателен ДО addActionListener (иначе getControl вернёт пустышку)
+    Dim oToolkit As Object
+    oToolkit = createUnoService("com.sun.star.awt.Toolkit")
+    oDlg.createPeer(oToolkit, Null)
+
+    ' Listener для «Добавить» — STANDARD-кнопка сама не закрывает диалог
+    g_DictDlg_Dialog = oDlg
+    Dim oListener As Object
+    oListener = CreateUnoListener("AIDictDlg_BtnAdd_", "com.sun.star.awt.XActionListener")
+    oDlg.getControl("btnAdd").addActionListener(oListener)
+
+    ' execute() блокирующий: 1 = OK (Delete), 0 = CANCEL (Close или Add via endExecute)
+    Dim nResult As Integer : nResult = oDlg.execute()
+
+    ' Если listener успел поставить "add" — НЕ переписываем. Иначе:
+    If g_DictDlg_Action <> "add" Then
+        If nResult = 1 Then
+            ' OK: читаем выделенные индексы
+            Dim oListCtl As Object : oListCtl = oDlg.getControl("lstWords")
+            Dim aSelPos
+            aSelPos = oListCtl.getSelectedItemsPos()
+            Dim n As Integer : n = UBound(aSelPos) + 1
+            If n > 0 Then
+                ReDim aSelected(n - 1)
+                Dim i As Integer
+                For i = 0 To n - 1
+                    aSelected(i) = aWords(aSelPos(i))
+                Next i
+                nSelCount = n
+                g_DictDlg_Action = "delete"
+            Else
+                ' Нечего удалять — просто закрываем
+                g_DictDlg_Action = "close"
+            End If
+        Else
+            g_DictDlg_Action = "close"
+        End If
+    End If
+
+    oDlg.dispose()
+    g_DictDlg_Dialog = Nothing
+End Sub
+
+' XActionListener для кнопки «Добавить новое...»:
+'   Sub-имена должны быть `<Prefix><method>` (см. CreateUnoListener в docs).
+'   actionPerformed — клик; disposing — обязательный no-op из XEventListener.
+Sub AIDictDlg_BtnAdd_actionPerformed(oEvt As Object)
+    g_DictDlg_Action = "add"
+    If Not IsNull(g_DictDlg_Dialog) Then g_DictDlg_Dialog.endExecute()
+End Sub
+
+Sub AIDictDlg_BtnAdd_disposing(oEvt As Object)
+    ' no-op
+End Sub
+
+' Запрашивает у пользователя новое слово через InputBox и шлёт /dict/add.
+' На успех сообщений не показывает (diff увидит при reopen диалога).
+Sub AIDictManage_DoAdd()
+    Dim sWord As String
+    sWord = Trim(InputBox( _
+        "Введите новое слово для добавления в словарь:" & Chr(10) & Chr(10) & _
+        "Правила: одно слово, 2-64 символа, без пробелов.", _
+        "AI Suggester — Словарь", ""))
+    If sWord = "" Then Exit Sub
+
+    If InStr(sWord, " ") > 0 Or InStr(sWord, Chr(10)) > 0 Or InStr(sWord, Chr(13)) > 0 Then
+        MsgBox "В словарь добавляется ОДНО слово (без пробелов). Введено: «" & _
+               sWord & "».", 48, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+    If Len(sWord) < 2 Or Len(sWord) > 64 Then
+        MsgBox "Длина слова должна быть от 2 до 64 символов. Введено " & _
+               CStr(Len(sWord)) & " симв.", 48, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    Dim sUrl As String : sUrl = DictAddUrl()
+    If sUrl = "" Then
+        MsgBox "Не настроен адрес сервера.", 16, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    Dim sResp As String, sHttp As String
+    If Not PostJson(sUrl, "{""word"":""" & EscapeJsonString(sWord) & """}", sResp, sHttp) Then
+        MsgBox "Не удалось связаться с сервером:" & Chr(10) & Left(sResp, 300), _
+               16, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    Dim bOk As Boolean : bOk = (Left(sHttp, 1) = "2")
+    If Not bOk And sHttp = "" And InStr(sResp, """added"":") > 0 Then bOk = True
+    If Not bOk Then
+        Dim sHttpShown As String : sHttpShown = sHttp
+        If sHttpShown = "" Then sHttpShown = "?"
+        MsgBox "Сервер отверг запрос (HTTP " & sHttpShown & "):" & Chr(10) & _
+               Left(sResp, 400), 48, "AI Suggester — Словарь"
+    End If
+End Sub
+
+' Удаляет переданные слова через /dict/remove (по одному запросу на слово,
+' /dict/remove не имеет batch-варианта). Показывает confirm перед удалением
+' и summary с числом ошибок, если они были.
+Sub AIDictManage_DoDelete(aWords() As String, nCount As Integer)
+    If nCount <= 0 Then Exit Sub
+
+    Dim sUrl As String : sUrl = DictRemoveUrl()
+    If sUrl = "" Then
+        MsgBox "Не настроен адрес сервера.", 16, "AI Suggester — Словарь"
+        Exit Sub
+    End If
+
+    ' Confirm
+    Dim sPreview As String : sPreview = ""
+    Dim j As Integer
+    For j = 0 To nCount - 1
+        sPreview = sPreview & "  • " & aWords(j) & Chr(10)
+        If j >= 10 Then
+            sPreview = sPreview & "  … и ещё " & CStr(nCount - 1 - j) & Chr(10)
+            Exit For
+        End If
+    Next j
+
+    Dim nAns As Integer
+    nAns = MsgBox("Удалить " & CStr(nCount) & " слов(а) из словаря?" & Chr(10) & _
+                  Chr(10) & sPreview, 4 + 32, "AI Suggester — Словарь")
+    If nAns <> 6 Then Exit Sub  ' 6 = Yes
+
+    Dim nOk As Integer : nOk = 0
+    Dim nFail As Integer : nFail = 0
+    Dim sFirstErr As String : sFirstErr = ""
+    Dim k As Integer
+    For k = 0 To nCount - 1
+        Dim sResp As String, sHttp As String
+        If PostJson(sUrl, "{""word"":""" & EscapeJsonString(aWords(k)) & """}", _
+                    sResp, sHttp) Then
+            Dim bOk As Boolean : bOk = (Left(sHttp, 1) = "2")
+            If Not bOk And sHttp = "" And InStr(sResp, """removed"":") > 0 Then bOk = True
+            If bOk Then
+                nOk = nOk + 1
+            Else
+                nFail = nFail + 1
+                If sFirstErr = "" Then sFirstErr = aWords(k) & " (HTTP " & sHttp & ")"
+            End If
+        Else
+            nFail = nFail + 1
+            If sFirstErr = "" Then sFirstErr = aWords(k) & " (нет связи)"
+        End If
+    Next k
+
+    If nFail > 0 Then
+        MsgBox "Удалено: " & CStr(nOk) & ". Ошибок: " & CStr(nFail) & "." & _
+               Chr(10) & "Первая ошибка: " & sFirstErr, _
+               48, "AI Suggester — Словарь"
+    End If
 End Sub
 
 
