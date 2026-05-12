@@ -229,6 +229,48 @@ def test_local_drops_changes_with_ellipsis_in_quotes(local_module):
     assert "Ошибок не найдено" not in out
 
 
+def test_v182_drops_idempotent_with_nested_quotes(local_module):
+    """v1.8.2 регрессия: пункт «адм…здания «ЦСН ВО»» → «адм…здания «ЦСН ВО»»
+    с ВЛОЖЕННЫМИ «...» в before/after. До v1.8.2 _CHANGE_PAIR_RE захватывал
+    внутреннюю пару «ЦСН ВО» как before и срез ` → ` как after — before != after,
+    идемпотентный пункт пропускался в выдачу. После v1.8.2 robust-парсер
+    жадно матчит внешние «...» и обнаруживает совпадение.
+    """
+    raw = (
+        "===CORRECTED===\n"
+        "текст\n"
+        "===CHANGES===\n"
+        "1. «кварталах» → «квартале» | согласование\n"
+        "2. «административного здания «ЦСН ВО»» → «административного здания «ЦСН ВО»» | пунктуация\n"
+        "===END==="
+    )
+    out = local_module._drop_idempotent_changes(raw)
+    # Идемпотентный пункт с вложенными кавычками удалён
+    assert "не требуется" not in out
+    assert "пунктуация" not in out
+    # Содержательный пункт сохранён
+    assert "«кварталах» → «квартале»" in out
+    # Заглушка не подставлена
+    assert "Ошибок не найдено" not in out
+
+
+def test_v182_parse_change_pair_robust(local_module):
+    """v1.8.2: robust-парсер корректно извлекает (before, after) при
+    вложенных кавычках и игнорирует ` | explanation`."""
+    fn = local_module._parse_change_pair_robust
+    # Простой случай
+    assert fn("1. «кварталах» → «квартале» | согласование") == ("кварталах", "квартале")
+    # Вложенные кавычки в before и after
+    assert fn(
+        '3. «административного здания «ЦСН ВО»» → «административного здания «ЦСН ВО»» | пунктуация'
+    ) == ("административного здания «ЦСН ВО»", "административного здания «ЦСН ВО»")
+    # Без ` | ` (пояснения нет)
+    assert fn("«старое» → «новое»") == ("старое", "новое")
+    # Не CHANGES-строка — None
+    assert fn("просто текст без стрелки") is None
+    assert fn("") is None
+
+
 def test_local_drops_changes_with_hallucinated_before(local_module):
     """Пункты, чьё «было» не является подстрокой raw_text — галлюцинации
     модели. Сервер их дропает на финальном этапе."""

@@ -69,7 +69,14 @@ Sub AIDictAddSelection()
         Exit Sub
     End If
 
-    If Left(sHttp, 1) = "2" Then
+    ' v1.8.2: sHttp может быть пустым из-за особенностей redirection
+    ' в Shell (status-файл не всегда пишется до возврата). При этом сервер
+    ' на /dict/* всегда возвращает JSON в sResp с полем "added" (200 или 4xx);
+    ' если в ответе есть `"added":true|false` — связь была и HTTP был 200.
+    ' См. аналогичный fallback в Main.xba (===CORRECTED=== маркер).
+    Dim bOk As Boolean : bOk = (Left(sHttp, 1) = "2")
+    If Not bOk And sHttp = "" And InStr(sResp, """added"":") > 0 Then bOk = True
+    If bOk Then
         ' 200 OK: разбираем "added":true/false и "total":N
         Dim sMsg As String
         If InStr(sResp, """added"":true") > 0 Then
@@ -83,7 +90,9 @@ Sub AIDictAddSelection()
         MsgBox sMsg, 64, "AI Suggester — Словарь"
     Else
         ' 400 (валидация), 503 (отключён), 500 (внутренняя)
-        MsgBox "Сервер отверг запрос (HTTP " & sHttp & "):" & Chr(10) & _
+        Dim sHttpShown As String : sHttpShown = sHttp
+        If sHttpShown = "" Then sHttpShown = "?"
+        MsgBox "Сервер отверг запрос (HTTP " & sHttpShown & "):" & Chr(10) & _
                Left(sResp, 400), 48, "AI Suggester — Словарь"
     End If
     Exit Sub
@@ -112,8 +121,13 @@ Sub AIDictListWords()
         Exit Sub
     End If
 
-    If Left(sHttp, 1) <> "2" Then
-        MsgBox "Сервер вернул HTTP " & sHttp & ":" & Chr(10) & Left(sResp, 400), _
+    ' v1.8.2: пустой sHttp при наличии "words" в теле — считаем 200 OK
+    Dim bOkL As Boolean : bOkL = (Left(sHttp, 1) = "2")
+    If Not bOkL And sHttp = "" And InStr(sResp, """words""") > 0 Then bOkL = True
+    If Not bOkL Then
+        Dim sHttpShownL As String : sHttpShownL = sHttp
+        If sHttpShownL = "" Then sHttpShownL = "?"
+        MsgBox "Сервер вернул HTTP " & sHttpShownL & ":" & Chr(10) & Left(sResp, 400), _
                48, "AI Suggester — Словарь"
         Exit Sub
     End If
@@ -179,7 +193,10 @@ Sub AIDictRemoveWord()
         Exit Sub
     End If
 
-    If Left(sHttp, 1) = "2" Then
+    ' v1.8.2: пустой sHttp при наличии "removed" в теле — считаем 200 OK
+    Dim bOkR As Boolean : bOkR = (Left(sHttp, 1) = "2")
+    If Not bOkR And sHttp = "" And InStr(sResp, """removed"":") > 0 Then bOkR = True
+    If bOkR Then
         Dim sMsg As String
         If InStr(sResp, """removed"":true") > 0 Then
             sMsg = "Слово «" & sWord & "» удалено из словаря." & Chr(10) & Chr(10) & _
@@ -190,7 +207,9 @@ Sub AIDictRemoveWord()
         End If
         MsgBox sMsg, 64, "AI Suggester — Словарь"
     Else
-        MsgBox "Сервер отверг запрос (HTTP " & sHttp & "):" & Chr(10) & _
+        Dim sHttpShownR As String : sHttpShownR = sHttp
+        If sHttpShownR = "" Then sHttpShownR = "?"
+        MsgBox "Сервер отверг запрос (HTTP " & sHttpShownR & "):" & Chr(10) & _
                Left(sResp, 400), 48, "AI Suggester — Словарь"
     End If
     Exit Sub

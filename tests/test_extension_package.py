@@ -19,10 +19,10 @@ def test_description_version():
     root = _parse(EXT_DIR / "description.xml")
     version = root.find("{http://openoffice.org/extensions/description/2006}version")
     assert version is not None
-    # v1.8.1: фикс Basic-синтаксиса в Dict.xba (As String() → As String,
-    # отказ от ReDim с отрицательными границами; функция ExtractWordsArray
-    # переименована в ExtractWordsJoined и возвращает плоскую строку).
-    assert version.get("value") == "1.8.1"
+    # v1.8.2: fallback в Dict.xba — пустой sHttp при наличии JSON-маркеров
+    # в теле трактуется как 200 OK (status-файл не всегда дописывается до
+    # возврата из Shell).
+    assert version.get("value") == "1.8.2"
 
 
 def test_manifest_lists_library_and_xcu():
