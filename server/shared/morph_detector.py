@@ -203,6 +203,21 @@ class MorphDetector:
         parses = self._morph.parse(word)
         return any("NOUN" in str(p.tag) for p in parses)
 
+    def _is_known_word(self, word: str) -> bool:
+        """True если слово есть в словаре pymorphy3.
+
+        v1.8.1: используется в детекторах adj_noun/numeral_noun, чтобы не
+        срабатывать на парах с OOV-словом (например «ремонтова» парсится
+        как ADJS/Surn через FakeDictionary, но это ложная интерпретация).
+        OOV-детектор пометит такое слово отдельно как «oov».
+        """
+        if not self._morph:
+            return True  # нет анализатора — не блокируем остальные проверки
+        try:
+            return self._morph.word_is_known(word)
+        except Exception:
+            return True
+
     def _suggest_noun_form(
         self, noun_word: str, target_number: Optional[str], target_case: Optional[str],
     ) -> Optional[str]:
@@ -256,6 +271,10 @@ class MorphDetector:
             if not self._is_ordinal_numeral(word_a):
                 continue
             if not self._is_noun(word_b):
+                continue
+            # v1.8.1: пропускаем если любое из слов — OOV (форма из FakeDictionary).
+            # Такие кейсы обрабатываются detect_oov_words, не adj/numeral.
+            if not self._is_known_word(word_a) or not self._is_known_word(word_b):
                 continue
             # Проверяем согласование по number+case
             if self._has_compatible_parse_pair(
@@ -347,6 +366,12 @@ class MorphDetector:
             # числительное (это уже ловит numeral_noun детектор).
             if self._is_ordinal_numeral(word_a):
                 continue
+            # v1.8.1: пропускаем если любое из слов — OOV. Был prod-FP на
+            # «капитальных ремонтова помещений»: «ремонтова» (OOV) парсился
+            # как ADJS через FakeDictionary, и детектор выдавал два FP по этой
+            # ложной интерпретации. OOV-детектор отловит «ремонтова» отдельно.
+            if not self._is_known_word(word_a) or not self._is_known_word(word_b):
+                continue
             # Краткие формы (ADJS/PRTS) — predicative, не склоняются
             # по падежам. Для них проверяем только number+gender.
             if self._is_short_form_only(word_a):
@@ -417,9 +442,15 @@ class MorphDetector:
             if not all_unknown:
                 continue
             # Если хотя бы один парс — собственное имя (фамилия/имя/гео),
-            # не флагуем (это допустимо и без словаря).
+            # не флагуем — НО только если этот парс из реального словаря
+            # (is_known=True). v1.8.1: «ремонтова» получает Surn-парс через
+            # FakeDictionary с is_known=False — этому доверять нельзя, иначе
+            # любое выдуманное слово на «-ова», «-ин», «-ский» останется
+            # неотловленным. Реальные фамилии (Иванов, Сорокин) парсятся как
+            # Surn с is_known=True через DictionaryAnalyzer и здесь проходят.
             has_safe_tag = any(
-                any(marker in str(p.tag) for marker in _OOV_SAFE_TAG_MARKERS)
+                p.is_known
+                and any(marker in str(p.tag) for marker in _OOV_SAFE_TAG_MARKERS)
                 for p in parses
             )
             if has_safe_tag:
