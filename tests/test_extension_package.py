@@ -19,10 +19,10 @@ def test_description_version():
     root = _parse(EXT_DIR / "description.xml")
     version = root.find("{http://openoffice.org/extensions/description/2006}version")
     assert version is not None
-    # v1.8.2: fallback в Dict.xba — пустой sHttp при наличии JSON-маркеров
-    # в теле трактуется как 200 OK (status-файл не всегда дописывается до
-    # возврата из Shell).
-    assert version.get("value") == "1.8.2"
+    # v1.8.3: диалог управления словарём (ListBox + Кнопки
+    # Удалить/Добавить/Закрыть) + новая тулбар-кнопка
+    # m003 «AI: Словарь».
+    assert version.get("value") == "1.8.3"
 
 
 def test_manifest_lists_library_and_xcu():
@@ -54,12 +54,15 @@ def test_basic_modules_are_parseable(name):
 
 def test_addons_xcu_has_user_toolbar_entries():
     """
-    На панели сотрудника две кнопки:
-      m001 — Main.AISuggestSelection («AI: Улучшить текст»);
-      m002 — Dict.AIDictAddSelection («AI: В словарь», v1.8b).
-    Диагностический Health.AICheckServer и сервисные Dict.AIDictListWords
-    / Dict.AIDictRemoveWord намеренно не вынесены на панель — доступны
-    через меню макросов администратору.
+    На панели сотрудника три кнопки (v1.8.3):
+      m001 — Main.AISuggestSelection («AI: Улучшить текст»).
+      m002 — Dict.AIDictAddSelection («AI: В словарь», v1.8b) —
+             быстрое добавление выделенного фрагмента.
+      m003 — Dict.AIDictManage («AI: Словарь», v1.8.3) — диалог
+             с ListBox и кнопками Удалить/Добавить/Закрыть.
+    Диагностический Health.AICheckServer и legacy Dict.AIDictListWords /
+    Dict.AIDictRemoveWord на панель не вынесены — по прежнему
+    доступны через меню макросов.
     """
     root = _parse(EXT_DIR / "Addons.xcu")
     ns = "{http://openoffice.org/2001/registry}"
@@ -67,22 +70,26 @@ def test_addons_xcu_has_user_toolbar_entries():
     names = {n.get(f"{ns}name") for n in nodes}
     assert "m001" in names  # AISuggestSelection
     assert "m002" in names  # AIDictAddSelection (v1.8b)
-    assert "m003" not in names  # больше кнопок не добавляли
-    # m002 действительно ссылается на Dict.AIDictAddSelection
-    prop_ns = "{http://openoffice.org/2001/registry}"
+    assert "m003" in names  # AIDictManage (v1.8.3)
+
+    # Проверяем что каждый нод ссылается на правильный макрос
+    expected_urls = {
+        "m001": "Main.AISuggestSelection",
+        "m002": "Dict.AIDictAddSelection",
+        "m003": "Dict.AIDictManage",
+    }
+    found = {}
     for node in nodes:
-        if node.get(f"{prop_ns}name") == "m002":
-            urls = [
-                v.text or ""
-                for v in node.iter()
-                if v.tag.endswith("value")
-            ]
-            assert any(
-                "Dict.AIDictAddSelection" in u for u in urls
-            ), f"m002 должна вызывать Dict.AIDictAddSelection, найдены: {urls}"
-            break
-    else:
-        pytest.fail("node m002 не найден в Addons.xcu")
+        name = node.get(f"{ns}name")
+        if name in expected_urls:
+            urls = [v.text or "" for v in node.iter() if v.tag.endswith("value")]
+            assert any(expected_urls[name] in u for u in urls), (
+                f"{name} должна вызывать {expected_urls[name]}, найдены: {urls}"
+            )
+            found[name] = True
+    assert set(found) == set(expected_urls), (
+        f"Не все кнопки найдены: проверено {found}, ожидалось {set(expected_urls)}"
+    )
 
 
 def test_oxt_artifact_can_be_rebuilt(tmp_path):
@@ -107,6 +114,36 @@ def test_oxt_artifact_can_be_rebuilt(tmp_path):
             "ai_macro/dialog.xlb",
         ):
             assert expected in names, f"В .oxt нет {expected}"
+
+
+def test_dict_xba_has_manage_dialog_v183():
+    """v1.8.3: новый Sub AIDictManage() и helper'ы для диалога управления
+    словарём (ListBox + Кнопки). Listener для STANDARD-кнопки «Добавить»
+    реализован через CreateUnoListener с префиксом AIDictDlg_BtnAdd_,
+    значит обязательно должны быть Sub'ы actionPerformed/disposing с этим
+    префиксом — иначе диалог упадёт на клике."""
+    body = (EXT_DIR / "ai_macro" / "Dict.xba").read_text(encoding="utf-8")
+    # Точка входа на тулбаре
+    assert "Sub AIDictManage()" in body
+    # Builder / dispatcher
+    assert "AIDictManage_ShowDialog" in body
+    assert "AIDictManage_DoAdd" in body
+    assert "AIDictManage_DoDelete" in body
+    # Loader
+    assert "LoadDictWordsJoined" in body
+    # Listener для кнопки «Добавить новое...» — оба метода XActionListener
+    # (actionPerformed + disposing inherited from XEventListener) должны быть.
+    # createUnoListener будет искать Sub-ы по этому префиксу.
+    assert "AIDictDlg_BtnAdd_actionPerformed" in body
+    assert "AIDictDlg_BtnAdd_disposing" in body
+    # Используется правильный UNO-сервис
+    assert "com.sun.star.awt.UnoControlDialogModel" in body
+    assert "com.sun.star.awt.UnoControlListBoxModel" in body
+    # PushButtonType: OK=1 (Delete), CANCEL=2 (Close), STANDARD=0 (Add)
+    assert "PushButtonType = 1" in body
+    assert "PushButtonType = 2" in body
+    # MultiSelection для ListBox
+    assert "MultiSelection = True" in body
 
 
 def test_main_xba_uses_settings_module():

@@ -33,23 +33,39 @@
           <prop oor:name="Target" oor:type="xs:string"><value>_self</value></prop>
           <prop oor:name="Context" oor:type="xs:string"><value>com.sun.star.text.TextDocument</value></prop>
         </node>
+        <node oor:name="m003" oor:op="replace">
+          <prop oor:name="URL" oor:type="xs:string">
+            <value>vnd.sun.star.script:ai_macro.Dict.AIDictManage?language=Basic&amp;location=application</value>
+          </prop>
+          <prop oor:name="ImageIdentifier" oor:type="xs:string"><value/></prop>
+          <prop oor:name="Title" oor:type="xs:string">
+            <value xml:lang="ru">AI: Словарь</value>
+            <value xml:lang="en">AI: Dictionary</value>
+          </prop>
+          <prop oor:name="Target" oor:type="xs:string"><value>_self</value></prop>
+          <prop oor:name="Context" oor:type="xs:string"><value>com.sun.star.text.TextDocument</value></prop>
+        </node>
       </node>
     </node>
   </node>
 </oor:component-data>
 <!--
-  На панели инструментов сотрудника показываются ДВЕ кнопки:
+  На панели инструментов сотрудника показываются ТРИ кнопки:
     • «AI: Улучшить текст» (m001) — основной макрос Main.AISuggestSelection.
-    • «AI: В словарь» (m002) — Dict.AIDictAddSelection: добавить выделенное
-      слово (аббревиатуру / служебный термин / исключение) в пользовательский
-      словарь на сервере. Сервер хранит слова в data/user_dict.json и инжектит
-      их в SYSTEM_PROMPT при каждом /suggest, чтобы модель считала их
-      корректными.
+    • «AI: В словарь»      (m002) — Dict.AIDictAddSelection: быстрое добавление
+      выделенного фрагмента (аббревиатура / служебный термин / исключение)
+      в пользовательский словарь на сервере.
+    • «AI: Словарь»        (m003, v1.8.3) — Dict.AIDictManage: диалог со
+      списком всех слов и кнопками «Удалить выделенные» / «Добавить новое» /
+      «Закрыть». Используется для просмотра словаря и пакетного удаления.
 
-  Диагностический макрос Health.AICheckServer и сервисные Dict.AIDictListWords
-  / Dict.AIDictRemoveWord зарегистрированы в script.xlb и доступны через
-  «Сервис → Макросы → Мои макросы → ai_macro», но намеренно не вынесены на
-  панель: сотрудник не должен видеть и менять адрес сервера или массово
-  редактировать словарь.
+  Сервер хранит словарь в data/user_dict.json и инжектит его в SYSTEM_PROMPT
+  при каждом /suggest, чтобы модель считала эти слова корректными.
+
+  Диагностический макрос Health.AICheckServer и legacy-макросы
+  Dict.AIDictListWords / Dict.AIDictRemoveWord (на InputBox) остаются
+  зарегистрированными в script.xlb и доступны через «Сервис → Макросы»,
+  но не вынесены на панель — основной поток управления словарём теперь
+  через «AI: Словарь».
 -->
 
