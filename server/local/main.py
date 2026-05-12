@@ -416,6 +416,40 @@ _CHANGE_PAIR_RE = re.compile(
 )
 
 
+_LEADING_NUM_RE = re.compile(r"^\s*\d+\.\s*")
+_QUOTED_GREEDY_RE = re.compile(
+    rf"^\s*[{_QUOTE_CHARS}](.+)[{_QUOTE_CHARS}]\s*$"
+)
+
+
+def _parse_change_pair_robust(line: str) -> Optional[tuple[str, str]]:
+    """Извлекает (before, after) из строки CHANGES, корректно обрабатывая
+    вложенные кавычки. v1.8.2: _CHANGE_PAIR_RE использует non-greedy
+    срез между [^кавычек]+, и на строке вида «адм…здания «ЦСН ВО»» →
+    «адм…здания «ЦСН ВО»» он матчится на внутренней «ЦСН ВО», а не на
+    внешней парe — в итоге before/after не равны и фильтр пропускает
+    идемпотентный пункт.
+
+    Эта функция работает по структуре строки:
+      `N. «before» → «after» | explanation` → (before, after).
+    Жадный матч `«(.+)»` забирает всё содержимое от первой « до последней ».
+    """
+    s = _LEADING_NUM_RE.sub("", line.strip())
+    # Отрезаем ` | explanation` (если есть)
+    if " | " in s:
+        s = s.split(" | ", 1)[0]
+    # Ищем разделитель before/after
+    for sep in (" → ", " -> "):
+        if sep in s:
+            left, right = s.rsplit(sep, 1)
+            lm = _QUOTED_GREEDY_RE.match(left.strip())
+            rm = _QUOTED_GREEDY_RE.match(right.strip())
+            if lm and rm:
+                return (lm.group(1), rm.group(1))
+            return None
+    return None
+
+
 def _drop_idempotent_changes(text: str) -> str:
     """Удаляет из блока ===CHANGES=== пункты вида «X → X».
 
@@ -443,12 +477,18 @@ def _drop_idempotent_changes(text: str) -> str:
         if not line.strip():
             kept.append(line)
             continue
-        m = _CHANGE_PAIR_RE.search(line)
+        # v1.8.2: сначала пробуем robust-парсер (учитывает вложенные кавычки),
+        # потом старый _CHANGE_PAIR_RE как fallback.
+        pair = _parse_change_pair_robust(line)
+        if pair is None:
+            m = _CHANGE_PAIR_RE.search(line)
+            if m:
+                pair = (m.group(1), m.group(2))
         # Сравниваем БЕЗ .lower(): «Приказа» → «приказа» — это валидная
         # орфографическая правка регистра (имя собственное vs нарицательное),
         # такие пункты сохраняем. Идемпотентный пункт — это когда до и после
         # совпадают побуквенно.
-        if m and m.group(1).strip() == m.group(2).strip():
+        if pair and pair[0].strip() == pair[1].strip():
             logger.debug("Фильтрую идемпотентный пункт: %s", line.strip())
             continue
         # Пункты с многоточием в цитатах («…» или «...») неприменимы:
@@ -457,8 +497,8 @@ def _drop_idempotent_changes(text: str) -> str:
         # «не удалось применить (фрагмент не найден)». YandexGPT-5-Lite
         # склонна к таким сокращениям; T-lite — реже. Промпт это запрещает,
         # но оставляем как страховку.
-        if m and ("…" in m.group(1) or "..." in m.group(1)
-                  or "…" in m.group(2) or "..." in m.group(2)):
+        if pair and ("…" in pair[0] or "..." in pair[0]
+                     or "…" in pair[1] or "..." in pair[1]):
             logger.info("Фильтрую пункт с многоточием в цитате: %s", line.strip())
             continue
         kept.append(line)
