@@ -35,10 +35,21 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from shared.syntax_parser import ParsedDoc
 
 _log = logging.getLogger("ai_suggester.morph_filter")
+
+# v1.9: ENV-флаг включения natasha-парсера в morph_filter. Default `true`.
+# Если natasha не установлена — фильтр откатится на v1.8.5 hardcoded
+# skip-rules (PRTF+ablt, PREP+местоим).
+_NATASHA_ENABLED_ENV = os.getenv("NATASHA_ENABLED", "true").lower() in (
+    "1", "true", "yes", "on",
+)
 
 # Предлоги/наречия, явно требующие определённого падежа. Если такой
 # токен стоит непосредственно перед `before` в исходном тексте — модель,
@@ -124,7 +135,8 @@ class MorphFilter:
         return any("PREP" in str(p.tag) for p in parses)
 
     def _is_grammatically_disagreed_with_prev(
-        self, before: str, raw_text: str
+        self, before: str, raw_text: str,
+        parsed_doc: Optional["ParsedDoc"] = None,
     ) -> bool:
         """v1.7.3: True если в `raw_text` непосредственно перед `before`
         стоит ADJF/ADJS/PRTF/PRTS/NPRO, и **ни один** парс `before` не
@@ -152,6 +164,34 @@ class MorphFilter:
         idx = raw_text.find(before)
         if idx < 0:
             return False
+        # v1.9: если есть дерево зависимостей — спрашиваем у него
+        # синтаксическую связь между prev_word и before на этом offset.
+        # Если НЕ attributive (amod/det/...) или prev сам управляется
+        # предлогом — disagreement НЕ существует (дерево говорит
+        # что эти слова не должны согласовываться). Возвращаем False,
+        # это включит стандартный case-only-фильтр и заблокирует
+        # hallucinated case-change от T-lite. Сигнал True (`рассогласованы`)
+        # возвращаем только при attributive-связи с реальным
+        # морфологическим несовпадением.
+        if parsed_doc is not None:
+            noun_idx = parsed_doc.token_at_offset(idx)
+            if noun_idx is not None:
+                # Ищем предыдущий по дереву токен (не PUNCT) и смотрим
+                # его связь с noun_idx.
+                prev_idx = noun_idx - 1
+                while prev_idx >= 0 and parsed_doc.tokens[prev_idx].pos == "PUNCT":
+                    prev_idx -= 1
+                if prev_idx >= 0:
+                    if parsed_doc.is_clearly_non_attributive(prev_idx, noun_idx):
+                        # Синтаксически эти слова ЯВНО НЕ в attributive-
+                        # связи (либо obl:agent, либо case-governed
+                        # через case-child, либо parataxis). disagreement
+                        # не существует. Возвращаем False — пусть
+                        # стандартный case-only-фильтр заблокирует hallucination.
+                        return False
+                    # Иначе (включая случаи где natasha мис-парсит):
+                    # fallback на pymorphy3-морфоcheck ниже + v1.8.5
+                    # hardcoded skip-rules.
         prefix = raw_text[:idx].rstrip()
         m = re.search(r"(\S+)\s*$", prefix)
         if not m:
@@ -218,7 +258,8 @@ class MorphFilter:
         return True
 
     def is_case_only_substitution(
-        self, before: str, after: str, raw_text: Optional[str] = None
+        self, before: str, after: str, raw_text: Optional[str] = None,
+        parsed_doc: Optional["ParsedDoc"] = None,
     ) -> bool:
         """True если `before` и `after` — формы одной леммы, отличающиеся
         ТОЛЬКО падежом (не числом, не родом, не POS).
@@ -260,7 +301,9 @@ class MorphFilter:
             return False
         # Контекстная проверка: если before рассогласован с предыдущим
         # adj/прич/мест → реальная ошибка, не блокируем.
-        if raw_text and self._is_grammatically_disagreed_with_prev(b, raw_text):
+        if raw_text and self._is_grammatically_disagreed_with_prev(
+            b, raw_text, parsed_doc=parsed_doc,
+        ):
             return False
         try:
             pb = self._morph.parse(b)
@@ -304,7 +347,10 @@ class MorphFilter:
         prev = m.group(1).lower().strip(".,;:!?\"'«»()[]{}")
         return prev in _CASE_GOVERNING_PREPS
 
-    def is_hallucinated_case_change(self, before: str, after: str, raw_text: str) -> bool:
+    def is_hallucinated_case_change(
+        self, before: str, after: str, raw_text: str,
+        parsed_doc: Optional["ParsedDoc"] = None,
+    ) -> bool:
         """Главный публичный метод. Возвращает True если правка
         `before` → `after` — галлюцинированное «улучшение» уже валидной
         падежной формы (одна лемма + тот же number + разный case + НЕТ
@@ -317,7 +363,22 @@ class MorphFilter:
         Используется в серверном пайплайне для дропа таких пунктов из
         ===CHANGES=== и отката подмены в ===CORRECTED===.
         """
-        if not self.is_case_only_substitution(before, after, raw_text):
+        # v1.9: если не передан parsed_doc и NATASHA_ENABLED=true — пытаемся
+        # получить дерево лениво (кэшируется, так что один раз на
+        # raw_text). Пробрасываем в is_case_only_substitution →
+        # _is_grammatically_disagreed_with_prev.
+        if parsed_doc is None and _NATASHA_ENABLED_ENV:
+            try:
+                from shared.syntax_parser import get_syntax_parser  # noqa: E402
+                parser = get_syntax_parser()
+                if parser.available:
+                    parsed_doc = parser.parse(raw_text)
+            except Exception as exc:  # pragma: no cover
+                _log.warning(
+                    "MorphFilter: не удалось загрузить syntax_parser: %s",
+                    exc,
+                )
+        if not self.is_case_only_substitution(before, after, raw_text, parsed_doc):
             return False
         if self.has_case_governing_context(before, raw_text):
             return False

@@ -452,3 +452,130 @@ def test_v185_no_fp_preposition_demonstrative_pronoun_cases(detector: MorphDetec
         assert target_noun not in befores, (
             f"v1.8.5 regression for «{text}»: «{target_noun}» wrongly flagged"
         )
+
+
+# ─── v1.9 интеграционные тесты с natasha syntax_parser ────────────────
+
+
+@pytest.fixture(scope="module")
+def syntax_parser_v19():
+    """Загружает natasha-парсер для интеграционных тестов v1.9. Если
+    natasha не установлена — skip. Это один раз на модуль (~5 сек startup).
+    """
+    try:
+        from shared.syntax_parser import reset_syntax_parser, get_syntax_parser
+    except Exception:
+        pytest.skip("syntax_parser не доступен")
+    reset_syntax_parser()
+    p = get_syntax_parser()
+    if not p.available:
+        pytest.skip("natasha не установлена")
+    return p
+
+
+def test_v19_natasha_blocks_fp1_participle_agent(
+    detector: MorphDetector, syntax_parser_v19,
+):
+    """v1.9: с natasha-деревом FP-1 (причастие + агенс) блокируется
+    БЕЗ v1.8.5 hardcoded skip-rule (тот всё равно остался как fallback).
+    Главная проверка — что детектор не флагует «подразделениями» как
+    disagreement при наличии parsed_doc.
+    """
+    text = (
+        "мероприятий по профилактике, предупреждению, выявлению и "
+        "пресечению преступлений, проводимых подразделениями собственной "
+        "безопасности"
+    )
+    doc = syntax_parser_v19.parse(text)
+    assert doc is not None
+    errs = detector.detect_adj_noun_disagreements(text, parsed_doc=doc)
+    befores = [e.before for e in errs]
+    assert "подразделениями" not in befores, (
+        f"v1.9 FP-1 regression: «подразделениями» wrongly flagged; "
+        f"errs={[(e.before, e.suggestion) for e in errs]}"
+    )
+
+
+def test_v19_natasha_blocks_fp2_preposition_pronoun(
+    detector: MorphDetector, syntax_parser_v19,
+):
+    """v1.9: с natasha-деревом FP-2 («при этом количество») блокируется
+    через case-child signal в is_clearly_non_attributive.
+    """
+    text = (
+        "Преобладают общеуголовные преступления – 99, при этом "
+        "количество должностных преступлений – 47."
+    )
+    doc = syntax_parser_v19.parse(text)
+    assert doc is not None
+    errs = detector.detect_adj_noun_disagreements(text, parsed_doc=doc)
+    befores = [e.before for e in errs]
+    assert "количество" not in befores, (
+        f"v1.9 FP-2 regression: «количество» wrongly flagged; "
+        f"errs={[(e.before, e.suggestion) for e in errs]}"
+    )
+
+
+def test_v19_natasha_does_not_break_real_disagreement(
+    detector: MorphDetector, syntax_parser_v19,
+):
+    """v1.9: реальный disagreement «*проведённое мероприятия» по-прежнему
+    ловится (natasha мис-парсит это в PROPN nsubj — fallback на v1.8.5
+    + pymorphy3 спасает нас от false-negative парсера).
+    """
+    text = "Проведённое мероприятия выполнено."
+    doc = syntax_parser_v19.parse(text)
+    assert doc is not None
+    errs = detector.detect_adj_noun_disagreements(text, parsed_doc=doc)
+    befores = [e.before for e in errs]
+    # Главное — «мероприятия» (плур) должно быть помечено как требующее
+    # исправления на «мероприятие» (сингулярное). Это TP, и v1.9 не
+    # должна это пропустить.
+    assert "мероприятия" in befores, (
+        f"v1.9 should still detect real disagreement; got errs="
+        f"{[(e.before, e.suggestion) for e in errs]}"
+    )
+
+
+def test_v19_detect_errors_auto_loads_parser(detector: MorphDetector):
+    """v1.9: detect_errors() сам подтягивает natasha-парсер если
+    NATASHA_ENABLED=true и не передан parsed_doc явно. Закрытие
+    end-to-end FP-1 через публичный API.
+    """
+    # NATASHA_ENABLED берётся из env при импорте модуля. В тестовой среде
+    # default=true. Проверяем что вызов без parsed_doc всё равно работает.
+    text = (
+        "мероприятий, проводимых подразделениями собственной безопасности"
+    )
+    errs = detector.detect_errors(text)
+    befores = [e.before for e in errs]
+    assert "подразделениями" not in befores, (
+        f"v1.9 detect_errors auto-natasha: «подразделениями» wrongly flagged"
+    )
+
+
+def test_v19_full_admin_doc_no_regression(
+    detector: MorphDetector, syntax_parser_v19,
+):
+    """v1.9: полный прод-кейс из PR #47 — длинный админ-текст с
+    причастными оборотами и «при этом». Должно быть: 0 FP на
+    подразделениями/сотрудниками/количество, и НЕТ изменения
+    поведения для остальных слов.
+    """
+    text = (
+        "Анализ уголовных деяний, совершенных сотрудниками, свидетельствует "
+        "о том, что преобладают общеуголовные преступления – 99, при этом "
+        "количество должностных преступлений – 47. УОПМ в целях повышения "
+        "эффективности мероприятий по профилактике, предупреждению, "
+        "выявлению и пресечению преступлений, проводимых подразделениями "
+        "собственной безопасности, обобщены и структурированы сведения."
+    )
+    doc = syntax_parser_v19.parse(text)
+    errs = detector.detect_errors(text, parsed_doc=doc)
+    befores = [e.before for e in errs]
+    # FP-цели из прода 05.05.2026 — все должны быть НЕ помечены:
+    for fp_word in ("подразделениями", "сотрудниками", "количество"):
+        assert fp_word not in befores, (
+            f"v1.9 prod-regression: «{fp_word}» wrongly flagged; "
+            f"errs={[(e.before, e.suggestion) for e in errs]}"
+        )

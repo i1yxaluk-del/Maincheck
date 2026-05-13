@@ -18,6 +18,15 @@ beautifulsoup4>=4.12.0
 pymorphy3>=2.0.0
 pymorphy3-dicts-ru>=2.4.0
 
+# v1.9: natasha dependency-parser для синтаксического анализа.
+# Заменяет ручные skip-rules v1.8.5 на универсальное правило «attributive
+# relation в UD-дереве» — закрывает классы FP «причастие+агенс», «предлог
+# +местоим+сущ» и т.д. без новых hardcoded patterns. Включается через
+# NATASHA_ENABLED=true (по умолчанию). Если не установлен — детекторы
+# откатываются на v1.8.5 hardcoded правила, latency не растёт.
+# Размер: ~150 МБ (slovnet news-models). Latency: +8-50 мс/запрос.
+natasha>=1.6.0
+
 # v1.8c: sage-95m post-валидатор (опционально, default OFF).
 # `ai-forever/sage-fredt5-distilled-95m` — компактная русская GEC-модель,
 # проверяет каждую правку T-lite как «второе мнение». Включается через
