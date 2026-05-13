@@ -143,10 +143,37 @@ curl http://localhost:8000/metrics
 ```bash
 cd server/cloud
 cp .env.example .env
-# вписать OPENROUTER_API_KEY
+# вписать OPENROUTER_API_KEY и (опц.) CLOUD_PRESET=A|B|C|D
 pip install -r requirements.txt
 # запустить под systemd аналогично локальному
 ```
+
+**CLOUD_PRESET** (`v2.2`):
+- **A** — `openrouter/free` auto-router (дефолт, самый надёжный).
+- **B** — `qwen/qwen3-next-80b-a3b-instruct:free` (рекомендуется для
+  русскоязычных официальных документов).
+- **C** — `google/gemma-4-31b-it:free` (multilingual, контекст 256K).
+- **D** — `nvidia/nemotron-3-super-120b-a12b:free` (сильный reasoning).
+
+**Архитектура cloud (`v2.2`)** — сознательно упрощён по сравнению с
+локальным сервером. Сетевая модель сама справляется с орфографией,
+пунктуацией, согласованием, стилем и логикой, поэтому local-specific
+костыли (морф-фильтр, морф-детектор, sage, LanguageTool, few-shot
+retrieval) в cloud НЕ используются и в `.env.example` отсутствуют.
+Активны только:
+- **RAG** (`RAG_ENABLED=true`) — фрагменты НПА РФ из `data/rag_store/`,
+  чтобы модель могла ссылаться на ГОСТ Р 7.0.97-2016, методические
+  рекомендации Минюста, ведомственные регламенты.
+- **Пользовательский словарь** (`USER_DICT_ENABLED=true`) — REST API
+  `/dict/list`, `/dict/add`, `/dict/remove`. Модель не «исправляет»
+  термины из словаря.
+- **Сильный SYSTEM_PROMPT** — покрывает все классы ошибок русского
+  языка плюс нормы служебной переписки в РФ. См.
+  `server/cloud/main.py:SYSTEM_PROMPT`.
+
+> Cloud и local не работают вместе. Cloud сейчас — для опробования
+> функционала и качества сетевой модели на реальных документах
+> ведомства.
 
 ---
 

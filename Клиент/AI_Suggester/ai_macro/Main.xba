@@ -325,7 +325,13 @@ End Sub
 ' Делает: запоминает ParaStyleName начала выделения, удаляет содержимое,
 ' вставляет текст по строкам с настоящими PARAGRAPH_BREAK между ними.
 Sub ApplyWholeReplace(oSel As Object, sText As String)
-    ' Нормализуем переводы строк: всегда Chr(10)
+    ' v2.2: различаем разрыв абзаца от мягкого переноса строки (Shift+Enter).
+    ' Конвенция (та же, что в сервере /suggest):
+    '   • двойной Chr(10)+Chr(10) — граница абзаца (PARAGRAPH_BREAK);
+    '   • одиночный Chr(10) — мягкий перенос внутри абзаца (LINE_BREAK).
+    ' До v2.2 все переносы трактовались как PARAGRAPH_BREAK, и текст,
+    ' набранный через Shift+Enter, после правки распадался на несколько
+    ' абзацев — фикс этого бага.
     Dim sNorm As String
     sNorm = Replace(sText, Chr(13) & Chr(10), Chr(10))
     sNorm = Replace(sNorm, Chr(13), Chr(10))
@@ -350,18 +356,29 @@ Sub ApplyWholeReplace(oSel As Object, sText As String)
         On Error Goto 0
     End If
 
-    Dim aParas() As String : aParas = Split(sNorm, Chr(10))
-    Dim i As Integer
+    ' Сначала режем по \n\n на «абзацы», затем каждый абзац по \n на
+    ' «мягкие строки». Это сохраняет оригинальную структуру переносов.
+    Dim aParas() As String : aParas = Split(sNorm, Chr(10) & Chr(10))
+    Dim i As Integer, j As Integer
     For i = 0 To UBound(aParas)
         If i > 0 Then
-            ' Разрыв абзаца, а не line break — иначе нумерация и стили
-            ' не подхватятся для следующего параграфа.
             On Error Resume Next
             oTextObj.insertControlCharacter(oCur, _
                 com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK, False)
             On Error Goto 0
         End If
-        oTextObj.insertString(oCur, aParas(i), False)
+        Dim aLines() As String : aLines = Split(aParas(i), Chr(10))
+        For j = 0 To UBound(aLines)
+            If j > 0 Then
+                ' Shift+Enter / Soft return — LINE_BREAK, а НЕ PARAGRAPH_BREAK.
+                ' Нумерация и стили остаются от текущего абзаца.
+                On Error Resume Next
+                oTextObj.insertControlCharacter(oCur, _
+                    com.sun.star.text.ControlCharacter.LINE_BREAK, False)
+                On Error Goto 0
+            End If
+            oTextObj.insertString(oCur, aLines(j), False)
+        Next j
     Next i
 End Sub
 

@@ -122,6 +122,55 @@ def test_local_metrics(local_module):
     assert "audit" in data
 
 
+def test_local_normalize_line_breaks_helper(local_module):
+    """v2.2: local-сервер тоже нормализует переносы (Shift+Enter fix).
+
+    \\r\\n → \\n\\n (paragraph), \\r → \\n\\n, \\n остаётся (мягкий перенос),
+    U+2028 → \\n.  SYSTEM_PROMPT local-сервера не меняется — нормализация
+    нужна только чтобы Ollama видела одинаковую конвенцию переносов
+    независимо от платформы клиента.
+    """
+    fn = local_module._normalize_line_breaks
+    assert fn("a\r\nb") == "a\n\nb"
+    assert fn("a\rb") == "a\n\nb"
+    assert fn("a\nb") == "a\nb"
+    assert fn("a\u2028b") == "a\nb"
+    assert fn("a\n\n\n\nb") == "a\n\nb"
+    assert fn("") == ""
+
+
+def test_local_soft_linebreak_preserved(local_module, monkeypatch):
+    """Shift+Enter (одиночный \\n) НЕ должен превращаться в paragraph break
+    при отправке в Ollama. До v2.2 расширение разбивало такой текст
+    на разные абзацы — фиксим на стороне сервера-нормализатора."""
+    from fastapi.testclient import TestClient
+
+    captured: dict[str, str] = {}
+
+    async def fake_call_ollama(messages):
+        captured["user_msg"] = messages[-1]["content"]
+        return (
+            "===CORRECTED===\n"
+            "Первая строка\nвторая строка.\n"
+            "===CHANGES===\n"
+            "1. Ошибок не найдено. Текст соответствует нормам.\n"
+            "===END==="
+        )
+
+    monkeypatch.setattr(local_module, "call_ollama", fake_call_ollama)
+    client = TestClient(local_module.app)
+    raw = "Первая строка\nвторая строка.\r\nВторой абзац."
+    files = {
+        "text": ("t.txt", io.BytesIO(raw.encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    sent = captured["user_msg"]
+    assert "Первая строка\nвторая строка." in sent
+    assert "\r" not in sent
+
+
 def test_local_strip_thinking(local_module):
     """Проверка, что <think>…</think> обрезается из ответа Ollama."""
     raw = (
@@ -2127,3 +2176,342 @@ def test_v20b_lt_enriches_changes(local_module_lt_enabled, monkeypatch):
     assert "===CHANGES===" in body
     # LT правка ([TYPOGRAPHY] из мока), добавлена в CHANGES
     assert "TYPOGRAPHY" in body or "тире" in body
+
+
+# ─── v2.1 cloud-mirror tests: parity с local-сервером ─────────────────
+
+
+def _load_cloud_server_with_env(monkeypatch, tmp_path, **env):
+    """Загружает cloud-server с произвольными env-флагами.
+    Дефолты: OPENROUTER_API_KEY заполнен, LOG_DIR/AUDIT_DB в tmp.
+    Любые дополнительные env-флаги передаются через **env.
+    """
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("AUDIT_DB", str(tmp_path / "audit.sqlite"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test-key-123456")
+    for k, v in env.items():
+        monkeypatch.setenv(k, str(v))
+
+    for m in list(sys.modules):
+        if m.startswith(("shared", "main")):
+            sys.modules.pop(m, None)
+
+    cloud_dir = ROOT / "server" / "cloud"
+    sys.path.insert(0, str(cloud_dir))
+    module = importlib.import_module("main")
+    yield module
+    sys.path.remove(str(cloud_dir))
+    for m in list(sys.modules):
+        if m.startswith(("shared", "main")):
+            sys.modules.pop(m, None)
+
+
+@pytest.fixture
+def cloud_module_preset_b(monkeypatch, tmp_path):
+    yield from _load_cloud_server_with_env(monkeypatch, tmp_path, CLOUD_PRESET="B")
+
+
+@pytest.fixture
+def cloud_module_preset_unknown(monkeypatch, tmp_path):
+    yield from _load_cloud_server_with_env(monkeypatch, tmp_path, CLOUD_PRESET="Z")
+
+
+@pytest.fixture
+def cloud_module_override(monkeypatch, tmp_path):
+    yield from _load_cloud_server_with_env(
+        monkeypatch, tmp_path,
+        OPENROUTER_MODELS="model-x/free,model-y/free",
+    )
+
+
+@pytest.fixture
+def cloud_module_dict_disabled(monkeypatch, tmp_path):
+    yield from _load_cloud_server_with_env(monkeypatch, tmp_path, USER_DICT_ENABLED="false")
+
+
+def test_cloud_preset_a_default(cloud_module):
+    """Дефолтный preset = A, первая модель — openrouter/free auto-router."""
+    assert cloud_module.CLOUD_PRESET == "A"
+    assert cloud_module.MODELS[0] == "openrouter/free"
+    assert len(cloud_module.MODELS) > 1
+
+
+def test_cloud_preset_b_qwen(cloud_module_preset_b):
+    """CLOUD_PRESET=B → primary = qwen3-next."""
+    assert cloud_module_preset_b.CLOUD_PRESET == "B"
+    assert cloud_module_preset_b.MODELS[0].startswith("qwen/qwen3-next")
+
+
+def test_cloud_unknown_preset_falls_back_to_a(cloud_module_preset_unknown):
+    """Неизвестный preset → A (мягкая деградация)."""
+    assert cloud_module_preset_unknown.CLOUD_PRESET == "A"
+
+
+def test_cloud_models_override(cloud_module_override):
+    """OPENROUTER_MODELS (CSV) перебивает preset."""
+    assert cloud_module_override.MODELS == ["model-x/free", "model-y/free"]
+
+
+def test_cloud_metrics_extended(cloud_module):
+    """v2.2 metrics возвращает минимальный набор блоков: rag, dict, preset, audit.
+
+    В v2.2 cloud-сервер сознательно упрощён по сравнению с local: морф-фильтр,
+    морф-детектор, sage, LanguageTool и few-shot retrieval удалены, потому что
+    сетевая модель сама лучше справляется с этими классами ошибок.
+    """
+    from fastapi.testclient import TestClient
+    client = TestClient(cloud_module.app)
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["server"] == "cloud"
+    assert "rag_enabled" in data
+    assert "user_dict_enabled" in data
+    assert "cloud_preset" in data
+    assert "cloud_preset_description" in data
+    assert "audit" in data
+    # В v2.2 этих блоков быть не должно — фильтры удалены
+    assert "few_shot_enabled" not in data
+    assert "morph_filter_enabled" not in data
+    assert "morph_detector_enabled" not in data
+    assert "languagetool_enabled" not in data
+
+
+def test_cloud_dict_list_endpoint(cloud_module):
+    """/dict/list возвращает 200 + words, когда USER_DICT_ENABLED=true (дефолт)."""
+    from fastapi.testclient import TestClient
+    client = TestClient(cloud_module.app)
+    r = client.get("/dict/list")
+    assert r.status_code == 200
+    body = r.json()
+    assert "words" in body
+    assert isinstance(body["words"], list)
+
+
+def test_cloud_dict_add_and_remove(cloud_module):
+    """/dict/add + /dict/remove работают и /dict/list отражает изменения."""
+    from fastapi.testclient import TestClient
+    client = TestClient(cloud_module.app)
+
+    # Сначала зачистим словарь (на случай артефактов от других тестов)
+    initial = client.get("/dict/list").json()["words"]
+    for w in initial:
+        client.post("/dict/remove", json={"word": w})
+
+    r = client.post("/dict/add", json={"word": "ЦСНтест"})
+    assert r.status_code == 200
+    assert r.json()["added"] is True
+
+    listing = client.get("/dict/list").json()
+    assert "ЦСНтест" in listing["words"]
+
+    r = client.post("/dict/remove", json={"word": "ЦСНтест"})
+    assert r.status_code == 200
+    assert r.json()["removed"] is True
+    listing = client.get("/dict/list").json()
+    assert "ЦСНтест" not in listing["words"]
+
+
+def test_cloud_dict_disabled(cloud_module_dict_disabled):
+    """/dict/list возвращает 503 если USER_DICT_ENABLED=false."""
+    from fastapi.testclient import TestClient
+    client = TestClient(cloud_module_dict_disabled.app)
+    r = client.get("/dict/list")
+    assert r.status_code == 503
+    assert "отключён" in r.json()["error"]
+
+
+def test_cloud_dict_add_invalid_input(cloud_module):
+    """/dict/add возвращает 400 на невалидный JSON."""
+    from fastapi.testclient import TestClient
+    client = TestClient(cloud_module.app)
+    r = client.post("/dict/add", json={})
+    assert r.status_code == 400
+
+
+def test_cloud_soft_linebreak_normalized(cloud_module, monkeypatch):
+    """v2.2: одиночный \\r и \\r\\n на входе /suggest нормализуются до \\n\\n
+    (paragraph), а одиночный \\n (Shift+Enter) — остаётся как мягкий перенос.
+
+    Это исправляет баг «расширение разъединяет один абзац с Shift+Enter
+    на несколько». Проверяем, что сервер передаёт модели текст в
+    единой конвенции и raw_text в audit-логах нормализован.
+    """
+    from fastapi.testclient import TestClient
+
+    captured: dict[str, str] = {}
+
+    async def fake_call_model(messages, model):
+        captured["user_msg"] = messages[-1]["content"]
+        return (
+            "===CORRECTED===\n"
+            "Первая строка\nвторая строка.\n"
+            "===CHANGES===\n"
+            "1. Ошибок не найдено. Текст соответствует нормам.\n"
+            "===END==="
+        )
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    client = TestClient(cloud_module.app)
+    # Имитируем то, что LibreOffice getString() мог бы прислать:
+    # \r\n — paragraph break (Windows), \n — Shift+Enter (soft).
+    raw = "Первая строка\nвторая строка.\r\nВторой абзац."
+    files = {
+        "text": ("t.txt", io.BytesIO(raw.encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    sent = captured["user_msg"]
+    # Soft-break (одиночный \n) сохранён внутри абзаца
+    assert "Первая строка\nвторая строка." in sent
+    # Hard-break (\r\n) превратился в paragraph break (\n\n)
+    assert "Второй абзац." in sent
+    assert "\r\n" not in sent
+    assert "\r" not in sent
+
+
+def test_cloud_normalize_line_breaks_helper(cloud_module):
+    """Unit-тест нормализатора переносов: \\r\\n → \\n\\n, \\r → \\n\\n, \\n остаётся."""
+    fn = cloud_module._normalize_line_breaks
+    assert fn("a\r\nb") == "a\n\nb"
+    assert fn("a\rb") == "a\n\nb"
+    assert fn("a\nb") == "a\nb"  # soft break не трогаем
+    assert fn("a\u2028b") == "a\nb"  # U+2028 — single soft break
+    # Множественные \n\n схлопываются до 2
+    assert fn("a\n\n\n\nb") == "a\n\nb"
+    assert fn("") == ""
+
+
+def test_cloud_postprocess_drops_not_in_text(cloud_module, monkeypatch):
+    """Cloud-сервер дропает пункты, чей «было» отсутствует в raw_text
+    (галлюцинации модели — как и local)."""
+    from fastapi.testclient import TestClient
+
+    async def fake_call_model(messages, model):
+        return (
+            "===CORRECTED===\n"
+            "Документ согласно приказу.\n"
+            "===CHANGES===\n"
+            "1. «несуществующая_цитата» → «другое» | вымышленная правка\n"
+            "===END==="
+        )
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    client = TestClient(cloud_module.app)
+    files = {
+        "text": ("t.txt", io.BytesIO("Документ согласно приказу.".encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    assert "несуществующая_цитата" not in r.text
+
+
+def test_cloud_suggest_appends_end_marker(cloud_module, monkeypatch):
+    """Если модель забыла ===END===, cloud-сервер дописывает его."""
+    from fastapi.testclient import TestClient
+
+    async def fake_call_model(messages, model):
+        return (
+            "===CORRECTED===\nок\n"
+            "===CHANGES===\n1. Ошибок нет.\n"
+        )
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    client = TestClient(cloud_module.app)
+    files = {
+        "text": ("t.txt", io.BytesIO("ок".encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    assert "===END===" in r.text
+
+
+def test_cloud_suggest_fallback_on_429(cloud_module, monkeypatch):
+    """Cloud-сервер пробует следующую модель на HTTP 429."""
+    from fastapi.testclient import TestClient
+    import httpx as _httpx
+
+    calls = []
+
+    async def fake_call_model(messages, model):
+        calls.append(model)
+        if model == cloud_module.MODELS[0]:
+            req = _httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+            resp = _httpx.Response(429, request=req, text='{"error":"rate-limited"}')
+            raise _httpx.HTTPStatusError("rate-limited", request=req, response=resp)
+        return (
+            "===CORRECTED===\nок\n===CHANGES===\n1. Ошибок нет.\n===END==="
+        )
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    client = TestClient(cloud_module.app)
+    files = {
+        "text": ("t.txt", io.BytesIO("ок".encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    assert "===CORRECTED===" in r.text
+    # Минимум 2 модели опробованы (429 на первой, успех на второй)
+    assert len(calls) >= 2
+
+
+def test_cloud_strip_thinking(cloud_module, monkeypatch):
+    """Cloud-сервер срезает <think>…</think> блоки (parity с local)."""
+    from fastapi.testclient import TestClient
+
+    async def fake_call_model(messages, model):
+        return (
+            "<think>Думаю про орфографию...</think>\n"
+            "===CORRECTED===\nок\n===CHANGES===\n1. Ошибок нет.\n===END==="
+        )
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    client = TestClient(cloud_module.app)
+    files = {
+        "text": ("t.txt", io.BytesIO("ок".encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    assert "<think>" not in r.text
+    assert "Думаю про орфографию" not in r.text
+
+
+def test_cloud_openrouter_client_resolve_models():
+    """Резолвер моделей: preset A/B + override."""
+    from shared.openrouter_client import resolve_models, CLOUD_PRESETS
+
+    a = resolve_models("A")
+    assert a[0] == "openrouter/free"
+    b = resolve_models("B")
+    assert b[0].startswith("qwen/qwen3-next")
+    unknown = resolve_models("Z")  # неизвестный preset → A
+    assert unknown == a
+    override = resolve_models("A", override_models=["model-1", "model-2"])
+    assert override == ["model-1", "model-2"]
+    # Все 4 preset'а определены
+    for k in ("A", "B", "C", "D"):
+        assert k in CLOUD_PRESETS
+
+
+def test_cloud_openrouter_client_key_redaction():
+    """OpenRouterClient.key_redacted маскирует ключ."""
+    from shared.openrouter_client import OpenRouterClient
+
+    c1 = OpenRouterClient("sk-or-v1-abcdefghijklmnop1234")
+    redacted = c1.key_redacted
+    assert "sk-or-v1-abc" in redacted
+    assert "1234" in redacted
+    assert "..." in redacted
+    assert "defghijkl" not in redacted
+
+    c2 = OpenRouterClient("")
+    assert c2.key_redacted == "(empty)"
+    assert c2.key_present is False
+
+    c3 = OpenRouterClient("ваш_ключ_тут")
+    assert c3.key_present is False  # placeholder
