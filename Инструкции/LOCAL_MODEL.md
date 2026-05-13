@@ -46,6 +46,21 @@
 | ~~`qwen3:30b-a3b-instruct-2507`~~      | ~18 ГБ   | Вносит новые ошибки | — (не рекомендуется)                          |
 | ~~`qwen3:30b-a3b` (без 2507)~~         | ~18 ГБ   | thinking-режим игнорирует `think:false` | — (не рекомендуется)      |
 
+### v2.0-a: A/B/C presets (май 2026)
+
+Для быстрого переключения между моделями добавлен `LLM_PRESET` env-var. См.
+`server/local/.env.example`. Helper-script: `scripts/switch_llm_preset.sh A|B|C`.
+
+| Preset | Модель | Размер (Q4) | Лицензия | Примечание |
+|---|---|---|---|---|
+| A ⭐ | `t-tech/T-lite-it-2.1:q4_K_M` | ~5 ГБ | Apache 2.0 (T-Bank) | Baseline, default |
+| B | `hf.co/yandex/YandexGPT-5-Lite-8B-instruct-GGUF:Q4_K_M` | ~5 ГБ | Yandex (open) | F0.5=83% LORuGEC (BEA 2025) |
+| C | `hf.co/ai-sage/GigaChat-3.1-Lightning-10B-A1.8B-Instruct-GGUF:Q4_K_M` | ~6 ГБ | MIT | MoE 1.8B active, март 2026 |
+
+A/B/C-бенчмарк: `./scripts/benchmark_llm_presets.sh /path/to/text.txt`.
+Скрипт переключает preset, перезапускает сервер, гоняет один и тот же
+запрос, печатает сводку.
+
 > **Совет.** Если RAM <8 ГБ — T-lite всё равно работает (5 ГБ + ОС ≈ 6.5 ГБ).
 > Если RAM ≥24 ГБ и вам нужно максимальное качество на длинных юридических
 > текстах — `qwen2.5:32b` остаётся хорошим выбором, но ждать придётся ~100 с

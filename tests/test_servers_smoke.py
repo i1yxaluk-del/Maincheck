@@ -1878,3 +1878,122 @@ def test_v184_preserves_other_block_structure(local_module):
     )
     out = local_module._complete_changes_from_corrected(text, raw)
     assert "Дополнительный хвост" in out
+
+
+# ─── v2.0-a: LLM_PRESET A/B/C тесты ───────────────────────────────────
+
+
+def _load_local_server_with_preset(monkeypatch, tmp_path, preset, model_override=None):
+    """Загружает local-сервер с заданным LLM_PRESET. Если model_override
+    задан — также устанавливает MODEL_NAME (для проверки приоритета).
+    """
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("AUDIT_DB", str(tmp_path / "audit.sqlite"))
+    monkeypatch.setenv("RAG_ENABLED", "false")
+    monkeypatch.setenv("LLM_PRESET", preset)
+    if model_override is not None:
+        monkeypatch.setenv("MODEL_NAME", model_override)
+    else:
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+    for m in list(sys.modules):
+        if m.startswith(("shared", "main")):
+            sys.modules.pop(m, None)
+    local_dir = ROOT / "server" / "local"
+    sys.path.insert(0, str(local_dir))
+    module = importlib.import_module("main")
+    yield module
+    sys.path.remove(str(local_dir))
+    for m in list(sys.modules):
+        if m.startswith(("shared", "main")):
+            sys.modules.pop(m, None)
+
+
+@pytest.fixture
+def local_module_preset_a(monkeypatch, tmp_path):
+    yield from _load_local_server_with_preset(monkeypatch, tmp_path, "A")
+
+
+@pytest.fixture
+def local_module_preset_b(monkeypatch, tmp_path):
+    yield from _load_local_server_with_preset(monkeypatch, tmp_path, "B")
+
+
+@pytest.fixture
+def local_module_preset_c(monkeypatch, tmp_path):
+    yield from _load_local_server_with_preset(monkeypatch, tmp_path, "C")
+
+
+@pytest.fixture
+def local_module_preset_unknown(monkeypatch, tmp_path):
+    yield from _load_local_server_with_preset(monkeypatch, tmp_path, "Z")
+
+
+@pytest.fixture
+def local_module_preset_with_override(monkeypatch, tmp_path):
+    yield from _load_local_server_with_preset(
+        monkeypatch, tmp_path, "A", model_override="qwen3:30b-a3b"
+    )
+
+
+def test_v20a_preset_a_default_tlite(local_module_preset_a):
+    """Preset A → MODEL_NAME = t-tech/T-lite (baseline default)."""
+    assert local_module_preset_a.LLM_PRESET == "A"
+    assert local_module_preset_a.MODEL_NAME == "t-tech/T-lite-it-2.1:q4_K_M"
+
+
+def test_v20a_preset_b_yandex(local_module_preset_b):
+    """Preset B → MODEL_NAME = YandexGPT-5-Lite-8B GGUF."""
+    assert local_module_preset_b.LLM_PRESET == "B"
+    assert "yandex" in local_module_preset_b.MODEL_NAME.lower()
+    assert "YandexGPT-5-Lite" in local_module_preset_b.MODEL_NAME
+
+
+def test_v20a_preset_c_gigachat(local_module_preset_c):
+    """Preset C → MODEL_NAME = GigaChat-3.1-Lightning."""
+    assert local_module_preset_c.LLM_PRESET == "C"
+    assert "GigaChat-3.1-Lightning" in local_module_preset_c.MODEL_NAME
+    assert "ai-sage" in local_module_preset_c.MODEL_NAME.lower()
+
+
+def test_v20a_preset_unknown_falls_back_to_a(local_module_preset_unknown):
+    """Незнакомый preset → fallback на preset A (T-lite). Сервер
+    остаётся работоспособным, не падает с KeyError на старте.
+    """
+    assert local_module_preset_unknown.LLM_PRESET == "Z"
+    assert local_module_preset_unknown.MODEL_NAME == "t-tech/T-lite-it-2.1:q4_K_M"
+
+
+def test_v20a_explicit_model_name_overrides_preset(
+    local_module_preset_with_override,
+):
+    """Явный MODEL_NAME имеет приоритет над LLM_PRESET. Позволяет
+    тестировать произвольные модели без правки кода presets.
+    """
+    mod = local_module_preset_with_override
+    assert mod.LLM_PRESET == "A"
+    # При том MODEL_NAME должен быть override-значением, не T-lite
+    assert mod.MODEL_NAME == "qwen3:30b-a3b"
+
+
+def test_v20a_metrics_includes_preset(local_module_preset_b):
+    """/metrics возвращает llm_preset и llm_preset_description."""
+    from fastapi.testclient import TestClient
+    client = TestClient(local_module_preset_b.app)
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["llm_preset"] == "B"
+    assert "yandex" in data["llm_preset_description"].lower() or "Yandex" in data["llm_preset_description"]
+    assert data["model"] == local_module_preset_b.MODEL_NAME
+
+
+def test_v20a_presets_dict_structure(local_module_preset_a):
+    """Все presets имеют MODEL_NAME и DESCRIPTION (защита от опечаток
+    при добавлении новых presets)."""
+    presets = local_module_preset_a.LLM_PRESETS
+    assert set(presets.keys()) >= {"A", "B", "C"}
+    for key, cfg in presets.items():
+        assert "MODEL_NAME" in cfg, f"preset {key} missing MODEL_NAME"
+        assert "DESCRIPTION" in cfg, f"preset {key} missing DESCRIPTION"
+        assert cfg["MODEL_NAME"], f"preset {key} MODEL_NAME пустой"
+        assert cfg["DESCRIPTION"], f"preset {key} DESCRIPTION пустое"
