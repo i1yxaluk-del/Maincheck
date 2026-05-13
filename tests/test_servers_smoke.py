@@ -122,6 +122,55 @@ def test_local_metrics(local_module):
     assert "audit" in data
 
 
+def test_local_normalize_line_breaks_helper(local_module):
+    """v2.2: local-сервер тоже нормализует переносы (Shift+Enter fix).
+
+    \\r\\n → \\n\\n (paragraph), \\r → \\n\\n, \\n остаётся (мягкий перенос),
+    U+2028 → \\n.  SYSTEM_PROMPT local-сервера не меняется — нормализация
+    нужна только чтобы Ollama видела одинаковую конвенцию переносов
+    независимо от платформы клиента.
+    """
+    fn = local_module._normalize_line_breaks
+    assert fn("a\r\nb") == "a\n\nb"
+    assert fn("a\rb") == "a\n\nb"
+    assert fn("a\nb") == "a\nb"
+    assert fn("a\u2028b") == "a\nb"
+    assert fn("a\n\n\n\nb") == "a\n\nb"
+    assert fn("") == ""
+
+
+def test_local_soft_linebreak_preserved(local_module, monkeypatch):
+    """Shift+Enter (одиночный \\n) НЕ должен превращаться в paragraph break
+    при отправке в Ollama. До v2.2 расширение разбивало такой текст
+    на разные абзацы — фиксим на стороне сервера-нормализатора."""
+    from fastapi.testclient import TestClient
+
+    captured: dict[str, str] = {}
+
+    async def fake_call_ollama(messages):
+        captured["user_msg"] = messages[-1]["content"]
+        return (
+            "===CORRECTED===\n"
+            "Первая строка\nвторая строка.\n"
+            "===CHANGES===\n"
+            "1. Ошибок не найдено. Текст соответствует нормам.\n"
+            "===END==="
+        )
+
+    monkeypatch.setattr(local_module, "call_ollama", fake_call_ollama)
+    client = TestClient(local_module.app)
+    raw = "Первая строка\nвторая строка.\r\nВторой абзац."
+    files = {
+        "text": ("t.txt", io.BytesIO(raw.encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    sent = captured["user_msg"]
+    assert "Первая строка\nвторая строка." in sent
+    assert "\r" not in sent
+
+
 def test_local_strip_thinking(local_module):
     """Проверка, что <think>…</think> обрезается из ответа Ollama."""
     raw = (
@@ -2204,23 +2253,28 @@ def test_cloud_models_override(cloud_module_override):
 
 
 def test_cloud_metrics_extended(cloud_module):
-    """v2.1 metrics возвращает блоки rag/few_shot/dict/morph/lt."""
+    """v2.2 metrics возвращает минимальный набор блоков: rag, dict, preset, audit.
+
+    В v2.2 cloud-сервер сознательно упрощён по сравнению с local: морф-фильтр,
+    морф-детектор, sage, LanguageTool и few-shot retrieval удалены, потому что
+    сетевая модель сама лучше справляется с этими классами ошибок.
+    """
     from fastapi.testclient import TestClient
     client = TestClient(cloud_module.app)
     r = client.get("/metrics")
     assert r.status_code == 200
     data = r.json()
     assert data["server"] == "cloud"
-    # Все блоки feature-parity присутствуют
     assert "rag_enabled" in data
-    assert "few_shot_enabled" in data
-    assert "morph_filter_enabled" in data
-    assert "morph_detector_enabled" in data
     assert "user_dict_enabled" in data
-    assert "languagetool_enabled" in data
     assert "cloud_preset" in data
     assert "cloud_preset_description" in data
     assert "audit" in data
+    # В v2.2 этих блоков быть не должно — фильтры удалены
+    assert "few_shot_enabled" not in data
+    assert "morph_filter_enabled" not in data
+    assert "morph_detector_enabled" not in data
+    assert "languagetool_enabled" not in data
 
 
 def test_cloud_dict_list_endpoint(cloud_module):
@@ -2275,32 +2329,58 @@ def test_cloud_dict_add_invalid_input(cloud_module):
     assert r.status_code == 400
 
 
-def test_cloud_postprocess_eyo_dropped(cloud_module, monkeypatch):
-    """Cloud-сервер должен сбрасывать ё↔е стилистические правки в CHANGES
-    (как и local-сервер, через _drop_eyo_substitutions)."""
+def test_cloud_soft_linebreak_normalized(cloud_module, monkeypatch):
+    """v2.2: одиночный \\r и \\r\\n на входе /suggest нормализуются до \\n\\n
+    (paragraph), а одиночный \\n (Shift+Enter) — остаётся как мягкий перенос.
+
+    Это исправляет баг «расширение разъединяет один абзац с Shift+Enter
+    на несколько». Проверяем, что сервер передаёт модели текст в
+    единой конвенции и raw_text в audit-логах нормализован.
+    """
     from fastapi.testclient import TestClient
 
+    captured: dict[str, str] = {}
+
     async def fake_call_model(messages, model):
+        captured["user_msg"] = messages[-1]["content"]
         return (
             "===CORRECTED===\n"
-            "проведёнными работами в третьем квартале\n"
+            "Первая строка\nвторая строка.\n"
             "===CHANGES===\n"
-            "1. «проведенными» → «проведёнными» | расстановка буквы ё\n"
+            "1. Ошибок не найдено. Текст соответствует нормам.\n"
             "===END==="
         )
 
     monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
     client = TestClient(cloud_module.app)
+    # Имитируем то, что LibreOffice getString() мог бы прислать:
+    # \r\n — paragraph break (Windows), \n — Shift+Enter (soft).
+    raw = "Первая строка\nвторая строка.\r\nВторой абзац."
     files = {
-        "text": ("t.txt", io.BytesIO("проведенными работами в третьем квартале".encode("utf-8")), "text/plain"),
+        "text": ("t.txt", io.BytesIO(raw.encode("utf-8")), "text/plain"),
         "context": ("c.txt", io.BytesIO(b""), "text/plain"),
     }
     r = client.post("/suggest", files=files)
     assert r.status_code == 200
-    # Пункт «проведенными → проведёнными» — ё-only подстановка, должна быть отфильтрована
-    assert "«проведенными» → «проведёнными»" not in r.text
-    # CORRECTED откатан к исходному написанию (ё → е по raw_text)
-    assert "проведенными" in r.text
+    sent = captured["user_msg"]
+    # Soft-break (одиночный \n) сохранён внутри абзаца
+    assert "Первая строка\nвторая строка." in sent
+    # Hard-break (\r\n) превратился в paragraph break (\n\n)
+    assert "Второй абзац." in sent
+    assert "\r\n" not in sent
+    assert "\r" not in sent
+
+
+def test_cloud_normalize_line_breaks_helper(cloud_module):
+    """Unit-тест нормализатора переносов: \\r\\n → \\n\\n, \\r → \\n\\n, \\n остаётся."""
+    fn = cloud_module._normalize_line_breaks
+    assert fn("a\r\nb") == "a\n\nb"
+    assert fn("a\rb") == "a\n\nb"
+    assert fn("a\nb") == "a\nb"  # soft break не трогаем
+    assert fn("a\u2028b") == "a\nb"  # U+2028 — single soft break
+    # Множественные \n\n схлопываются до 2
+    assert fn("a\n\n\n\nb") == "a\n\nb"
+    assert fn("") == ""
 
 
 def test_cloud_postprocess_drops_not_in_text(cloud_module, monkeypatch):

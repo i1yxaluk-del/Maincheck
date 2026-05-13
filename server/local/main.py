@@ -436,6 +436,34 @@ SYSTEM_PROMPT = """Ты — корректор русского языка дл�
 app = FastAPI(title="AI LibreOffice Suggester — Local", version="1.6.0")
 
 
+# ─── Нормализация переносов строк (v2.2 Shift+Enter fix) ─────────────
+# LibreOffice getString() возвращает paragraph-break как \r или \r\n
+# (платформо-зависимо), а Shift+Enter (мягкий перенос) — как \n или
+# U+2028. Конвенция, общая с client-side ApplyWholeReplace:
+#   • \n\n (двойной LF) — граница абзаца;
+#   • \n     (одиночный LF) — мягкий перенос внутри абзаца.
+# Применяется только к raw_text/raw_ctx на входе /suggest; внутренние
+# helpers (тесты, постпроцессинг) работают с уже нормализованным текстом.
+
+
+def _normalize_line_breaks(text: str) -> str:
+    """\\r\\n, \\r, U+2028 → консистентная \\n-конвенция.
+
+    Без этой функции одиночный Chr(10) от Shift+Enter после round-trip
+    через LLM мог склеиваться или, наоборот, превращаться в paragraph
+    break при applyWholeReplace в Main.xba — клиент видел «разъединение»
+    одного фрагмента на несколько абзацев. См. ЖУРНАЛ_v1.6.md v2.2.
+    """
+    if not text:
+        return text
+    text = text.replace("\r\n", "\n\n")
+    text = text.replace("\r", "\n\n")
+    text = text.replace("\u2028", "\n")
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text
+
+
 @app.on_event("startup")
 async def _warmup_ollama():
     """Грузим модель в RAM при старте сервера, чтобы первый запрос
@@ -786,6 +814,10 @@ async def suggest(
     raw_ctx = (await context.read()).decode("utf-8", errors="replace").strip()
     if not raw_text:
         return "ОШИБКА: Пустой текст"
+
+    # v2.2: нормализация переносов (Shift+Enter fix). См. _normalize_line_breaks.
+    raw_text = _normalize_line_breaks(raw_text)
+    raw_ctx = _normalize_line_breaks(raw_ctx)
 
     extra = _rag_context(raw_text)
     user_msg = f"Контекст:\n{raw_ctx}\n"

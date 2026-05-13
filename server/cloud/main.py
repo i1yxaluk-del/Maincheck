@@ -1,30 +1,37 @@
 """
-Облачный сервер AI LibreOffice Suggester (OpenRouter free tier) — v2.1.
+Облачный сервер AI LibreOffice Suggester (OpenRouter) — v2.2.
 
-Feature-parity с локальным сервером (`server/local/main.py`):
-    • CLOUD_PRESET A/B/C/D — выбор основной модели + fallback-цепочка
-      (см. shared/openrouter_client.py).
-    • RAG по ведомственным документам (RAG_ENABLED=true) — те же
-      data/rag_store/ + Ollama embedder, что и local.
-    • Retrieval-augmented few-shot из GEC-банка (USE_FEW_SHOT=true) —
-      hybrid BM25 + dense, как в local.
-    • Пользовательский словарь + REST API /dict/list, /dict/add, /dict/remove.
-    • Морф-фильтр (pymorphy3) — дроп галлюцинированных падежных «улучшений».
-    • Морф-детектор — обогащение CHANGES правилами numeral-noun / adj-noun.
-    • LanguageTool-RU — стилистика/типографика (опционально).
-    • Все пост-фильтры: ё-замена, drop-not-in-text, rebuild-from-diff,
-      sync CHANGES↔CORRECTED, renumber.
-    • Логи с ротацией + retention, SQLite-аудит, /metrics.
+Назначение: использовать сильную сетевую LLM (Qwen3-Next 80B, Gemma 4 31B,
+Nemotron 3 Super 120B, openrouter/free auto-router) как полностью
+автономный корректор русских официальных документов. Сервер сознательно
+устроен проще локального — сетевая модель сама лучше справляется с
+большинством классов ошибок, поэтому local-specific костыли
+(морф-фильтр, морф-детектор, sage, LanguageTool, few-shot retrieval)
+здесь намеренно отсутствуют.
 
-Архитектура: запрос приходит → RAG context + few-shot examples →
-OpenRouter chat (fallback по моделям) → весь пост-процессинг shared/postprocess
-→ ответ клиенту в формате ===CORRECTED===…===CHANGES===…===END===.
+Архитектура (v2.2, в порядке pipeline):
+    1. Нормализация переносов строк (Shift+Enter / разрыв абзаца) — см.
+       раздел «Shift+Enter»: одиночный \\n — мягкий перенос внутри
+       абзаца, двойной \\n\\n — разрыв абзаца. Эта же конвенция
+       сохраняется в исправленном тексте.
+    2. RAG-контекст (RAG_ENABLED=true) — фрагменты НПА РФ из
+       `data/rag_store/`, проиндексированные ранее через rag_cli.
+       Подсказка модели — не цитировать в CHANGES напрямую.
+    3. Пользовательский словарь (USER_DICT_ENABLED=true) —
+       whitelist терминов в system-prompt + REST API `/dict/*`.
+       Модель не должна «исправлять» термины из этого списка.
+    4. OpenRouter chat с fallback по CLOUD_PRESET (A/B/C/D).
+    5. Безопасный пост-процессинг (модель уже хорошая, минимизируем):
+        • strip-thinking — обрезка `<think>…</think>` блоков;
+        • безопасные защитные фильтры формата (формат ответа,
+          идемпотентные правки X→X, drop-not-in-text, renumber);
+        • восстановление структуры переносов (см. п.1).
 
 Backward compatibility:
-    • Без новых env-флагов поведение совпадает с v1.6.0 (модели обновлены,
-      RAG/few-shot/morph/LT — выключены по умолчанию).
-    • Старые тесты (`test_cloud_suggest_with_mocked_openrouter`,
-      `test_cloud_metrics`, `test_cloud_missing_key`) продолжают работать.
+    • Без новых env-флагов поведение совпадает с v1.6.0 (только список
+      моделей актуализирован под free-tier OpenRouter мая 2026).
+    • Старые тесты `test_cloud_suggest_with_mocked_openrouter`,
+      `test_cloud_metrics`, `test_cloud_missing_key` продолжают работать.
 """
 from __future__ import annotations
 
@@ -49,22 +56,10 @@ from shared.openrouter_client import (  # noqa: E402
     resolve_models,
 )
 from shared.postprocess import (  # noqa: E402
-    _complete_changes_from_corrected,
     _drop_changes_not_in_text,
-    _drop_eyo_substitutions,
     _drop_idempotent_changes,
-    _drop_morph_case_substitutions,
-    _drop_user_dict_changes,
-    _enrich_changes_with_detector,
-    _enrich_changes_with_languagetool,
-    _extract_corrected_body,
-    _had_any_change_pairs,
-    _has_real_change_items,
-    _rebuild_changes_from_diff,
     _renumber_changes,
-    _replace_changes_block,
     _strip_thinking,
-    _undo_eyo_in_corrected_block,
 )
 
 
@@ -100,64 +95,37 @@ RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 RAG_EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "nomic-embed-text")
 
 
-# ─── Few-shot retrieval (опционально, USE_FEW_SHOT=true) ─────────────
+# ─── User dict (опционально, USER_DICT_ENABLED=true) ─────────────────
 
-USE_FEW_SHOT = os.getenv("USE_FEW_SHOT", "false").lower() in ("1", "true", "yes", "on")
-GEC_BANK_FILES = [
-    s.strip() for s in os.getenv(
-        "GEC_BANK_FILES",
-        "../shared/gec_seed/gec_bank.jsonl"
-        ",../shared/gec_seed/gec_bank_extended.jsonl"
-        ",../shared/gec_seed/lexify_admin.jsonl",
-    ).split(",")
-    if s.strip()
-]
-GEC_TOP_K = int(os.getenv("GEC_TOP_K", "3"))
-GEC_EMBED_MODEL = os.getenv("GEC_EMBED_MODEL", RAG_EMBED_MODEL)
-GEC_RETRIEVAL_MODE = os.getenv("GEC_RETRIEVAL_MODE", "hybrid").strip().lower()
-if GEC_RETRIEVAL_MODE not in ("hybrid", "dense", "sparse"):
-    GEC_RETRIEVAL_MODE = "hybrid"
-GEC_BM25_TOKENIZER = os.getenv("GEC_BM25_TOKENIZER", "both").strip().lower()
-if GEC_BM25_TOKENIZER not in ("word", "trigram", "both"):
-    GEC_BM25_TOKENIZER = "both"
-
-
-# ─── Морфо-фильтр / детектор / словарь / LanguageTool ────────────────
-
-MORPH_FILTER_ENABLED = os.getenv("MORPH_FILTER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-MORPH_DETECTOR_ENABLED = os.getenv("MORPH_DETECTOR_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 USER_DICT_ENABLED = os.getenv("USER_DICT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
-LANGUAGETOOL_ENABLED = os.getenv("LANGUAGETOOL_ENABLED", "false").lower() in ("1", "true", "yes", "on")
-LANGUAGETOOL_URL = os.getenv("LANGUAGETOOL_URL", "http://localhost:8081")
-LANGUAGETOOL_LANGUAGE = os.getenv("LANGUAGETOOL_LANGUAGE", "ru-RU")
-LANGUAGETOOL_TIMEOUT = float(os.getenv("LANGUAGETOOL_TIMEOUT", "10"))
-LANGUAGETOOL_ENABLED_CATEGORIES = os.getenv(
-    "LANGUAGETOOL_ENABLED_CATEGORIES", "STYLE,TYPOGRAPHY",
-)
-LANGUAGETOOL_DISABLED_CATEGORIES = os.getenv("LANGUAGETOOL_DISABLED_CATEGORIES", "")
-LANGUAGETOOL_DISABLED_RULES = os.getenv("LANGUAGETOOL_DISABLED_RULES", "")
 
+# ─── Логи и аудит ─────────────────────────────────────────────────────
+# Уровень и retention настраиваются через env-переменные внутри
+# setup_logger() / AuditStore() — здесь только инициализация.
 
 logger = setup_logger("ai_suggester.cloud")
 audit = AuditStore()
+
 or_client = OpenRouterClient(
-    OPENROUTER_API_KEY,
+    api_key=OPENROUTER_API_KEY,
     referer=OPENROUTER_REFERER,
     title=OPENROUTER_TITLE,
     timeout=OPENROUTER_TIMEOUT,
 )
 
+logger.info(
+    "Cloud server v2.2 starting: preset=%s primary=%s fallback=%d models",
+    CLOUD_PRESET, MODELS[0] if MODELS else "(none)", max(len(MODELS) - 1, 0),
+)
+logger.info("Key: %s, key_present=%s", or_client.key_redacted, or_client.key_present)
 
-# ─── Lazy singletons (mirror local/main.py) ───────────────────────────
+
+# ─── Lazy singletons ──────────────────────────────────────────────────
 
 _rag_store = None
 _rag_embedder = None
-_gec_bank = None
-_morph_filter = None
-_morph_detector = None
 _user_dict = None
-_lt_client = None
 
 if RAG_ENABLED:
     try:
@@ -173,69 +141,6 @@ if RAG_ENABLED:
         logger.warning("RAG не удалось инициализировать: %s", e)
         _rag_store = None
 
-if USE_FEW_SHOT:
-    try:
-        from shared.gec_bank import GecBank  # noqa: E402
-        from shared.rag_store import HashingEmbedder, OllamaEmbedder  # noqa: E402
-
-        if _rag_embedder is not None and GEC_EMBED_MODEL == RAG_EMBED_MODEL:
-            _gec_embedder = _rag_embedder
-        else:
-            try:
-                _gec_embedder = OllamaEmbedder(model=GEC_EMBED_MODEL, base_url=OLLAMA_URL)
-                _ = _gec_embedder.embed(["probe"])
-            except Exception as exc:
-                logger.warning(
-                    "Ollama-эмбеддер (%s) недоступен (%s), HashingEmbedder",
-                    GEC_EMBED_MODEL, exc,
-                )
-                _gec_embedder = HashingEmbedder(dim=1024)
-        _gec_bank = GecBank(_gec_embedder, bm25_tokenizer=GEC_BM25_TOKENIZER)
-        _resolved_paths = [
-            str((_HERE / p) if not Path(p).is_absolute() else Path(p))
-            for p in GEC_BANK_FILES
-        ]
-        n = _gec_bank.load_jsonl(*_resolved_paths)
-        if n == 0:
-            logger.warning("Few-shot retrieval включён, но банк пуст — 0-shot fallback")
-            _gec_bank = None
-        else:
-            _cache_path = Path(_resolved_paths[0]).with_suffix(".index.pkl")
-            _gec_bank.build_index(cache_path=_cache_path)
-            logger.info(
-                "Few-shot retrieval включён: %d пар, top_k=%d, embedder=%s, mode=%s",
-                n, GEC_TOP_K, _gec_embedder.name, GEC_RETRIEVAL_MODE,
-            )
-    except Exception as e:
-        logger.warning("Few-shot retrieval не удалось инициализировать: %s", e)
-        _gec_bank = None
-
-if MORPH_FILTER_ENABLED:
-    try:
-        from shared.morph_filter import get_morph_filter  # noqa: E402
-
-        _morph_filter = get_morph_filter()
-        if _morph_filter.available:
-            logger.info("MorphFilter включён (pymorphy3)")
-        else:
-            logger.info("MorphFilter: pymorphy3 не доступен — no-op")
-    except Exception as e:
-        logger.warning("MorphFilter не удалось инициализировать: %s", e)
-        _morph_filter = None
-
-if MORPH_DETECTOR_ENABLED:
-    try:
-        from shared.morph_detector import get_morph_detector  # noqa: E402
-
-        _morph_detector = get_morph_detector()
-        if _morph_detector.available:
-            logger.info("MorphDetector включён (pymorphy3)")
-        else:
-            logger.info("MorphDetector: pymorphy3 не доступен — no-op")
-    except Exception as e:
-        logger.warning("MorphDetector не удалось инициализировать: %s", e)
-        _morph_detector = None
-
 if USER_DICT_ENABLED:
     try:
         from shared.user_dict import get_user_dict  # noqa: E402
@@ -249,68 +154,69 @@ if USER_DICT_ENABLED:
         logger.warning("UserDict не удалось инициализировать: %s", e)
         _user_dict = None
 
-if LANGUAGETOOL_ENABLED:
-    try:
-        from shared.languagetool_client import (  # noqa: E402
-            _parse_csv_env,
-            get_languagetool_client,
-        )
 
-        _lt_client = get_languagetool_client(
-            url=LANGUAGETOOL_URL,
-            language=LANGUAGETOOL_LANGUAGE,
-            enabled_categories=_parse_csv_env(LANGUAGETOOL_ENABLED_CATEGORIES),
-            disabled_categories=_parse_csv_env(LANGUAGETOOL_DISABLED_CATEGORIES),
-            disabled_rules=_parse_csv_env(LANGUAGETOOL_DISABLED_RULES),
-            timeout=LANGUAGETOOL_TIMEOUT,
-        )
-        if _lt_client.available:
-            logger.info(
-                "LanguageTool включён: url=%s, language=%s",
-                LANGUAGETOOL_URL, LANGUAGETOOL_LANGUAGE,
-            )
-        else:
-            logger.warning(
-                "LanguageTool: ENABLED=true, но сервер %s недоступен — skip LT-этап",
-                LANGUAGETOOL_URL,
-            )
-    except Exception as e:
-        logger.warning("LanguageTool не удалось инициализировать: %s", e)
-        _lt_client = None
-else:
-    logger.info("LanguageTool: отключён (LANGUAGETOOL_ENABLED=false)")
+# ─── SYSTEM_PROMPT (v2.2 — сильный сетевой корректор) ────────────────
 
+SYSTEM_PROMPT = """Ты — корректор русского языка для официальных документов государственных органов РФ. Твоя задача — найти и исправить ВСЕ ошибки в текстах служебной переписки, организационно-распорядительных и правовых документах.
 
-# ─── Промпт идентичен local/main.py v2.0-b ────────────────────────────
+ОБЯЗАТЕЛЬНО ИСПРАВЛЯЙ ОШИБКИ ВСЕХ ВИДОВ:
 
-SYSTEM_PROMPT = """Ты — корректор русского языка для официальных документов. Не рассуждай, сразу выдавай ответ в нужном формате.
+1. ОРФОГРАФИЯ — опечатки, удвоение/пропуск букв, слитное/раздельное/дефисное написание, перепутанные буквы (а/о, и/е), приставки (пре-/при-, не-/ни-), окончания.
 
-ИСПРАВЛЯЙ ТОЛЬКО ЯВНЫЕ ОШИБКИ:
-• орфография — опечатки, удвоение/пропуск букв, слитное/раздельное написание;
-• управление — «согласно приказу» (не «согласно приказа»), «благодаря решению»;
-• согласование — однородные члены и причастные обороты в одном роде, числе и падеже с главным словом, даже если оно стоит за несколько слов («актов, …, не предусмотренных», не «предусмотренной»);
-• пунктуация — запятые при однородных членах, обособленных оборотах, придаточных.
+2. ПУНКТУАЦИЯ — запятые при однородных членах, обособленных оборотах (причастный, деепричастный, уточняющий), вводных словах, придаточных; тире (длинное — а не дефис -); точка с запятой между сложными однородными; кавычки (елочки «», лапки ""); постановка точек в конце нумерованных пунктов; пробелы вокруг знаков.
 
-НЕ ТРОГАЙ:
-• аббревиатуры и сокращения (п/п, вх.№, исх.№, ФСБ, МВД);
-• ведомственные термины и профессиональные обороты;
-• правильно написанный текст («улучшать стиль» нельзя);
+3. ГРАММАТИКА И СОГЛАСОВАНИЕ:
+   • падежные формы — «согласно приказу» (дат.), «вопреки решению» (дат.), «по приезде» (предл.), «по окончании», «по истечении»;
+   • согласование однородных членов с главным словом в роде, числе и падеже, даже если оно стоит за несколько слов («актов, …, не предусмотренных», а не «не предусмотренной»);
+   • числительные с существительными — «во 2-м квартале» (ед., предл.), а не «во 2-м кварталах»;
+   • прилагательное с существительным в роде/числе/падеже;
+   • временные формы и залог глаголов в сложных конструкциях;
+   • неполные предложения, согласование местоимений с антецедентом.
+
+4. СТИЛЬ И ЛОГИКА:
+   • канцелярит уместен, но избегай тавтологии («осуществляет осуществление»), плеоназмов («первый по приоритету первый»), бюрократических оборотов-паразитов;
+   • согласование времен в сложных предложениях;
+   • устранение двусмысленности и противоречий между смежными абзацами;
+   • точные числовые ссылки (даты, номера приказов, реквизиты НПА — если в тексте уже упомянуты);
+   • единообразие сокращений и аббревиатур внутри одного текста.
+
+5. ОФИЦИАЛЬНО-ДЕЛОВАЯ ПЕРЕПИСКА РФ — по ГОСТ Р 7.0.97-2016 (Система стандартов по информации, библиотечному и издательскому делу):
+   • реквизиты — «исх. №», «вх. №», «п/п»;
+   • устойчивые формулы — «прошу Вас», «направляю Вам», «в соответствии с», «во исполнение»;
+   • правильная иерархия — «Министерство → Управление → Отдел»;
+   • НПА оформляются как «Федеральный закон от 06.03.2006 № 35-ФЗ "О противодействии терроризму"», постановления Правительства РФ — с датой и номером.
+
+ЧТО ЗАПРЕЩЕНО ТРОГАТЬ:
+• аббревиатуры и сокращения, имена собственные, наименования организаций и должностей;
+• ведомственные термины, профессиональную лексику, торговые марки;
+• авторскую стилистику, если она не нарушает норму;
 • е/ё взаимозаменяемы — это стилистика, не ошибка;
-• структуру и смысл предложений.
+• общий смысл, состав сведений, фактическую информацию (даты, номера, имена) не менять;
+• если фрагмент уже грамматически корректен — оставь как есть, даже если предпочёл бы переформулировать.
 
-ФОРМАТ ОТВЕТА (строго, без какого-либо текста до или после):
+КОНТЕКСТ:
+• первое сообщение — «Контекст» (текст ДО проверяемого фрагмента, только для понимания стиля и связности; в нём ничего не исправляй).
+• «ТЕКСТ ДЛЯ ПРОВЕРКИ» — фрагмент, в котором ищешь ошибки. Может быть от 1 предложения до нескольких абзацев. Все ошибки во всём фрагменте — единым проходом.
+
+СТРУКТУРА ПЕРЕНОСОВ СТРОК (ВАЖНО ДЛЯ КЛИЕНТА):
+• одиночный \\n внутри абзаца — это мягкий перенос строки (Shift+Enter), оставляй на тех же местах;
+• двойной \\n\\n — граница абзаца, оставляй на тех же местах;
+• НЕ объединяй абзацы в один, НЕ разрывай абзац на несколько.
+
+ФОРМАТ ОТВЕТА (СТРОГО, без какого-либо текста до или после, без рассуждений):
 ===CORRECTED===
-<исправленный текст>
+<полный исправленный текст с сохранёнными переносами строк и абзацев>
 ===CHANGES===
-1. «было» → «стало» | краткая причина (5–10 слов)
+1. «было» → «стало» | краткая причина (5–15 слов, по-русски)
+2. ...
 ===END===
 
-ПРАВИЛА ЦИТИРОВАНИЯ В CHANGES (важно — клиент применяет правки поиском по тексту):
-• в кавычках «было» цитируй ТОЧНО как в исходном тексте, побуквенно;
-• БЕЗ многоточия (… или ...), БЕЗ сокращений, БЕЗ перефразирования;
+ПРАВИЛА ЦИТИРОВАНИЯ В CHANGES (клиент применяет правки ПОИСКОМ по тексту):
+• «было» — ТОЧНО, побуквенно, как в исходном тексте (с учётом регистра);
+• БЕЗ многоточия, БЕЗ сокращений, БЕЗ перефразирования;
 • «стало» — фрагмент той же длины с применённой правкой;
-• если правка касается запятой — включи в цитату слова слева и справа от запятой;
-• это правило относится к ФОРМАТУ цитаты в CHANGES, а не к тому, какие ошибки искать. Ищи все ошибки правописания, управления, согласования, пунктуации одинаково внимательно.
+• если правка касается одного знака препинания — включи в «было»/«стало» одно-два слова слева и справа от знака, чтобы клиент мог найти контекст;
+• если в тексте есть НПА — комментарий может ссылаться на норму («п. 3 ст. 12 Закона № 35-ФЗ»), но саму ссылку НЕ выдумывай — только если такая норма явно упомянута в RAG-контексте или в самом тексте.
 
 Если ошибок нет:
 ===CORRECTED===
@@ -320,7 +226,41 @@ SYSTEM_PROMPT = """Ты — корректор русского языка дл�
 ===END==="""
 
 
-app = FastAPI(title="AI LibreOffice Suggester — Cloud", version="2.1.0")
+app = FastAPI(title="AI LibreOffice Suggester — Cloud", version="2.2.0")
+
+
+# ─── Shift+Enter / структура переносов строк ──────────────────────────
+
+
+def _normalize_line_breaks(text: str) -> str:
+    """Приводит входной текст к канонической форме переносов:
+
+    LibreOffice getString() возвращает paragraph-break как \\r или \\r\\n
+    (платформо-зависимо), а Shift+Enter (soft return) — как \\n или
+    U+2028. Конвенция, общая с client-side ApplyWholeReplace:
+
+    • двойной \\n\\n  — граница абзаца;
+    • одиночный \\n   — мягкий перенос внутри абзаца.
+
+    Превращения:
+    • \\r\\n → \\n\\n (paragraph break, Windows);
+    • \\r    → \\n\\n (paragraph break, macOS classic / LO Linux);
+    • U+2028 → \\n     (Unicode line separator → soft return);
+    • уже-\\n не трогаем; 3+ подряд схлопываем до \\n\\n.
+
+    До v2.2 одиночный Chr(10) от Shift+Enter после round-trip через LLM
+    мог склеиваться или, наоборот, превращаться в paragraph break при
+    ApplyWholeReplace в Main.xba — пользователь видел «разъединение»
+    одного фрагмента на несколько абзацев. См. ЖУРНАЛ_v1.6.md v2.2.
+    """
+    if not text:
+        return text
+    text = text.replace("\r\n", "\n\n")
+    text = text.replace("\r", "\n\n")
+    text = text.replace("\u2028", "\n")
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text
 
 
 # ─── Backward-compatible helpers (тест test_cloud_suggest_with_mocked_openrouter
@@ -334,9 +274,9 @@ def _key_missing() -> bool:
 async def call_model(messages: list, model: str) -> str:
     """Один HTTP-запрос на одну модель (backward-compat для тестов).
 
-    Бросает `httpx.HTTPStatusError` на 4xx/5xx (как и в v1.6.0), чтобы
-    верхний уровень мог решить, переходить ли к следующей модели по
-    fallback-цепочке. Тесты подменяют эту функцию для мокирования.
+    Бросает `httpx.HTTPStatusError` на 4xx/5xx, чтобы верхний уровень мог
+    решить, переходить ли к следующей модели по fallback-цепочке. Тесты
+    подменяют эту функцию для мокирования.
     """
     return await or_client._post_chat(
         messages, model,
@@ -346,8 +286,8 @@ async def call_model(messages: list, model: str) -> str:
 
 
 async def _chat_with_fallback(messages: list) -> tuple[str, str]:
-    """Перебирает MODELS до первого успешного ответа. Возвращает (content, used_model).
-    На полном фейле — поднимает OpenRouterError.
+    """Перебирает MODELS до первого успешного ответа. Возвращает
+    (content, used_model). На полном фейле — поднимает OpenRouterError.
 
     Использует `call_model` для каждой попытки — это позволяет тестам
     мокировать одну точку входа.
@@ -376,7 +316,7 @@ async def _chat_with_fallback(messages: list) -> tuple[str, str]:
     raise OpenRouterError(f"Все модели недоступны. Последняя ошибка: {last_err}")
 
 
-# ─── /rag_context (shared logic; cloud-local) ─────────────────────────
+# ─── /rag_context ─────────────────────────────────────────────────────
 
 
 def _rag_context(text: str) -> str:
@@ -393,7 +333,10 @@ def _rag_context(text: str) -> str:
         return ""
     if not hits:
         return ""
-    parts = ["ПРИМЕНИМЫЕ НОРМАТИВНЫЕ ФРАГМЕНТЫ (используйте как справку, не цитируйте в CHANGES):"]
+    parts = [
+        "ПРИМЕНИМЫЕ НОРМАТИВНЫЕ ФРАГМЕНТЫ "
+        "(используй как справку и для ссылок на НПА в CHANGES; НЕ цитируй дословно):",
+    ]
     for h in hits:
         parts.append(f"— [{h['doc_id']}] {h['text'][:600]}")
     return "\n".join(parts)
@@ -414,8 +357,8 @@ async def health():
             extras = []
             if RAG_ENABLED and _rag_store:
                 extras.append(f"RAG: {len(_rag_store.docs)} документов")
-            if _gec_bank is not None:
-                extras.append(f"Few-shot: {len(_gec_bank)} пар, top_k={GEC_TOP_K}")
+            if _user_dict is not None:
+                extras.append(f"Dict: {len(_user_dict.list_words())} слов")
             suffix = (" | " + " | ".join(extras)) if extras else ""
             return f"OK | Работает: {model} | Ответ: {ans[:40]}{suffix}"
         except httpx.HTTPStatusError as e:
@@ -454,6 +397,7 @@ async def test_api():
 async def metrics(hours: int = 24):
     return JSONResponse({
         "server": "cloud",
+        "version": "2.2.0",
         "models": MODELS,
         "cloud_preset": CLOUD_PRESET,
         "cloud_preset_description": CLOUD_PRESETS[CLOUD_PRESET]["DESCRIPTION"],
@@ -463,30 +407,13 @@ async def metrics(hours: int = 24):
         "rag_doc_ids": sorted(_rag_store.docs.keys()) if _rag_store else [],
         "rag_top_k": RAG_TOP_K if (RAG_ENABLED and _rag_store) else 0,
         "rag_embedder": _rag_embedder.name if _rag_embedder is not None else None,
-        "few_shot_enabled": _gec_bank is not None,
-        "few_shot_pairs": len(_gec_bank) if _gec_bank else 0,
-        "few_shot_top_k": GEC_TOP_K if _gec_bank else 0,
-        "few_shot_embedder": _gec_bank.embedder.name if _gec_bank is not None else None,
-        "few_shot_retrieval_mode": GEC_RETRIEVAL_MODE if _gec_bank is not None else None,
-        "few_shot_bm25_terms": (
-            _gec_bank.stats().get("bm25_terms", 0) if _gec_bank is not None else 0
-        ),
-        "morph_filter_enabled": _morph_filter is not None and _morph_filter.available,
-        "morph_detector_enabled": _morph_detector is not None and _morph_detector.available,
         "user_dict_enabled": _user_dict is not None,
         "user_dict_size": len(_user_dict.list_words()) if _user_dict is not None else 0,
-        "languagetool_enabled": LANGUAGETOOL_ENABLED,
-        "languagetool_available": _lt_client is not None and _lt_client.available,
-        "languagetool_url": LANGUAGETOOL_URL if LANGUAGETOOL_ENABLED else None,
-        "languagetool_language": LANGUAGETOOL_LANGUAGE if LANGUAGETOOL_ENABLED else None,
-        "languagetool_enabled_categories": (
-            LANGUAGETOOL_ENABLED_CATEGORIES if LANGUAGETOOL_ENABLED else None
-        ),
         "audit": audit.stats(hours=hours),
     })
 
 
-# ─── /dict/* — user dictionary REST API (mirror local/main.py) ───────
+# ─── /dict/* — user dictionary REST API ──────────────────────────────
 
 
 @app.get("/dict/list")
@@ -557,30 +484,16 @@ async def suggest(
     if not raw_text:
         return "ОШИБКА: Пустой текст"
 
-    # RAG-контекст и few-shot — те же механизмы, что в local-сервере
+    # Нормализация переносов строк: исправляет баг «Shift+Enter
+    # разрывает текст на разные абзацы». См. _normalize_line_breaks.
+    raw_text = _normalize_line_breaks(raw_text)
+    raw_ctx = _normalize_line_breaks(raw_ctx)
+
     extra = _rag_context(raw_text)
     user_msg = f"Контекст (предшествующий текст, только для понимания стиля):\n{raw_ctx}\n"
     if extra:
         user_msg += f"\n{extra}\n"
     user_msg += f"\n---\nТЕКСТ ДЛЯ ПРОВЕРКИ:\n{raw_text}"
-
-    few_shot_examples: list = []
-    if _gec_bank is not None:
-        try:
-            if GEC_RETRIEVAL_MODE == "sparse":
-                hits = _gec_bank.search_sparse(raw_text, top_k=GEC_TOP_K)
-            elif GEC_RETRIEVAL_MODE == "dense":
-                hits = _gec_bank.search(raw_text, top_k=GEC_TOP_K)
-            else:
-                hits = _gec_bank.search_hybrid(raw_text, top_k=GEC_TOP_K)
-            few_shot_examples = [pair for score, pair in hits]
-            if few_shot_examples:
-                logger.info(
-                    "Few-shot (%s): подмешиваю %d пар", GEC_RETRIEVAL_MODE, len(few_shot_examples),
-                )
-        except Exception as e:
-            logger.warning("Few-shot retrieval провалился (0-shot fallback): %s", e)
-            few_shot_examples = []
 
     effective_system_prompt = SYSTEM_PROMPT
     if _user_dict is not None:
@@ -588,19 +501,10 @@ async def suggest(
         if dict_suffix:
             effective_system_prompt = SYSTEM_PROMPT + "\n\n" + dict_suffix
 
-    if few_shot_examples:
-        from shared.gec_bank import build_few_shot_messages  # noqa: E402
-
-        messages = build_few_shot_messages(
-            system_prompt=effective_system_prompt,
-            user_text=user_msg,
-            examples=few_shot_examples,
-        )
-    else:
-        messages = [
-            {"role": "system", "content": effective_system_prompt},
-            {"role": "user", "content": user_msg},
-        ]
+    messages = [
+        {"role": "system", "content": effective_system_prompt},
+        {"role": "user", "content": user_msg},
+    ]
 
     client_ip = request.client.host if request.client else ""
     user_agent = request.headers.get("user-agent", "")
@@ -610,7 +514,7 @@ async def suggest(
     with timer:
         try:
             result, used_model = await _chat_with_fallback(messages)
-            # Cleanup — выравниваем формат до того, как пускать через пост-фильтры
+            # Cleanup — выравниваем формат до защитных пост-фильтров.
             result = _strip_thinking(result)
             if "===CORRECTED===" not in result:
                 result = (
@@ -623,32 +527,12 @@ async def suggest(
             if "===END===" not in result:
                 result = result.rstrip() + "\n===END==="
 
-            # Pipeline идентичен local/main.py (см. ЖУРНАЛ_v1.6.md):
-            had_pairs_pre_filter = _had_any_change_pairs(result)
-            result = _drop_idempotent_changes(result)
-            result = _drop_eyo_substitutions(result, raw_text)
-            result = _undo_eyo_in_corrected_block(result, raw_text)
-            result = _drop_morph_case_substitutions(result, raw_text, _morph_filter)
-            result = _drop_changes_not_in_text(result, raw_text)
-            if had_pairs_pre_filter and not _has_real_change_items(result):
-                corrected_body = _extract_corrected_body(result)
-                if corrected_body and corrected_body != raw_text:
-                    rebuilt = _rebuild_changes_from_diff(raw_text, corrected_body)
-                    if rebuilt:
-                        logger.info(
-                            "Реконструировано %d пункт(ов) CHANGES из diff "
-                            "(модель забыла рапорт)", len(rebuilt),
-                        )
-                        result = _replace_changes_block(result, rebuilt)
-            result = _drop_user_dict_changes(result, _user_dict)
-            result = _enrich_changes_with_detector(
-                result, raw_text, _morph_detector, user_dict=_user_dict,
-            )
-            result = _enrich_changes_with_languagetool(
-                result, raw_text, _lt_client, user_dict=_user_dict,
-            )
-            result = _complete_changes_from_corrected(result, raw_text)
-            result = _renumber_changes(result)
+            # Минимальный безопасный пост-процессинг. Сетевые модели в целом
+            # выдают качественный ответ, поэтому морф-фильтр / sage / LT
+            # здесь не используются (см. server/local/main.py для local).
+            result = _drop_idempotent_changes(result)        # X → X дроп
+            result = _drop_changes_not_in_text(result, raw_text)  # галлюцинации
+            result = _renumber_changes(result)               # чистая нумерация
             ok = True
         except OpenRouterError as e:
             error = str(e)
