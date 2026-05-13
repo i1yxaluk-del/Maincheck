@@ -109,6 +109,20 @@ class MorphFilter:
         "NPRO",   # местоимение-существительное
     })
 
+    def _is_preposition_word(self, word: str) -> bool:
+        """v1.8.5: True если у слова есть PREP-парс. Используется чтобы
+        обнаружить, что предыдущее слово (prev_word) на самом деле
+        управляется предшествующим предлогом, а не модифицирует
+        следующее существительное. См. `_is_grammatically_disagreed_with_prev`.
+        """
+        if self._morph is None or not word:
+            return False
+        try:
+            parses = self._morph.parse(word.lower())
+        except Exception:
+            return False
+        return any("PREP" in str(p.tag) for p in parses)
+
     def _is_grammatically_disagreed_with_prev(
         self, before: str, raw_text: str
     ) -> bool:
@@ -145,6 +159,17 @@ class MorphFilter:
         prev_word = m.group(1).strip(".,;:!?\"'«»()[]{}—–-")
         if not prev_word:
             return False
+        # v1.8.5: смотрим ещё на одно слово назад — если prev_word сам
+        # управляется предлогом («при этом», «в том», «о тех»...), то
+        # prev_word — объект предлога, а не модификатор `before`. Иначе
+        # disagreement-логика даст ложноположительный «before рассогласован»
+        # на discourse markers.
+        prev_prefix = prefix[: prefix.rfind(prev_word)].rstrip() if prev_word in prefix else ""
+        prev_prev_match = re.search(r"(\S+)\s*$", prev_prefix) if prev_prefix else None
+        prev_prev_word = (
+            prev_prev_match.group(1).strip(".,;:!?\"'«»()[]{}—–-")
+            if prev_prev_match else ""
+        )
         try:
             prev_parses = self._morph.parse(prev_word)
             b_parses = self._morph.parse(before)
@@ -156,6 +181,30 @@ class MorphFilter:
         prev_agree = [p for p in prev_parses
                       if p.tag.POS in self._POS_REQUIRING_AGREEMENT]
         if not prev_agree:
+            return False
+        # v1.8.5: если prev — причастие (PRTF/PRTS), а before может быть
+        # в творительном (ablt) — это паттерн «причастие + агенс_в_творительном»
+        # («проводимых подразделениями», «выполненная Ивановым»), валидная
+        # русская конструкция. Причастие согласуется не с этим существительным,
+        # а с upstream-головой («преступлений, проводимых X»), и НЕТ
+        # рассогласования. Возвращаем False — это НЕ disagreement, и
+        # `is_case_only_substitution` дальше отработает стандартный case-only
+        # тест → заблокирует hallucinated fix «подразделениями→подразделений».
+        prev_is_participle = any(
+            p.tag.POS in ("PRTF", "PRTS") for p in prev_parses
+        )
+        before_can_be_ablt = any(p.tag.case == "ablt" for p in b_parses)
+        if prev_is_participle and before_can_be_ablt:
+            return False
+        # v1.8.5: если перед prev_word стоит предлог (PREP) — prev_word
+        # это объект предлога («при этом», «о том», «в этих»...), а НЕ
+        # модификатор before. Прод-кейс 05.05.2026: «при этом количество
+        # должностных преступлений — 47» → T-lite сочиняет fix
+        # «количество → количестве», и фильтр пропускает его, так как
+        # видит «этом»(loct) перед «количество»(nomn) и считает это
+        # disagreement. На самом деле «этом» бнут к «при», и «количество»
+        # начинает новую clause — disagreement-нет.
+        if prev_prev_word and self._is_preposition_word(prev_prev_word):
             return False
         # Хотя бы одна пара (prev_p, b_p) согласована? Тогда before — валиден.
         for prev_p in prev_agree:

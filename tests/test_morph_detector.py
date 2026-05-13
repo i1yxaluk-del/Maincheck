@@ -301,3 +301,154 @@ def test_v181_no_fp_on_chain_with_real_noun_genitive(detector: MorphDetector):
     befores = [e.before for e in errs]
     assert "помещений" not in befores
     assert "здания" not in befores
+
+
+# ─── v1.8.5 регрессионные тесты ──────────────────────────────────────
+
+
+def test_v185_no_fp_participle_with_instrumental_agent(detector: MorphDetector):
+    """v1.8.5 прод-кейс (05.05.2026): корректное «проводимых подразделениями»
+    флагалось как disagreement и «исправлялось» в «проводимых подразделений»,
+    что грамматически неверно.
+
+    Причастие «проводимых» (gen.pl) согласуется с upstream-головой
+    («мероприятий ... преступлений», gen.pl), а «подразделениями» — это
+    его агенс в творительном падеже (instrumental). Это норма русского
+    языка для пассивных причастий: «работа, выполненная Ивановым»,
+    «решение, принятое комиссией», «преступление, совершённое лицом».
+    """
+    text = (
+        "УОПМ в целях повышения эффективности мероприятий по профилактике, "
+        "предупреждению, выявлению и пресечению преступлений, проводимых "
+        "подразделениями собственной безопасности, обобщены и структурированы "
+        "сведения о преступлениях, совершенных должностными лицами "
+        "подразделений вневедомственной охраны и разрешительной работы "
+        "территориальных органов."
+    )
+    errs = detector.detect_errors(text)
+    befores = [e.before for e in errs]
+    # Главное: НЕТ FP на «подразделениями» (агенс причастия, не disagreement)
+    assert "подразделениями" not in befores, (
+        f"FP regression: «подразделениями» flagged as error: {befores}"
+    )
+    # Параллельно: «должностными» (instrumental) после «совершенных» —
+    # тоже агенс, не должен флагаться
+    assert "должностными" not in befores
+    assert "лицами" not in befores
+
+
+def test_v185_participle_with_agent_simple_cases(detector: MorphDetector):
+    """v1.8.5: краткие изолированные случаи паттерна «причастие + агенс»."""
+    cases = [
+        # (text, instrumental_noun_that_should_NOT_be_flagged)
+        ("работа, выполненная Ивановым", "Ивановым"),
+        ("решение, принятое комиссией", "комиссией"),
+        ("документ, подписанный директором", "директором"),
+        ("приказ, утверждённый руководителем", "руководителем"),
+        ("отчёт, рассмотренный отделом", "отделом"),
+    ]
+    for text, agent in cases:
+        errs = detector.detect_adj_noun_disagreements(text)
+        befores = [e.before for e in errs]
+        assert agent not in befores, (
+            f"v1.8.5 regression for «{text}»: agent «{agent}» wrongly flagged"
+        )
+
+
+def test_v185_participle_attribute_agreement_still_detected(
+    detector: MorphDetector,
+):
+    """v1.8.5: проверка что мы НЕ сломали детектор для реальных
+    рассогласований причастий с головой. Пример: «*проведённое мероприятия»
+    — «проведённое» (sg.neut.nomn) + «мероприятия» (NOT nomn.neut.sg —
+    либо plur либо sg.gent) — disagreement.
+
+    Поскольку «мероприятия» не парсится в творительном (NOUN, neut, plur
+    или sg.gent — нет ablt), v1.8.5 skip-правило НЕ срабатывает,
+    disagreement по-прежнему ловится.
+    """
+    errs = detector.detect_adj_noun_disagreements("проведённое мероприятия")
+    befores = [e.before for e in errs]
+    assert "мероприятия" in befores, (
+        "Реальное рассогласование причастие+сущ должно по-прежнему ловиться"
+    )
+
+
+def test_v185_helper_is_participle(detector: MorphDetector):
+    """v1.8.5: _is_participle различает причастия и обычные ADJF."""
+    # Причастия
+    assert detector._is_participle("проводимых")  # PRTF
+    assert detector._is_participle("выполненная")  # PRTF
+    assert detector._is_participle("совершенных")  # PRTF
+    # ADJF — НЕ причастие (для них v1.8.5 skip не применяется)
+    assert not detector._is_participle("капитальных")  # ADJF
+    assert not detector._is_participle("красный")  # ADJF
+    assert not detector._is_participle("новый")  # ADJF
+
+
+def test_v185_helper_can_be_instrumental(detector: MorphDetector):
+    """v1.8.5: _can_be_instrumental корректно определяет творительный."""
+    # Творительный падеж
+    assert detector._can_be_instrumental("подразделениями")
+    assert detector._can_be_instrumental("Ивановым")
+    assert detector._can_be_instrumental("комиссией")
+    # НЕ творительный (гарантированно)
+    assert not detector._can_be_instrumental("подразделений")  # gen.pl
+    assert not detector._can_be_instrumental("дом")  # nomn.sg
+
+
+def test_v185_helper_is_preposition(detector: MorphDetector):
+    """v1.8.5: _is_preposition корректно опознаёт предлоги."""
+    # Закрытый класс предлогов
+    assert detector._is_preposition("при")
+    assert detector._is_preposition("в")
+    assert detector._is_preposition("на")
+    assert detector._is_preposition("о")
+    assert detector._is_preposition("по")
+    assert detector._is_preposition("над")
+    assert detector._is_preposition("под")
+    assert detector._is_preposition("от")
+    assert detector._is_preposition("из")
+    # case-insensitive: «При» в начале предложения
+    assert detector._is_preposition("При")
+    # НЕ предлоги
+    assert not detector._is_preposition("этом")  # NPRO/ADJF
+    assert not detector._is_preposition("новый")  # ADJF
+    assert not detector._is_preposition("дом")  # NOUN
+
+
+def test_v185_no_fp_preposition_object_followed_by_noun(detector: MorphDetector):
+    """v1.8.5 прод-кейс (05.05.2026): «при этом количество должностных
+    преступлений» — корректный текст. «при этом» — discourse marker,
+    «этом» — объект предлога «при», и НЕ модифицирует «количество».
+    Детектор не должен выдавать FP «количество → количестве».
+    """
+    text = (
+        "Преобладают общеуголовные преступления — 99, при этом количество "
+        "должностных преступлений — 47."
+    )
+    errs = detector.detect_adj_noun_disagreements(text)
+    befores = [e.before for e in errs]
+    assert "количество" not in befores, (
+        f"v1.8.5 regression: «количество» wrongly flagged in «при этом количество»; "
+        f"got errs={[(e.before, e.suggestion) for e in errs]}"
+    )
+
+
+def test_v185_no_fp_preposition_demonstrative_pronoun_cases(detector: MorphDetector):
+    """v1.8.5: разные паттерны «<предлог> <местоим/прил> <сущ>»."""
+    cases = [
+        # (текст, существительное которое НЕ должно быть во FP)
+        ("Запись о том сотруднике сделана позже.", "сотруднике"),
+        ("Решение по тем вопросам отложено.", "вопросам"),
+        ("В этом году проведена реформа.", "году"),
+        ("О тех проблемах не сообщили.", "проблемах"),
+    ]
+    for text, target_noun in cases:
+        errs = detector.detect_adj_noun_disagreements(text)
+        befores = [e.before for e in errs]
+        # Эти существительные могут не быть отмечены вообще, но даже если
+        # отмечены — это FP. v1.8.5 это исправляет.
+        assert target_noun not in befores, (
+            f"v1.8.5 regression for «{text}»: «{target_noun}» wrongly flagged"
+        )

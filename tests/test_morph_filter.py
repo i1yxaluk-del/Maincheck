@@ -481,3 +481,133 @@ def test_v173_prev_word_is_noun_no_check(mf: MorphFilter):
     # ADJF, поэтому contextual disambiguation возвращает False, и
     # стандартная логика case-only применяется → True.
     assert mf.is_case_only_substitution("приказа", "приказу", raw) is True
+
+
+# ─── v1.8.5 регрессионные тесты ──────────────────────────────────────
+
+
+def test_v185_participle_agent_not_disagreement(mf: MorphFilter):
+    """v1.8.5 прод-кейс (05.05.2026): «проводимых подразделениями» —
+    причастие + агенс в творительном. Это валидная конструкция,
+    причастие не согласуется с этим существительным (согласуется с
+    upstream-головой). _is_grammatically_disagreed_with_prev должен
+    вернуть False для такой пары.
+    """
+    raw = "преступлений, проводимых подразделениями собственной безопасности"
+    assert mf._is_grammatically_disagreed_with_prev(
+        "подразделениями", raw
+    ) is False
+
+
+def test_v185_filter_blocks_hallucinated_agent_case_change(mf: MorphFilter):
+    """v1.8.5 прод-кейс: T-lite могла бы сгенерировать hallucinated
+    case fix «подразделениями → подразделений». Фильтр должен
+    блокировать через is_hallucinated_case_change=True (паттерн
+    причастие+агенс не должен открывать дорогу к case-substitutions).
+    """
+    raw = "проводимых подразделениями собственной безопасности"
+    assert mf.is_case_only_substitution(
+        "подразделениями", "подразделений", raw
+    ) is True
+    assert mf.is_hallucinated_case_change(
+        "подразделениями", "подразделений", raw
+    ) is True
+
+
+def test_v185_participle_agent_simple_cases(mf: MorphFilter):
+    """v1.8.5: simple isolated cases of «причастие + агенс»."""
+    cases = [
+        ("работа, выполненная Ивановым", "Ивановым"),
+        ("решение, принятое комиссией", "комиссией"),
+        ("документ, подписанный директором", "директором"),
+        ("отчёт, рассмотренный отделом", "отделом"),
+    ]
+    for text, agent in cases:
+        assert mf._is_grammatically_disagreed_with_prev(agent, text) is False, (
+            f"v1.8.5 regression for «{text}»: «{agent}» wrongly seen as disagreed"
+        )
+
+
+def test_v185_real_disagreement_still_detected(mf: MorphFilter):
+    """v1.8.5: не сломали real-disagreement детекцию для НЕ-творительного
+    падежа. «Проверочное мероприятия» — мероприятия НЕ ablt, и она реально
+    рассогласована с «Проверочное» → True (disagreement) → fix to
+    «мероприятие» НЕ блокируется фильтром.
+    """
+    raw = "проведено Проверочное мероприятия по контролю"
+    assert mf._is_grammatically_disagreed_with_prev("мероприятия", raw) is True
+    # is_case_only_substitution возвращает False (disagreement override),
+    # поэтому fix «мероприятия → мероприятие» НЕ считается case-only и
+    # будет применён.
+    assert mf.is_case_only_substitution(
+        "мероприятия", "мероприятие", raw
+    ) is False
+
+
+def test_v185_prev_adjective_not_participle_still_flagged(mf: MorphFilter):
+    """v1.8.5 ограничение: ADJF/ADJS пред-слова НЕ исключаются из
+    логики, даже если before в творительном. «довольный отделом»
+    оставлен как минор-FP (адъективное управление творительным редко
+    встречается в admin-текстах).
+    """
+    raw = "довольный отделом сотрудник"
+    # ADJF «довольный» (nomn.sg.masc) + NOUN «отделом» (ablt.sg.masc) —
+    # рассогласование по падежу. Хотя «довольный» лексически управляет
+    # творительным, грамматически парсы рассогласованы, и старая логика
+    # это возвращает как disagreement=True. Нашу v1.8.5 проверку этот
+    # кейс не активирует (потому что «довольный» не PRTF/PRTS).
+    assert mf._is_grammatically_disagreed_with_prev("отделом", raw) is True
+
+
+def test_v185_preposition_object_not_disagreement(mf: MorphFilter):
+    """v1.8.5 прод-кейс (05.05.2026, 2-е предложение): «при этом
+    количество должностных преступлений — 47». «этом» — это объект
+    предлога «при» (PREP, loct), и НЕ модифицирует «количество».
+    Disagreement-логика должна вернуть False.
+    """
+    raw = (
+        "Преобладают общеуголовные преступления — 99, при этом количество "
+        "должностных преступлений — 47."
+    )
+    assert mf._is_grammatically_disagreed_with_prev("количество", raw) is False
+
+
+def test_v185_filter_blocks_hallucinated_preposition_object_case_change(
+    mf: MorphFilter,
+):
+    """v1.8.5 прод-кейс: T-lite сгенерировала FP «количество → количестве»
+    после discourse marker «при этом». is_hallucinated_case_change должен
+    вернуть True (блокировать fix).
+    """
+    raw = (
+        "Преобладают общеуголовные преступления — 99, при этом количество "
+        "должностных преступлений — 47."
+    )
+    assert mf.is_hallucinated_case_change("количество", "количестве", raw) is True
+
+
+def test_v185_preposition_object_simple_cases(mf: MorphFilter):
+    """v1.8.5: разные «<предлог> <местоим/прил> <сущ>» паттерны —
+    disagreement-логика не должна срабатывать на сущ.
+    """
+    cases = [
+        ("Запись о том сотруднике сделана позже.", "сотруднике"),
+        ("Решение по тем вопросам отложено.", "вопросам"),
+        ("В этом году проведена реформа.", "году"),
+        ("О тех проблемах не сообщили.", "проблемах"),
+    ]
+    for raw, noun in cases:
+        assert mf._is_grammatically_disagreed_with_prev(noun, raw) is False, (
+            f"v1.8.5 regression for «{raw}»: «{noun}» wrongly seen as disagreed"
+        )
+
+
+def test_v185_helper_is_preposition_word(mf: MorphFilter):
+    """v1.8.5: _is_preposition_word корректно идентифицирует предлоги."""
+    assert mf._is_preposition_word("при")
+    assert mf._is_preposition_word("в")
+    assert mf._is_preposition_word("над")
+    assert mf._is_preposition_word("По")  # case-insensitive (начало предлож.)
+    assert not mf._is_preposition_word("этом")
+    assert not mf._is_preposition_word("новый")
+    assert not mf._is_preposition_word("")  # пустая строка — False

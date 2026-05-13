@@ -315,6 +315,57 @@ class MorphDetector:
                 return True
         return False
 
+    def _is_participle(self, word: str) -> bool:
+        """True если хотя бы один парс — PRTF/PRTS (только причастие).
+
+        Отличается от `_is_adj_or_participle` тем, что чистые ADJF/ADJS
+        НЕ считаются причастиями. Используется для целевого исключения
+        паттерна «причастие + агенс_в_творительном» в детекторе adj_noun
+        (см. v1.8.5).
+        """
+        if not self._morph:
+            return False
+        parses = self._morph.parse(word)
+        for p in parses:
+            tag_str = str(p.tag)
+            if "PRTF" in tag_str or "PRTS" in tag_str:
+                return True
+        return False
+
+    def _can_be_instrumental(self, word: str) -> bool:
+        """True если у слова есть хотя бы один парс в творительном падеже
+        (`ablt`).
+
+        Используется в `detect_adj_noun_disagreements` для подавления
+        FP-класса «причастие + агенс_в_творительном» (v1.8.5).
+        """
+        if not self._morph:
+            return False
+        parses = self._morph.parse(word)
+        for p in parses:
+            if p.tag.case == "ablt":
+                return True
+        return False
+
+    def _is_preposition(self, word: str) -> bool:
+        """True если хотя бы один парс слова — предлог (PREP).
+
+        Используется в `detect_adj_noun_disagreements` для подавления
+        FP-класса «при этом X» / «над тем Y»: если adj/прич перед NOUN
+        управляется предшествующим предлогом, оно НЕ модифицирует NOUN,
+        а образует с предлогом prepositional-фразу (v1.8.5).
+        """
+        if not self._morph:
+            return False
+        # Перепроверяем lower-case — предлоги пишутся всегда строчно
+        # кроме начала предложения. Pymorphy3 распознаёт «при» и «При»
+        # одинаково, но lower-case надёжнее.
+        parses = self._morph.parse(word.lower())
+        for p in parses:
+            if "PREP" in str(p.tag):
+                return True
+        return False
+
     def _is_short_form_only(self, word: str) -> bool:
         """True если у слова ВСЕ парсы — краткая форма (ADJS/PRTS).
         Краткие формы не склоняются по падежам, поэтому в пред-позиции
@@ -372,6 +423,40 @@ class MorphDetector:
             # ложной интерпретации. OOV-детектор отловит «ремонтова» отдельно.
             if not self._is_known_word(word_a) or not self._is_known_word(word_b):
                 continue
+            # v1.8.5: пропускаем паттерн «причастие + сущ_в_творительном».
+            # В русском причастие управляет агенсом в творительном падеже:
+            # «проводимых подразделениями» (carried out by subdivisions),
+            # «открытое отделом» (opened by department), «решённый комиссией»
+            # (resolved by commission). В таких парах причастие НЕ
+            # согласуется с этим существительным — оно согласуется с
+            # upstream-головой (например, «мероприятий, проводимых X»).
+            # Без этой проверки детектор флагует подавляющую часть таких
+            # пар как disagreement — критический FP-класс в admin-текстах
+            # (прод-кейс 05.05.2026: «проводимых подразделениями» →
+            # «проводимых подразделений», что грамматически неверно).
+            # Ограничение: ADJF/ADJS тут НЕ исключаются — они редко
+            # управляют творительным как агенсом («довольный отделом»
+            # остаётся как минор-FP, разбираться отдельно).
+            if self._is_participle(word_a) and self._can_be_instrumental(word_b):
+                continue
+            # v1.8.5: пропускаем паттерн «<предлог> <местоим/прил> <сущ>»,
+            # где «местоим/прил» — это объект предлога, а не модификатор
+            # следующего сущ. Прод-кейс 05.05.2026:
+            #   «...преступления – 99, при этом количество должностных...»
+            # Пара (этом, количество): «этом» (loct.neut.sing) флагуется
+            # как disagreement с «количество» (nomn.sing.neut). Но «при
+            # этом» — discourse marker («moreover»), «этом» бнут к «при»
+            # (PREP loct), а не к «количество». Аналогичные паттерны:
+            #   «о том X», «о тех Y», «в этом N», «над этой M».
+            # Проверяем что предыдущее слово (i-1) — это предлог.
+            # Ограничение: legitimate-FP остаётся на ситуациях вроде
+            # «над новой ошибкой» (где «новая» правильно agrees с
+            # «ошибкой») — но они НЕ дают disagreement в _has_compatible,
+            # так что эта проверка их не блокирует.
+            if i > 0:
+                _, prev_word_outer = words[i - 1]
+                if self._is_preposition(prev_word_outer):
+                    continue
             # Краткие формы (ADJS/PRTS) — predicative, не склоняются
             # по падежам. Для них проверяем только number+gender.
             if self._is_short_form_only(word_a):
