@@ -133,6 +133,25 @@ MORPH_DETECTOR_ENABLED = os.getenv("MORPH_DETECTOR_ENABLED", "true").lower() in 
 # POST /dict/add, POST /dict/remove. Подробности: server/shared/user_dict.py.
 USER_DICT_ENABLED = os.getenv("USER_DICT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
+# v2.0-b: LanguageTool-RU параллельный детектор. Стучит в локальный
+# LT-сервер (Java/Docker) и добавляет в CHANGES стилистические + типо-
+# графские правки, которые T-lite/MorphDetector не дают. По умолчанию
+# ОТКЛЮЧЁН — нужен запущенный LT-сервер на http://localhost:8081
+# (см. Инструкции/LANGUAGETOOL.md). Если сервер недоступен — graceful
+# fallback, /suggest продолжает работать без LT-правок.
+# Категории по умолчанию: STYLE + TYPOGRAPHY (не дублируем GRAMMAR/TYPOS).
+LANGUAGETOOL_ENABLED = os.getenv("LANGUAGETOOL_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+LANGUAGETOOL_URL = os.getenv("LANGUAGETOOL_URL", "http://localhost:8081")
+LANGUAGETOOL_LANGUAGE = os.getenv("LANGUAGETOOL_LANGUAGE", "ru-RU")
+LANGUAGETOOL_TIMEOUT = float(os.getenv("LANGUAGETOOL_TIMEOUT", "10"))
+LANGUAGETOOL_ENABLED_CATEGORIES = os.getenv(
+    "LANGUAGETOOL_ENABLED_CATEGORIES", "STYLE,TYPOGRAPHY"
+)
+LANGUAGETOOL_DISABLED_CATEGORIES = os.getenv(
+    "LANGUAGETOOL_DISABLED_CATEGORIES", ""
+)
+LANGUAGETOOL_DISABLED_RULES = os.getenv("LANGUAGETOOL_DISABLED_RULES", "")
+
 # RAG
 RAG_ENABLED = os.getenv("RAG_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 RAG_STORE_DIR = os.getenv("RAG_STORE_DIR", "data/rag_store")
@@ -192,6 +211,7 @@ _morph_filter = None  # v1.7: lazy singleton, инициализируется �
 _morph_detector = None  # v1.8a: детектор ошибок (lazy singleton)
 _user_dict = None  # v1.8b: пользовательский словарь (lazy singleton)
 _sage_validator = None  # v1.8c: sage-95m пост-валидатор (lazy singleton)
+_lt_client = None  # v2.0-b: LanguageTool-RU клиент (lazy singleton)
 
 if RAG_ENABLED:
     try:
@@ -335,6 +355,45 @@ try:
 except Exception as e:  # noqa: BLE001
     logger.warning("SageValidator не удалось инициализировать: %s", e)
     _sage_validator = None
+
+# v2.0-b: LanguageTool-RU клиент. Опционально (LANGUAGETOOL_ENABLED).
+# Проверка доступности LT-сервера лениво при первом запросе, чтобы не
+# падать на старте если LT-сервер ещё не поднят.
+if LANGUAGETOOL_ENABLED:
+    try:
+        from shared.languagetool_client import (  # noqa: E402
+            get_languagetool_client,
+            _parse_csv_env,
+        )
+
+        _lt_client = get_languagetool_client(
+            url=LANGUAGETOOL_URL,
+            language=LANGUAGETOOL_LANGUAGE,
+            enabled_categories=_parse_csv_env(LANGUAGETOOL_ENABLED_CATEGORIES),
+            disabled_categories=_parse_csv_env(LANGUAGETOOL_DISABLED_CATEGORIES),
+            disabled_rules=_parse_csv_env(LANGUAGETOOL_DISABLED_RULES),
+            timeout=LANGUAGETOOL_TIMEOUT,
+        )
+        # Один probe-запрос при старте чтобы залогировать наличие сервера.
+        # Если LT недоступен — _lt_client.available == False, /suggest
+        # просто пропускает LT-этап (не падает).
+        if _lt_client.available:
+            logger.info(
+                "LanguageTool включён: url=%s, language=%s, enabled_categories=%s",
+                LANGUAGETOOL_URL, LANGUAGETOOL_LANGUAGE,
+                LANGUAGETOOL_ENABLED_CATEGORIES or "(все)",
+            )
+        else:
+            logger.warning(
+                "LanguageTool: LANGUAGETOOL_ENABLED=true, но сервер %s "
+                "недоступен. /suggest продолжит работу без LT-правок.",
+                LANGUAGETOOL_URL,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("LanguageTool не удалось инициализировать: %s", e)
+        _lt_client = None
+else:
+    logger.info("LanguageTool: отключён (LANGUAGETOOL_ENABLED=false)")
 
 
 SYSTEM_PROMPT = """Ты — корректор русского языка для официальных документов. Не рассуждай, сразу выдавай ответ в нужном формате.
@@ -1019,6 +1078,89 @@ def _enrich_changes_with_detector(text: str, raw_text: str) -> str:
     return new_text
 
 
+def _enrich_changes_with_languagetool(text: str, raw_text: str) -> str:
+    """v2.0-b: добавляет в CHANGES стилистические/типографские правки от
+    LanguageTool-RU (если LT-сервер доступен и LANGUAGETOOL_ENABLED=true).
+
+    Дедупликация по `before` (case-insensitive) — не дублируем правки,
+    которые уже отдала T-lite или MorphDetector. CORRECTED патчится
+    заменой первого вхождения `before` на `suggestion`. При недоступности
+    LT-сервера — no-op.
+
+    LT-правки помечены `[CATEGORY_ID]` в message, чтобы пользователь
+    видел, что это LanguageTool, а не T-lite.
+    """
+    if _lt_client is None or not _lt_client.available:
+        return text
+    if not raw_text:
+        return text
+    if "===CHANGES===" not in text or "===END===" not in text:
+        return text
+    if "===CORRECTED===" not in text:
+        return text
+    try:
+        matches = _lt_client.check(raw_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "LanguageTool упал на raw_text (size=%d): %s", len(raw_text), exc,
+        )
+        return text
+    if not matches:
+        return text
+    # Извлекаем существующие `before` из CHANGES для дедупликации
+    try:
+        before_block, rest = text.split("===CHANGES===", 1)
+        changes_block, tail = rest.split("===END===", 1)
+    except ValueError:
+        return text
+    existing_befores: set[str] = set()
+    for line in changes_block.splitlines():
+        m = _CHANGE_PAIR_RE.search(line)
+        if m:
+            existing_befores.add(m.group(1).strip().lower())
+    corrected_body = _extract_corrected_body(text) or raw_text
+    new_lines: list[str] = []
+    added_pairs = 0
+    patched_corrected = corrected_body
+    # Whitelist пользовательского словаря: LT не должен «улучшать»
+    # аббревиатуры и спец-термины (как и MorphDetector).
+    whitelist = (
+        _user_dict.as_frozenset() if _user_dict is not None else frozenset()
+    )
+    for lt in matches:
+        if not lt.suggestion or lt.suggestion == lt.before:
+            continue
+        before_key = lt.before.strip().lower()
+        if before_key in existing_befores:
+            continue
+        if lt.before in whitelist or before_key in whitelist:
+            continue
+        new_lines.append(lt.to_change_line(0))  # перенумеруется ниже
+        existing_befores.add(before_key)
+        added_pairs += 1
+        if lt.before in patched_corrected:
+            patched_corrected = patched_corrected.replace(
+                lt.before, lt.suggestion, 1,
+            )
+    if added_pairs == 0:
+        return text
+    existing_kept = changes_block.rstrip()
+    if existing_kept and "Ошибок не найдено" in existing_kept:
+        existing_kept = ""
+    if existing_kept:
+        merged_changes = existing_kept + "\n" + "\n".join(new_lines) + "\n"
+    else:
+        merged_changes = "\n" + "\n".join(new_lines) + "\n"
+    logger.info(
+        "LanguageTool: добавлено %d пункт(ов) в CHANGES (стиль/типографика)",
+        added_pairs,
+    )
+    new_text = before_block + "===CHANGES===" + merged_changes + "===END===" + tail
+    if patched_corrected != corrected_body:
+        new_text = _replace_corrected_body(new_text, patched_corrected)
+    return new_text
+
+
 def _replace_corrected_body(text: str, new_body: str) -> str:
     """Заменяет содержимое блока ===CORRECTED===…===CHANGES=== на new_body."""
     if "===CORRECTED===" not in text or "===CHANGES===" not in text:
@@ -1644,6 +1786,16 @@ async def metrics(hours: int = 24):
         "sage_validator_model": (
             _sage_validator.config.model_name if _sage_validator is not None else None
         ),
+        # v2.0-b: статус LanguageTool-RU параллельного детектора
+        "languagetool_enabled": LANGUAGETOOL_ENABLED,
+        "languagetool_available": (
+            _lt_client is not None and _lt_client.available
+        ),
+        "languagetool_url": LANGUAGETOOL_URL if LANGUAGETOOL_ENABLED else None,
+        "languagetool_language": LANGUAGETOOL_LANGUAGE if LANGUAGETOOL_ENABLED else None,
+        "languagetool_enabled_categories": (
+            LANGUAGETOOL_ENABLED_CATEGORIES if LANGUAGETOOL_ENABLED else None
+        ),
     })
 
 
@@ -1870,6 +2022,14 @@ async def suggest(
             # sage оценивал ТОЛЬКО правки от LLM (детектор уже отфильтрован
             # по precision на уровне правил). Latency cost ~1-3 с warm.
             result = _filter_changes_with_sage(result, raw_text)
+            # v2.0-b: параллельный детектор LanguageTool-RU. Добавляет
+            # стилистические + типографские правки, которые T-lite и
+            # MorphDetector обычно не трогают (тире вместо дефиса,
+            # русские кавычки, повторы слов, канцеляризмы и т.п.).
+            # Если LT-сервер недоступен или LANGUAGETOOL_ENABLED=false —
+            # no-op. Идёт ПОСЛЕ sage, т.к. sage валидирует только LLM-
+            # правки, а LT-правки — rule-based, ML-проверка не нужна.
+            result = _enrich_changes_with_languagetool(result, raw_text)
             # v1.8.4: закрываем рассинхрон CHANGES↔CORRECTED. T-lite иногда
             # склеивает несколько правок (орфография+согласование) в один
             # пункт CHANGES, а CORRECTED показывает обе. Клиент применит

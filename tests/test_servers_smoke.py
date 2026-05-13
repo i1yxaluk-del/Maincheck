@@ -1997,3 +1997,133 @@ def test_v20a_presets_dict_structure(local_module_preset_a):
         assert "DESCRIPTION" in cfg, f"preset {key} missing DESCRIPTION"
         assert cfg["MODEL_NAME"], f"preset {key} MODEL_NAME пустой"
         assert cfg["DESCRIPTION"], f"preset {key} DESCRIPTION пустое"
+
+
+# ─── v2.0-b: LanguageTool интеграция ──────────────────────────────────
+
+
+def _load_local_server_with_lt(monkeypatch, tmp_path, lt_enabled=True):
+    """Загружает local-сервер с активным LANGUAGETOOL_ENABLED.
+
+    Используем `transport`-параметр LanguageToolClient (а не глобальный
+    monkeypatch httpx.Client — это бы ломало starlette.TestClient,
+    который наследуется от httpx.Client). Перехватываем функцию
+    `get_languagetool_client` чтобы инжектировать MockTransport.
+    """
+    import httpx
+
+    def handler(request):
+        if request.url.path == "/v2/languages":
+            return httpx.Response(200, json=[
+                {"longCode": "ru-RU", "code": "ru", "name": "Russian"},
+            ])
+        if request.url.path == "/v2/check":
+            return httpx.Response(200, json={
+                "matches": [
+                    {
+                        "message": "Используйте длинное тире",
+                        "offset": 13, "length": 1,
+                        "replacements": [{"value": "—"}],
+                        "rule": {
+                            "id": "DASH_RULE",
+                            "category": {"id": "TYPOGRAPHY", "name": "Типографика"},
+                        },
+                    },
+                ],
+            })
+        return httpx.Response(404)
+
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("AUDIT_DB", str(tmp_path / "audit.sqlite"))
+    monkeypatch.setenv("RAG_ENABLED", "false")
+    monkeypatch.setenv("LANGUAGETOOL_ENABLED", "true" if lt_enabled else "false")
+    monkeypatch.setenv("LANGUAGETOOL_URL", "http://lt-mock:8081")
+    monkeypatch.setenv("LANGUAGETOOL_ENABLED_CATEGORIES", "STYLE,TYPOGRAPHY")
+    for m in list(sys.modules):
+        if m.startswith(("shared", "main")):
+            sys.modules.pop(m, None)
+    local_dir = ROOT / "server" / "local"
+    sys.path.insert(0, str(local_dir))
+    # Заворачиваем get_languagetool_client в фабрику с MockTransport
+    import shared.languagetool_client as lt_mod
+    original_get = lt_mod.get_languagetool_client
+
+    def patched_get(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original_get(**kwargs)
+
+    monkeypatch.setattr(lt_mod, "get_languagetool_client", patched_get)
+    lt_mod.reset_client()
+
+    module = importlib.import_module("main")
+    yield module
+    sys.path.remove(str(local_dir))
+    lt_mod.reset_client()
+    for m in list(sys.modules):
+        if m.startswith(("shared", "main")):
+            sys.modules.pop(m, None)
+
+
+@pytest.fixture
+def local_module_lt_enabled(monkeypatch, tmp_path):
+    yield from _load_local_server_with_lt(monkeypatch, tmp_path, lt_enabled=True)
+
+
+@pytest.fixture
+def local_module_lt_disabled(monkeypatch, tmp_path):
+    yield from _load_local_server_with_lt(monkeypatch, tmp_path, lt_enabled=False)
+
+
+def test_v20b_lt_disabled_metrics(local_module_lt_disabled):
+    """LANGUAGETOOL_ENABLED=false → metrics показывают enabled=false,
+    available=false, и url/categories=null."""
+    from fastapi.testclient import TestClient
+    client = TestClient(local_module_lt_disabled.app)
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["languagetool_enabled"] is False
+    assert data["languagetool_available"] is False
+    assert data["languagetool_url"] is None
+    assert data["languagetool_enabled_categories"] is None
+
+
+def test_v20b_lt_enabled_metrics(local_module_lt_enabled):
+    """LANGUAGETOOL_ENABLED=true + LT-mock доступен → metrics показывают
+    enabled=true, available=true, url + categories."""
+    from fastapi.testclient import TestClient
+    client = TestClient(local_module_lt_enabled.app)
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["languagetool_enabled"] is True
+    assert data["languagetool_available"] is True
+    assert data["languagetool_url"] == "http://lt-mock:8081"
+    assert data["languagetool_language"] == "ru-RU"
+    assert data["languagetool_enabled_categories"] == "STYLE,TYPOGRAPHY"
+
+
+def test_v20b_lt_enriches_changes(local_module_lt_enabled, monkeypatch):
+    """LANGUAGETOOL_ENABLED=true + LT возвращает один match → этот match
+    появляется в CHANGES блоке /suggest."""
+    from fastapi.testclient import TestClient
+
+    async def fake_call_ollama(messages, *args, **kwargs):
+        return (
+            "===CORRECTED===\nТест документ - проверка.\n"
+            "===CHANGES===\n1. «опечатка» → «опечатки» | орфография\n===END==="
+        )
+
+    monkeypatch.setattr(local_module_lt_enabled, "call_ollama", fake_call_ollama)
+    client = TestClient(local_module_lt_enabled.app)
+    files = {
+        "text": ("t.txt", io.BytesIO("Тест документ - проверка.".encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    body = r.text
+    # T-lite правка (от мока)
+    assert "===CHANGES===" in body
+    # LT правка ([TYPOGRAPHY] из мока), добавлена в CHANGES
+    assert "TYPOGRAPHY" in body or "тире" in body
