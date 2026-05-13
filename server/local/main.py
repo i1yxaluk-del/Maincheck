@@ -51,7 +51,29 @@ from shared.logging_setup import setup_logger  # noqa: E402
 load_dotenv()
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-MODEL_NAME = os.getenv("MODEL_NAME", "t-tech/T-lite-it-2.1:q4_K_M")
+
+# v2.0-a: A/B/C переключение LLM-модели через preset.
+# LLM_PRESET=A — T-lite-it-2.1 (8B, baseline, default)
+# LLM_PRESET=B — YandexGPT-5-Lite-8B-instruct (F0.5=83% на LORuGEC, BEA 2025)
+# LLM_PRESET=C — GigaChat-3.1-Lightning-10B-A1.8B (MoE, 1.8B active, MIT)
+# Если MODEL_NAME явно задан в env — он перебивает preset (для кастома).
+LLM_PRESETS = {
+    "A": {
+        "MODEL_NAME": "t-tech/T-lite-it-2.1:q4_K_M",
+        "DESCRIPTION": "T-lite-it-2.1 (baseline, dense 8B Qwen3-fine-tune от T-Bank)",
+    },
+    "B": {
+        "MODEL_NAME": "hf.co/yandex/YandexGPT-5-Lite-8B-instruct-GGUF:Q4_K_M",
+        "DESCRIPTION": "YandexGPT-5-Lite-8B-instruct (F0.5=83% на LORuGEC, ACL BEA 2025)",
+    },
+    "C": {
+        "MODEL_NAME": "hf.co/ai-sage/GigaChat-3.1-Lightning-10B-A1.8B-Instruct-GGUF:Q4_K_M",
+        "DESCRIPTION": "GigaChat-3.1-Lightning-10B-A1.8B (MoE 1.8B active, MIT, ai-sage)",
+    },
+}
+LLM_PRESET = os.getenv("LLM_PRESET", "A").strip().upper()
+_default_model = LLM_PRESETS.get(LLM_PRESET, LLM_PRESETS["A"])["MODEL_NAME"]
+MODEL_NAME = os.getenv("MODEL_NAME") or _default_model
 NUM_THREADS = int(os.getenv("NUM_THREADS", "28"))
 # Размер окна контекста (input + output в токенах). 4096 — стандарт qwen2.5,
 # но если у вас короткие тексты (<2 КБ), 2048 даёт ~2× прирост скорости
@@ -372,6 +394,13 @@ async def _warmup_ollama():
     """
     if not OLLAMA_WARMUP:
         return
+    preset_desc = LLM_PRESETS.get(LLM_PRESET, {}).get(
+        "DESCRIPTION", "custom (MODEL_NAME override)"
+    )
+    logger.info(
+        "v2.0-a LLM preset=%s — %s",
+        LLM_PRESET, preset_desc,
+    )
     logger.info(
         "Прогрев модели %s через Ollama (num_ctx=%d, timeout=%.0fs)…",
         MODEL_NAME, OLLAMA_NUM_CTX, OLLAMA_WARMUP_TIMEOUT,
@@ -1572,6 +1601,10 @@ async def metrics(hours: int = 24):
     return JSONResponse({
         "server": "local",
         "model": MODEL_NAME,
+        "llm_preset": LLM_PRESET,
+        "llm_preset_description": LLM_PRESETS.get(LLM_PRESET, {}).get(
+            "DESCRIPTION", "custom (MODEL_NAME override)"
+        ),
         "rag_enabled": RAG_ENABLED,
         "rag_documents": len(_rag_store.docs) if _rag_store else 0,
         "rag_chunks": len(_rag_store.entries) if _rag_store else 0,
