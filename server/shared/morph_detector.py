@@ -35,11 +35,22 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from shared.syntax_parser import ParsedDoc
 
 _log = logging.getLogger("ai_suggester.morph_detector")
+
+# v1.9: ENV-флаг включения natasha-парсера. Default `true`. Если
+# natasha не установлена, парсер сам отчитается `available=False` и
+# детектор откатится на v1.8.5 hardcoded skip-rules.
+_NATASHA_ENABLED_ENV = os.getenv("NATASHA_ENABLED", "true").lower() in (
+    "1", "true", "yes", "on",
+)
 
 
 # Граммемы, при наличии которых хотя бы у одного парса слово НЕ
@@ -387,6 +398,7 @@ class MorphDetector:
 
     def detect_adj_noun_disagreements(
         self, raw_text: str,
+        parsed_doc: Optional["ParsedDoc"] = None,
     ) -> list[GrammarError]:
         """Находит пары (adj/participle, noun), где число различается
         (или падеж рассогласован).
@@ -423,7 +435,23 @@ class MorphDetector:
             # ложной интерпретации. OOV-детектор отловит «ремонтова» отдельно.
             if not self._is_known_word(word_a) or not self._is_known_word(word_b):
                 continue
-            # v1.8.5: пропускаем паттерн «причастие + сущ_в_творительном».
+            # v1.9: если есть дерево зависимостей natasha — спрашиваем у
+            # него, ЯВНО ли пара (adj, noun) НЕ-attributive-связь
+            # (obl:agent, case-governed, conj, parataxis...). Если ДА —
+            # пропускаем, закрывает ЦЕЛЫЕ классы FP без hardcoded
+            # patch-правил на каждый.
+            #
+            # ВАЖНО: используем только НЕГАТИВНЫЕ сигналы парсера. Если
+            # natasha мис-парсит структуру (выдала amod там где должно
+            # быть obl:agent — редко, но бывает) — fallback на v1.8.5
+            # hardcoded skip-rules + pymorphy3-морфоcheck (как раньше).
+            if parsed_doc is not None:
+                adj_idx = parsed_doc.token_at_offset(offset_a)
+                noun_idx = parsed_doc.token_at_offset(offset_b)
+                if adj_idx is not None and noun_idx is not None:
+                    if parsed_doc.is_clearly_non_attributive(adj_idx, noun_idx):
+                        continue
+            # v1.8.5 (fallback): пропускаем паттерн «причастие + сущ_в_творительном».
             # В русском причастие управляет агенсом в творительном падеже:
             # «проводимых подразделениями» (carried out by subdivisions),
             # «открытое отделом» (opened by department), «решённый комиссией»
@@ -562,9 +590,14 @@ class MorphDetector:
 
     def detect_errors(
         self, raw_text: str, whitelist: Optional[frozenset[str]] = None,
+        parsed_doc: Optional["ParsedDoc"] = None,
     ) -> list[GrammarError]:
         """Запускает все детекторы и возвращает консолидированный
         список ошибок, отсортированный по offset.
+
+        v1.9: если `parsed_doc` не передан и `NATASHA_ENABLED=true`,
+        пытаемся получить дерево зависимостей через `get_syntax_parser()`
+        и пробросить его в adj_noun-детектор для пред-фильтрации FP.
 
         Дедупликация: если две ошибки указывают на тот же фрагмент
         (same offset+length) — оставляем первую (приоритет: numeral_noun
@@ -572,9 +605,20 @@ class MorphDetector:
         """
         if not self.available:
             return []
+        if parsed_doc is None and _NATASHA_ENABLED_ENV:
+            try:
+                from shared.syntax_parser import get_syntax_parser  # noqa: E402
+                parser = get_syntax_parser()
+                if parser.available:
+                    parsed_doc = parser.parse(raw_text)
+            except Exception as exc:  # pragma: no cover
+                _log.warning(
+                    "MorphDetector: не удалось загрузить syntax_parser: %s",
+                    exc,
+                )
         all_errors: list[GrammarError] = []
         all_errors.extend(self.detect_numeral_noun_disagreements(raw_text))
-        all_errors.extend(self.detect_adj_noun_disagreements(raw_text))
+        all_errors.extend(self.detect_adj_noun_disagreements(raw_text, parsed_doc))
         all_errors.extend(self.detect_oov_words(raw_text, whitelist))
         # Sort by offset, dedupe by (offset, length) — keep first.
         all_errors.sort(key=lambda e: (e.offset, e.length))

@@ -611,3 +611,117 @@ def test_v185_helper_is_preposition_word(mf: MorphFilter):
     assert not mf._is_preposition_word("этом")
     assert not mf._is_preposition_word("новый")
     assert not mf._is_preposition_word("")  # пустая строка — False
+
+
+# ─── v1.9 интеграционные тесты с natasha syntax_parser ────────────────
+
+
+@pytest.fixture(scope="module")
+def syntax_parser_v19():
+    """Загружает natasha-парсер для интеграционных тестов v1.9. Если
+    natasha не установлена — skip."""
+    try:
+        from shared.syntax_parser import reset_syntax_parser, get_syntax_parser
+    except Exception:
+        pytest.skip("syntax_parser не доступен")
+    reset_syntax_parser()
+    p = get_syntax_parser()
+    if not p.available:
+        pytest.skip("natasha не установлена")
+    return p
+
+
+def test_v19_natasha_blocks_fp_participle_agent_in_filter(
+    mf: MorphFilter, syntax_parser_v19,
+):
+    """v1.9: morph_filter с natasha-деревом блокирует hallucinated
+    «совершенных сотрудниками → сотрудников» через obl:agent signal.
+
+    Семантика метода `is_hallucinated_case_change`: True означает что
+    правка — галлюцинация и должна быть откатана. Здесь правка от
+    T-lite «сотрудниками → сотрудников» по контексту «совершенных
+    сотрудниками» — galвцинация (творительный валиден как agent).
+    """
+    text = (
+        "Анализ деяний, совершенных сотрудниками, свидетельствует."
+    )
+    doc = syntax_parser_v19.parse(text)
+    # «сотрудниками» (ablt) → «сотрудников» (gent) — это case-only
+    # подмена. С natasha-деревом is_hallucinated_case_change должна
+    # вернуть True (правка — галлюцинация).
+    result = mf.is_hallucinated_case_change(
+        before="сотрудниками",
+        after="сотрудников",
+        raw_text=text,
+        parsed_doc=doc,
+    )
+    assert result, (
+        "v1.9: «совершенных сотрудниками → сотрудников» должно быть "
+        "помечено как hallucinated case change (obl:agent → НЕ disagreement)"
+    )
+
+
+def test_v19_natasha_blocks_fp_preposition_pronoun_in_filter(
+    mf: MorphFilter, syntax_parser_v19,
+):
+    """v1.9: morph_filter блокирует hallucinated «количество →
+    количестве» в контексте «при этом количество» через case-child signal.
+    """
+    text = (
+        "преобладают преступления – 99, при этом количество должностных."
+    )
+    doc = syntax_parser_v19.parse(text)
+    result = mf.is_hallucinated_case_change(
+        before="количество",
+        after="количестве",
+        raw_text=text,
+        parsed_doc=doc,
+    )
+    assert result, (
+        "v1.9: «при этом количество → количестве» должно быть hallucinated"
+    )
+
+
+def test_v19_real_disagreement_still_legitimate_in_filter(
+    mf: MorphFilter, syntax_parser_v19,
+):
+    """v1.9: реальный disagreement «*Проверочное мероприятия → мероприятие»
+    по-прежнему legitimate fix (НЕ блокируется как hallucinated).
+    natasha мис-парсит это, но pymorphy3-fallback внутри
+    is_grammatically_disagreed_with_prev спасает нас.
+    """
+    text = "Проведено проверочное мероприятия."
+    doc = syntax_parser_v19.parse(text)
+    # before=мероприятия, after=мероприятие — это legitimate fix
+    # (sing.gent → sing.nomn). is_hallucinated_case_change должна
+    # вернуть False (это РЕАЛЬНАЯ правка).
+    result = mf.is_hallucinated_case_change(
+        before="мероприятия",
+        after="мероприятие",
+        raw_text=text,
+        parsed_doc=doc,
+    )
+    assert not result, (
+        "v1.9: реальная правка disagreement НЕ должна быть помечена "
+        "как hallucinated"
+    )
+
+
+def test_v19_auto_loads_parser_in_is_hallucinated_case_change(
+    mf: MorphFilter,
+):
+    """v1.9: is_hallucinated_case_change без явного parsed_doc сам
+    подтягивает natasha-парсер (если NATASHA_ENABLED=true).
+    """
+    text = (
+        "Анализ деяний, совершенных сотрудниками, свидетельствует."
+    )
+    result = mf.is_hallucinated_case_change(
+        before="сотрудниками",
+        after="сотрудников",
+        raw_text=text,
+    )
+    assert result, (
+        "v1.9 auto-natasha: «сотрудниками → сотрудников» должно быть "
+        "hallucinated через дерево зависимостей"
+    )
