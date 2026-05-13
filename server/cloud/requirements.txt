@@ -3,3 +3,31 @@ uvicorn[standard]>=0.29.0
 httpx>=0.27.0
 python-multipart>=0.0.9
 python-dotenv>=1.0.0
+
+# ─── Опциональные зависимости feature-parity с local-сервером (v2.1) ──
+# Cloud-сервер импортирует те же shared/* модули, что и local. Каждый
+# модуль работает в degraded-режиме (no-op), если соответствующие
+# зависимости не установлены, поэтому всё ниже опционально.
+
+# RAG / few-shot retrieval: нужно для USE_FEW_SHOT=true с Ollama-эмбеддером.
+# Без них few-shot откатывается на HashingEmbedder (лексическое
+# пересечение, качество ниже, но не ломается).
+# python-docx>=1.1.0
+# pypdf>=4.2.0
+# beautifulsoup4>=4.12.0
+
+# Морфо-фильтр и детектор (MORPH_FILTER_ENABLED / MORPH_DETECTOR_ENABLED).
+# Без них фильтр и детектор работают как no-op:
+# - модель сможет вернуть галлюцинированные падежные «улучшения»;
+# - не будут добавляться правила numeral-noun / adj-noun.
+# pymorphy3 — pure Python (~2 МБ), pymorphy3-dicts-ru — словарь OpenCorpora (~50 МБ).
+pymorphy3>=2.0.0
+pymorphy3-dicts-ru>=2.4.0
+
+# natasha — синтакс-парсер для расширенных skip-rules морфо-детектора.
+# Если не установлен — детекторы откатываются на hardcoded правила.
+# Размер ~150 МБ.
+# natasha>=1.6.0
+
+# LanguageTool-RU клиент использует только httpx (уже выше).
+# Сервер LT поднимается отдельно (см. ADMIN_GUIDE).

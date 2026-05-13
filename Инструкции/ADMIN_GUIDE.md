@@ -143,10 +143,23 @@ curl http://localhost:8000/metrics
 ```bash
 cd server/cloud
 cp .env.example .env
-# вписать OPENROUTER_API_KEY
+# вписать OPENROUTER_API_KEY и (опц.) CLOUD_PRESET=A|B|C|D
 pip install -r requirements.txt
 # запустить под systemd аналогично локальному
 ```
+
+**CLOUD_PRESET** (`v2.1`):
+- **A** — `openrouter/free` auto-router (дефолт, самый надёжный).
+- **B** — `qwen/qwen3-next-80b-a3b-instruct:free` (рекомендуется для
+  русскоязычных официальных документов).
+- **C** — `google/gemma-4-31b-it:free` (multilingual, контекст 256K).
+- **D** — `nvidia/nemotron-3-super-120b-a12b:free` (сильный reasoning).
+
+**Feature-parity с локальным сервером (`v2.1`)** — cloud поддерживает
+те же RAG (`RAG_ENABLED`), few-shot retrieval (`USE_FEW_SHOT`),
+морф-фильтр/детектор, пользовательский словарь (`/dict/*`),
+LanguageTool-RU и весь пост-процессинг, что и `server/local`. См.
+`server/cloud/.env.example` для полного списка флагов.
 
 ---
 

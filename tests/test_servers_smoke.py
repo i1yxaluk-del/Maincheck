@@ -2127,3 +2127,311 @@ def test_v20b_lt_enriches_changes(local_module_lt_enabled, monkeypatch):
     assert "===CHANGES===" in body
     # LT правка ([TYPOGRAPHY] из мока), добавлена в CHANGES
     assert "TYPOGRAPHY" in body or "тире" in body
+
+
+# ─── v2.1 cloud-mirror tests: parity с local-сервером ─────────────────
+
+
+def _load_cloud_server_with_env(monkeypatch, tmp_path, **env):
+    """Загружает cloud-server с произвольными env-флагами.
+    Дефолты: OPENROUTER_API_KEY заполнен, LOG_DIR/AUDIT_DB в tmp.
+    Любые дополнительные env-флаги передаются через **env.
+    """
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("AUDIT_DB", str(tmp_path / "audit.sqlite"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test-key-123456")
+    for k, v in env.items():
+        monkeypatch.setenv(k, str(v))
+
+    for m in list(sys.modules):
+        if m.startswith(("shared", "main")):
+            sys.modules.pop(m, None)
+
+    cloud_dir = ROOT / "server" / "cloud"
+    sys.path.insert(0, str(cloud_dir))
+    module = importlib.import_module("main")
+    yield module
+    sys.path.remove(str(cloud_dir))
+    for m in list(sys.modules):
+        if m.startswith(("shared", "main")):
+            sys.modules.pop(m, None)
+
+
+@pytest.fixture
+def cloud_module_preset_b(monkeypatch, tmp_path):
+    yield from _load_cloud_server_with_env(monkeypatch, tmp_path, CLOUD_PRESET="B")
+
+
+@pytest.fixture
+def cloud_module_preset_unknown(monkeypatch, tmp_path):
+    yield from _load_cloud_server_with_env(monkeypatch, tmp_path, CLOUD_PRESET="Z")
+
+
+@pytest.fixture
+def cloud_module_override(monkeypatch, tmp_path):
+    yield from _load_cloud_server_with_env(
+        monkeypatch, tmp_path,
+        OPENROUTER_MODELS="model-x/free,model-y/free",
+    )
+
+
+@pytest.fixture
+def cloud_module_dict_disabled(monkeypatch, tmp_path):
+    yield from _load_cloud_server_with_env(monkeypatch, tmp_path, USER_DICT_ENABLED="false")
+
+
+def test_cloud_preset_a_default(cloud_module):
+    """Дефолтный preset = A, первая модель — openrouter/free auto-router."""
+    assert cloud_module.CLOUD_PRESET == "A"
+    assert cloud_module.MODELS[0] == "openrouter/free"
+    assert len(cloud_module.MODELS) > 1
+
+
+def test_cloud_preset_b_qwen(cloud_module_preset_b):
+    """CLOUD_PRESET=B → primary = qwen3-next."""
+    assert cloud_module_preset_b.CLOUD_PRESET == "B"
+    assert cloud_module_preset_b.MODELS[0].startswith("qwen/qwen3-next")
+
+
+def test_cloud_unknown_preset_falls_back_to_a(cloud_module_preset_unknown):
+    """Неизвестный preset → A (мягкая деградация)."""
+    assert cloud_module_preset_unknown.CLOUD_PRESET == "A"
+
+
+def test_cloud_models_override(cloud_module_override):
+    """OPENROUTER_MODELS (CSV) перебивает preset."""
+    assert cloud_module_override.MODELS == ["model-x/free", "model-y/free"]
+
+
+def test_cloud_metrics_extended(cloud_module):
+    """v2.1 metrics возвращает блоки rag/few_shot/dict/morph/lt."""
+    from fastapi.testclient import TestClient
+    client = TestClient(cloud_module.app)
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["server"] == "cloud"
+    # Все блоки feature-parity присутствуют
+    assert "rag_enabled" in data
+    assert "few_shot_enabled" in data
+    assert "morph_filter_enabled" in data
+    assert "morph_detector_enabled" in data
+    assert "user_dict_enabled" in data
+    assert "languagetool_enabled" in data
+    assert "cloud_preset" in data
+    assert "cloud_preset_description" in data
+    assert "audit" in data
+
+
+def test_cloud_dict_list_endpoint(cloud_module):
+    """/dict/list возвращает 200 + words, когда USER_DICT_ENABLED=true (дефолт)."""
+    from fastapi.testclient import TestClient
+    client = TestClient(cloud_module.app)
+    r = client.get("/dict/list")
+    assert r.status_code == 200
+    body = r.json()
+    assert "words" in body
+    assert isinstance(body["words"], list)
+
+
+def test_cloud_dict_add_and_remove(cloud_module):
+    """/dict/add + /dict/remove работают и /dict/list отражает изменения."""
+    from fastapi.testclient import TestClient
+    client = TestClient(cloud_module.app)
+
+    # Сначала зачистим словарь (на случай артефактов от других тестов)
+    initial = client.get("/dict/list").json()["words"]
+    for w in initial:
+        client.post("/dict/remove", json={"word": w})
+
+    r = client.post("/dict/add", json={"word": "ЦСНтест"})
+    assert r.status_code == 200
+    assert r.json()["added"] is True
+
+    listing = client.get("/dict/list").json()
+    assert "ЦСНтест" in listing["words"]
+
+    r = client.post("/dict/remove", json={"word": "ЦСНтест"})
+    assert r.status_code == 200
+    assert r.json()["removed"] is True
+    listing = client.get("/dict/list").json()
+    assert "ЦСНтест" not in listing["words"]
+
+
+def test_cloud_dict_disabled(cloud_module_dict_disabled):
+    """/dict/list возвращает 503 если USER_DICT_ENABLED=false."""
+    from fastapi.testclient import TestClient
+    client = TestClient(cloud_module_dict_disabled.app)
+    r = client.get("/dict/list")
+    assert r.status_code == 503
+    assert "отключён" in r.json()["error"]
+
+
+def test_cloud_dict_add_invalid_input(cloud_module):
+    """/dict/add возвращает 400 на невалидный JSON."""
+    from fastapi.testclient import TestClient
+    client = TestClient(cloud_module.app)
+    r = client.post("/dict/add", json={})
+    assert r.status_code == 400
+
+
+def test_cloud_postprocess_eyo_dropped(cloud_module, monkeypatch):
+    """Cloud-сервер должен сбрасывать ё↔е стилистические правки в CHANGES
+    (как и local-сервер, через _drop_eyo_substitutions)."""
+    from fastapi.testclient import TestClient
+
+    async def fake_call_model(messages, model):
+        return (
+            "===CORRECTED===\n"
+            "проведёнными работами в третьем квартале\n"
+            "===CHANGES===\n"
+            "1. «проведенными» → «проведёнными» | расстановка буквы ё\n"
+            "===END==="
+        )
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    client = TestClient(cloud_module.app)
+    files = {
+        "text": ("t.txt", io.BytesIO("проведенными работами в третьем квартале".encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    # Пункт «проведенными → проведёнными» — ё-only подстановка, должна быть отфильтрована
+    assert "«проведенными» → «проведёнными»" not in r.text
+    # CORRECTED откатан к исходному написанию (ё → е по raw_text)
+    assert "проведенными" in r.text
+
+
+def test_cloud_postprocess_drops_not_in_text(cloud_module, monkeypatch):
+    """Cloud-сервер дропает пункты, чей «было» отсутствует в raw_text
+    (галлюцинации модели — как и local)."""
+    from fastapi.testclient import TestClient
+
+    async def fake_call_model(messages, model):
+        return (
+            "===CORRECTED===\n"
+            "Документ согласно приказу.\n"
+            "===CHANGES===\n"
+            "1. «несуществующая_цитата» → «другое» | вымышленная правка\n"
+            "===END==="
+        )
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    client = TestClient(cloud_module.app)
+    files = {
+        "text": ("t.txt", io.BytesIO("Документ согласно приказу.".encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    assert "несуществующая_цитата" not in r.text
+
+
+def test_cloud_suggest_appends_end_marker(cloud_module, monkeypatch):
+    """Если модель забыла ===END===, cloud-сервер дописывает его."""
+    from fastapi.testclient import TestClient
+
+    async def fake_call_model(messages, model):
+        return (
+            "===CORRECTED===\nок\n"
+            "===CHANGES===\n1. Ошибок нет.\n"
+        )
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    client = TestClient(cloud_module.app)
+    files = {
+        "text": ("t.txt", io.BytesIO("ок".encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    assert "===END===" in r.text
+
+
+def test_cloud_suggest_fallback_on_429(cloud_module, monkeypatch):
+    """Cloud-сервер пробует следующую модель на HTTP 429."""
+    from fastapi.testclient import TestClient
+    import httpx as _httpx
+
+    calls = []
+
+    async def fake_call_model(messages, model):
+        calls.append(model)
+        if model == cloud_module.MODELS[0]:
+            req = _httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+            resp = _httpx.Response(429, request=req, text='{"error":"rate-limited"}')
+            raise _httpx.HTTPStatusError("rate-limited", request=req, response=resp)
+        return (
+            "===CORRECTED===\nок\n===CHANGES===\n1. Ошибок нет.\n===END==="
+        )
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    client = TestClient(cloud_module.app)
+    files = {
+        "text": ("t.txt", io.BytesIO("ок".encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    assert "===CORRECTED===" in r.text
+    # Минимум 2 модели опробованы (429 на первой, успех на второй)
+    assert len(calls) >= 2
+
+
+def test_cloud_strip_thinking(cloud_module, monkeypatch):
+    """Cloud-сервер срезает <think>…</think> блоки (parity с local)."""
+    from fastapi.testclient import TestClient
+
+    async def fake_call_model(messages, model):
+        return (
+            "<think>Думаю про орфографию...</think>\n"
+            "===CORRECTED===\nок\n===CHANGES===\n1. Ошибок нет.\n===END==="
+        )
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    client = TestClient(cloud_module.app)
+    files = {
+        "text": ("t.txt", io.BytesIO("ок".encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    assert "<think>" not in r.text
+    assert "Думаю про орфографию" not in r.text
+
+
+def test_cloud_openrouter_client_resolve_models():
+    """Резолвер моделей: preset A/B + override."""
+    from shared.openrouter_client import resolve_models, CLOUD_PRESETS
+
+    a = resolve_models("A")
+    assert a[0] == "openrouter/free"
+    b = resolve_models("B")
+    assert b[0].startswith("qwen/qwen3-next")
+    unknown = resolve_models("Z")  # неизвестный preset → A
+    assert unknown == a
+    override = resolve_models("A", override_models=["model-1", "model-2"])
+    assert override == ["model-1", "model-2"]
+    # Все 4 preset'а определены
+    for k in ("A", "B", "C", "D"):
+        assert k in CLOUD_PRESETS
+
+
+def test_cloud_openrouter_client_key_redaction():
+    """OpenRouterClient.key_redacted маскирует ключ."""
+    from shared.openrouter_client import OpenRouterClient
+
+    c1 = OpenRouterClient("sk-or-v1-abcdefghijklmnop1234")
+    redacted = c1.key_redacted
+    assert "sk-or-v1-abc" in redacted
+    assert "1234" in redacted
+    assert "..." in redacted
+    assert "defghijkl" not in redacted
+
+    c2 = OpenRouterClient("")
+    assert c2.key_redacted == "(empty)"
+    assert c2.key_present is False
+
+    c3 = OpenRouterClient("ваш_ключ_тут")
+    assert c3.key_present is False  # placeholder
