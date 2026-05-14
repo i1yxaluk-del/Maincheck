@@ -2649,7 +2649,9 @@ def test_openrouter_chat_all_429_returns_friendly_quota_message():
     msg = str(excinfo.value)
     assert "429" in msg or "исчерпан" in msg
     assert "квот" in msg
-    assert "OPENROUTER_MODELS" in msg
+    # После v2.2.3 сообщение генеричное (не только про OpenRouter):
+    # вместо OPENROUTER_MODELS ожидаем упоминание второго провайдера.
+    assert "провайдер" in msg.lower() or "CLOUD_PROVIDERS" in msg
 
 
 def test_openrouter_chat_fallback_skips_content_none_to_next():
@@ -2700,4 +2702,319 @@ def test_cloud_chat_with_fallback_quota_exhausted_friendly_error(cloud_module, m
     msg = str(excinfo.value)
     assert "429" in msg
     assert "квот" in msg
-    assert "OPENROUTER_MODELS" in msg
+    # После v2.2.3: сообщение из cloud/main.py рекомендует добавить
+    # второго провайдера в CLOUD_PROVIDERS.
+    assert "CLOUD_PROVIDERS" in msg or "провайдер" in msg.lower()
+
+
+# ─── v2.2.3: multi-provider (OpenRouter, DeepSeek, Fireworks, ...) ────
+
+
+def test_providers_load_default_openrouter():
+    """Если CLOUD_PROVIDERS не задан — дефолт openrouter (back-compat)."""
+    from shared.providers import load_providers_from_env
+
+    env = {
+        "OPENROUTER_API_KEY": "sk-or-v1-test-key",
+        "OPENROUTER_MODELS": "openrouter/free,qwen/qwen3:free",
+    }
+    providers = load_providers_from_env(env_getter=env.get)
+    assert len(providers) == 1
+    assert providers[0].name == "openrouter"
+    assert providers[0].base_url == "https://openrouter.ai/api/v1"
+    assert providers[0].key_present is True
+    assert providers[0].models == ["openrouter/free", "qwen/qwen3:free"]
+    # HTTP-Referer и X-Title подставляются дефолтные
+    assert "HTTP-Referer" in providers[0].extra_headers
+    assert "X-Title" in providers[0].extra_headers
+
+
+def test_providers_load_multiple_with_defaults():
+    """CLOUD_PROVIDERS=openrouter,deepseek,fireworks → 3 провайдера
+    с известными дефолтными base_url для каждого."""
+    from shared.providers import KNOWN_PROVIDERS, load_providers_from_env
+
+    env = {
+        "CLOUD_PROVIDERS": "openrouter,deepseek,fireworks",
+        "OPENROUTER_API_KEY": "sk-or-v1-aaa",
+        "OPENROUTER_MODELS": "openrouter/free",
+        "DEEPSEEK_API_KEY": "sk-deepseek-bbb",
+        "DEEPSEEK_MODELS": "deepseek-chat,deepseek-reasoner",
+        "FIREWORKS_API_KEY": "fw_ccc",
+        "FIREWORKS_MODELS": "accounts/fireworks/models/llama-v3p3-70b-instruct",
+    }
+    providers = load_providers_from_env(env_getter=env.get)
+    assert [p.name for p in providers] == ["openrouter", "deepseek", "fireworks"]
+    assert providers[1].base_url == KNOWN_PROVIDERS["deepseek"]
+    assert providers[2].base_url == KNOWN_PROVIDERS["fireworks"]
+    assert providers[1].models == ["deepseek-chat", "deepseek-reasoner"]
+    assert providers[2].models == ["accounts/fireworks/models/llama-v3p3-70b-instruct"]
+    # DeepSeek и Fireworks НЕ получают HTTP-Referer/X-Title (это OpenRouter-specific)
+    assert "HTTP-Referer" not in providers[1].extra_headers
+    assert "HTTP-Referer" not in providers[2].extra_headers
+
+
+def test_providers_custom_base_url_override():
+    """<NAME>_BASE_URL перебивает дефолт из KNOWN_PROVIDERS."""
+    from shared.providers import load_providers_from_env
+
+    env = {
+        "CLOUD_PROVIDERS": "openrouter",
+        "OPENROUTER_API_KEY": "sk-or-v1-test",
+        "OPENROUTER_BASE_URL": "https://my-proxy.example.com/v1",
+        "OPENROUTER_MODELS": "model-a",
+    }
+    providers = load_providers_from_env(env_getter=env.get)
+    assert providers[0].base_url == "https://my-proxy.example.com/v1"
+
+
+def test_providers_unknown_provider_no_default_base_url():
+    """Неизвестный провайдер без <NAME>_BASE_URL → base_url пустой
+    (валидация будет на верхнем уровне)."""
+    from shared.providers import load_providers_from_env
+
+    env = {
+        "CLOUD_PROVIDERS": "weirdai",
+        "WEIRDAI_API_KEY": "sk-weird",
+        "WEIRDAI_MODELS": "weird-model-1",
+    }
+    providers = load_providers_from_env(env_getter=env.get)
+    assert providers[0].name == "weirdai"
+    assert providers[0].base_url == ""  # неизвестный, дефолта нет
+
+
+def test_providers_unknown_provider_with_explicit_base_url():
+    """Неизвестный провайдер с явным base_url работает."""
+    from shared.providers import load_providers_from_env
+
+    env = {
+        "CLOUD_PROVIDERS": "myllm",
+        "MYLLM_API_KEY": "sk-my-key",
+        "MYLLM_BASE_URL": "https://api.myllm.example/v1",
+        "MYLLM_MODELS": "model-x,model-y",
+    }
+    providers = load_providers_from_env(env_getter=env.get)
+    assert providers[0].name == "myllm"
+    assert providers[0].base_url == "https://api.myllm.example/v1"
+    assert providers[0].models == ["model-x", "model-y"]
+
+
+def test_providers_skip_no_key():
+    """Провайдер без ключа загружается (для логирования), но key_present=False."""
+    from shared.providers import load_providers_from_env
+
+    env = {
+        "CLOUD_PROVIDERS": "openrouter,deepseek",
+        "OPENROUTER_API_KEY": "sk-or-v1-aaa",
+        "OPENROUTER_MODELS": "model-1",
+        # DEEPSEEK_API_KEY намеренно НЕ задан
+        "DEEPSEEK_MODELS": "deepseek-chat",
+    }
+    providers = load_providers_from_env(env_getter=env.get)
+    assert len(providers) == 2
+    assert providers[0].key_present is True
+    assert providers[1].key_present is False  # deepseek без ключа
+
+
+def test_providers_openrouter_models_fallback_to_preset():
+    """Если OPENROUTER_MODELS не задан — fallback на CLOUD_PRESET (back-compat)."""
+    from shared.providers import load_providers_from_env
+
+    env = {
+        "OPENROUTER_API_KEY": "sk-or-v1-test",
+        "CLOUD_PRESET": "B",
+        # OPENROUTER_MODELS не задан
+    }
+    providers = load_providers_from_env(env_getter=env.get)
+    assert providers[0].name == "openrouter"
+    assert len(providers[0].models) >= 1
+    # Preset B имеет qwen3-next в качестве primary
+    assert providers[0].models[0].startswith("qwen/qwen3-next")
+
+
+def test_openai_compatible_client_uses_custom_base_url():
+    """OpenAICompatibleClient постит на <base_url>/chat/completions,
+    а не на жёстко зашитый openrouter."""
+    import asyncio
+    import httpx
+    from shared.openrouter_client import OpenAICompatibleClient
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request):
+        captured["url"] = str(request.url)
+        captured["auth"] = request.headers.get("Authorization")
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "OK"}}],
+        })
+
+    client = OpenAICompatibleClient(
+        "sk-deepseek-token-xxxxxxxx1234",
+        base_url="https://api.deepseek.com/v1",
+        provider_name="deepseek",
+        transport=httpx.MockTransport(handler),
+    )
+    content = asyncio.run(client._post_chat(
+        [{"role": "user", "content": "hi"}],
+        "deepseek-chat",
+        temperature=0.0, max_tokens=32,
+    ))
+    assert content == "OK"
+    assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert captured["auth"] == "Bearer sk-deepseek-token-xxxxxxxx1234"
+
+
+def test_openai_compatible_client_extra_headers():
+    """extra_headers (например HTTP-Referer) попадают в HTTP-запрос."""
+    import asyncio
+    import httpx
+    from shared.openrouter_client import OpenAICompatibleClient
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request):
+        captured["referer"] = request.headers.get("HTTP-Referer")
+        captured["title"] = request.headers.get("X-Title")
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "OK"}}],
+        })
+
+    client = OpenAICompatibleClient(
+        "sk-or-v1-test",
+        base_url="https://openrouter.ai/api/v1",
+        extra_headers={"HTTP-Referer": "http://my-app", "X-Title": "MyApp"},
+        provider_name="openrouter",
+        transport=httpx.MockTransport(handler),
+    )
+    asyncio.run(client._post_chat(
+        [{"role": "user", "content": "hi"}],
+        "openrouter/free",
+        temperature=0.0, max_tokens=32,
+    ))
+    assert captured["referer"] == "http://my-app"
+    assert captured["title"] == "MyApp"
+
+
+def test_openrouter_client_still_works_back_compat():
+    """OpenRouterClient (старый класс) продолжает работать как тонкая
+    обёртка над OpenAICompatibleClient."""
+    from shared.openrouter_client import OpenRouterClient, OpenAICompatibleClient
+
+    c = OpenRouterClient("sk-or-v1-test-token-1234567890")
+    assert isinstance(c, OpenAICompatibleClient)
+    assert c.base_url == "https://openrouter.ai/api/v1"
+    assert c.provider_name == "openrouter"
+    assert c.extra_headers.get("HTTP-Referer") == "http://localhost"
+    assert c.extra_headers.get("X-Title") == "AI LibreOffice Suggester"
+    # Back-compat атрибуты, на которые могут смотреть тесты/код
+    assert c.referer == "http://localhost"
+    assert c.title == "AI LibreOffice Suggester"
+
+
+def _load_cloud_with_env(monkeypatch, tmp_path, env_overrides: dict):
+    """Перезагружает cloud-модуль с заданным набором env-переменных."""
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("AUDIT_DB", str(tmp_path / "audit.sqlite"))
+    monkeypatch.setenv("RAG_ENABLED", "false")
+    monkeypatch.setenv("USER_DICT_ENABLED", "false")
+    # Сбрасываем все ранее существующие провайдер-енв до перезагрузки.
+    for k in list(os.environ.keys()):
+        if k.endswith("_API_KEY") or k.endswith("_MODELS") or k.endswith("_BASE_URL"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("CLOUD_PROVIDERS", raising=False)
+    for k, v in env_overrides.items():
+        monkeypatch.setenv(k, v)
+    for m in list(sys.modules):
+        if m.startswith(("shared", "main")):
+            sys.modules.pop(m, None)
+    cloud_dir = ROOT / "server" / "cloud"
+    sys.path.insert(0, str(cloud_dir))
+    try:
+        return importlib.import_module("main")
+    finally:
+        sys.path.remove(str(cloud_dir))
+
+
+def test_cloud_multi_provider_models_flattened(monkeypatch, tmp_path):
+    """Cloud с CLOUD_PROVIDERS=openrouter,deepseek — MODELS содержит
+    модели обоих провайдеров в правильном порядке."""
+    mod = _load_cloud_with_env(monkeypatch, tmp_path, {
+        "CLOUD_PROVIDERS": "openrouter,deepseek",
+        "OPENROUTER_API_KEY": "sk-or-v1-aaa",
+        "OPENROUTER_MODELS": "model-or-1,model-or-2",
+        "DEEPSEEK_API_KEY": "sk-ds-bbb",
+        "DEEPSEEK_MODELS": "deepseek-chat,deepseek-reasoner",
+    })
+    assert [p.name for p in mod.PROVIDERS] == ["openrouter", "deepseek"]
+    assert mod.MODELS == [
+        "model-or-1", "model-or-2", "deepseek-chat", "deepseek-reasoner",
+    ]
+    # Роутинг распределил модели по провайдерам корректно
+    assert mod._MODEL_ROUTING["model-or-1"][0].name == "openrouter"
+    assert mod._MODEL_ROUTING["deepseek-chat"][0].name == "deepseek"
+
+
+def test_cloud_multi_provider_fallback_across_providers(monkeypatch, tmp_path):
+    """Когда первый провайдер целиком 429-нулся, fallback уходит во
+    второго провайдера."""
+    import asyncio
+    import httpx
+
+    mod = _load_cloud_with_env(monkeypatch, tmp_path, {
+        "CLOUD_PROVIDERS": "openrouter,deepseek",
+        "OPENROUTER_API_KEY": "sk-or-v1-aaa",
+        "OPENROUTER_MODELS": "or-model-1,or-model-2",
+        "DEEPSEEK_API_KEY": "sk-ds-bbb",
+        "DEEPSEEK_MODELS": "deepseek-chat",
+    })
+
+    async def fake_call_model(messages, model):
+        if model.startswith("or-"):
+            request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+            response = httpx.Response(429, request=request, json={"error": {"message": "rate"}})
+            raise httpx.HTTPStatusError("429", request=request, response=response)
+        return "ANSWER FROM DEEPSEEK"
+
+    monkeypatch.setattr(mod, "call_model", fake_call_model)
+    content, used = asyncio.run(mod._chat_with_fallback([{"role": "user", "content": "hi"}]))
+    assert content == "ANSWER FROM DEEPSEEK"
+    assert used == "deepseek-chat"
+
+
+def test_cloud_metrics_exposes_providers(monkeypatch, tmp_path):
+    """/metrics показывает providers с base_url и моделями."""
+    from fastapi.testclient import TestClient
+
+    mod = _load_cloud_with_env(monkeypatch, tmp_path, {
+        "CLOUD_PROVIDERS": "openrouter,deepseek",
+        "OPENROUTER_API_KEY": "sk-or-v1-aaa",
+        "OPENROUTER_MODELS": "or-model-1",
+        "DEEPSEEK_API_KEY": "sk-ds-bbb",
+        "DEEPSEEK_MODELS": "deepseek-chat",
+    })
+    client = TestClient(mod.app)
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    data = r.json()
+    assert "providers" in data
+    names = [p["name"] for p in data["providers"]]
+    assert names == ["openrouter", "deepseek"]
+    assert data["providers"][1]["base_url"] == "https://api.deepseek.com/v1"
+    assert data["providers_configured"] == ["openrouter", "deepseek"]
+
+
+def test_cloud_no_providers_health_returns_clear_error(monkeypatch, tmp_path):
+    """Когда ни одного провайдера не настроено — /health и /test_api
+    возвращают понятную ошибку, а не падают."""
+    from fastapi.testclient import TestClient
+
+    mod = _load_cloud_with_env(monkeypatch, tmp_path, {
+        # ни одного <NAME>_API_KEY нет
+        "CLOUD_PROVIDERS": "openrouter,deepseek",
+    })
+    assert mod.PROVIDERS == []
+    assert mod.MODELS == []
+    client = TestClient(mod.app)
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert "не настроен" in r.text or "OPENROUTER_API_KEY" in r.text
