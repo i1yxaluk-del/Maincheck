@@ -2383,6 +2383,38 @@ def test_cloud_normalize_line_breaks_helper(cloud_module):
     assert fn("") == ""
 
 
+def test_cloud_postprocess_drops_eyo_substitutions(cloud_module, monkeypatch):
+    """v2.2-revisited: cloud-сервер должен сбрасывать ё↔е стилистические
+    правки в CHANGES и откатывать ё в CORRECTED по raw_text. SYSTEM_PROMPT
+    уже запрещает такие правки, но safe-filter закрывает lost-in-the-middle
+    bypass.
+    """
+    from fastapi.testclient import TestClient
+
+    async def fake_call_model(messages, model):
+        return (
+            "===CORRECTED===\n"
+            "проведёнными работами в третьем квартале\n"
+            "===CHANGES===\n"
+            "1. «проведенными» → «проведёнными» | расстановка буквы ё\n"
+            "2. «третьем» → «третьем» | проверка идемпотентности\n"
+            "===END==="
+        )
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    client = TestClient(cloud_module.app)
+    files = {
+        "text": ("t.txt", io.BytesIO("проведенными работами в третьем квартале".encode("utf-8")), "text/plain"),
+        "context": ("c.txt", io.BytesIO(b""), "text/plain"),
+    }
+    r = client.post("/suggest", files=files)
+    assert r.status_code == 200
+    # Пункт «проведенными → проведёнными» — ё-only подстановка, должна быть отфильтрована
+    assert "«проведенными» → «проведёнными»" not in r.text
+    # CORRECTED откатан к исходному написанию (ё → е по raw_text)
+    assert "проведенными" in r.text
+
+
 def test_cloud_postprocess_drops_not_in_text(cloud_module, monkeypatch):
     """Cloud-сервер дропает пункты, чей «было» отсутствует в raw_text
     (галлюцинации модели — как и local)."""

@@ -155,6 +155,18 @@ pip install -r requirements.txt
 - **C** — `google/gemma-4-31b-it:free` (multilingual, контекст 256K).
 - **D** — `nvidia/nemotron-3-super-120b-a12b:free` (сильный reasoning).
 
+Полный список моделей с fallback-цепочками для каждого preset —
+в коде: `server/shared/openrouter_client.py`, словарь `CLOUD_PRESETS`.
+Чтобы:
+- **поменять preset «навсегда» в коде** — отредактируйте `CLOUD_PRESETS`
+  и перезапустите cloud-сервер.
+- **поменять модели для конкретной установки без правки кода** —
+  пропишите в `server/cloud/.env`:
+  ```
+  OPENROUTER_MODELS=модель1,модель2,модель3
+  ```
+  CSV перебивает выбранный `CLOUD_PRESET`, модели пробуются по очереди.
+
 **Архитектура cloud (`v2.2`)** — сознательно упрощён по сравнению с
 локальным сервером. Сетевая модель сама справляется с орфографией,
 пунктуацией, согласованием, стилем и логикой, поэтому local-specific
