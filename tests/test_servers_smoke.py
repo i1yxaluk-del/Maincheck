@@ -2547,3 +2547,157 @@ def test_cloud_openrouter_client_key_redaction():
 
     c3 = OpenRouterClient("ваш_ключ_тут")
     assert c3.key_present is False  # placeholder
+
+
+# ─── v2.2.2: openrouter/free content=None и all-429 диагностика ───────
+
+
+def _openrouter_mock_client(handler):
+    """Создаёт OpenRouterClient с MockTransport для unit-тестов клиента."""
+    import httpx
+    from shared.openrouter_client import OpenRouterClient
+
+    return OpenRouterClient(
+        "sk-or-v1-test-token-do-not-use",
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def test_openrouter_post_chat_content_none_raises_softfail():
+    """Регрессия: openrouter/free auto-router иногда отдаёт 200 OK
+    + content=None. До v2.2.2 это валилось AttributeError 'NoneType'
+    .strip(). Теперь должен подняться OpenRouterError (soft-fail),
+    чтобы fallback ушёл на следующую модель."""
+    import asyncio
+    import httpx
+    from shared.openrouter_client import OpenRouterError
+
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None}}],
+        })
+
+    client = _openrouter_mock_client(handler)
+    with pytest.raises(OpenRouterError) as excinfo:
+        asyncio.run(client._post_chat(
+            [{"role": "user", "content": "hi"}],
+            "openrouter/free",
+            temperature=0.0, max_tokens=32,
+        ))
+    assert "content=None" in str(excinfo.value)
+    # AttributeError больше не утекает
+    assert "NoneType" not in str(excinfo.value)
+
+
+def test_openrouter_post_chat_error_in_body_raises_softfail():
+    """200 OK + error в теле (рейтлимит провайдера, content-policy) — soft-fail."""
+    import asyncio
+    import httpx
+    from shared.openrouter_client import OpenRouterError
+
+    def handler(request):
+        return httpx.Response(200, json={
+            "error": {"message": "rate limited by upstream", "code": 429},
+        })
+
+    client = _openrouter_mock_client(handler)
+    with pytest.raises(OpenRouterError) as excinfo:
+        asyncio.run(client._post_chat(
+            [{"role": "user", "content": "hi"}],
+            "openrouter/free",
+            temperature=0.0, max_tokens=32,
+        ))
+    assert "error" in str(excinfo.value).lower()
+    assert "rate limited" in str(excinfo.value)
+
+
+def test_openrouter_post_chat_empty_choices_raises_softfail():
+    """200 OK + пустой choices — soft-fail."""
+    import asyncio
+    import httpx
+    from shared.openrouter_client import OpenRouterError
+
+    def handler(request):
+        return httpx.Response(200, json={"choices": []})
+
+    client = _openrouter_mock_client(handler)
+    with pytest.raises(OpenRouterError):
+        asyncio.run(client._post_chat(
+            [{"role": "user", "content": "hi"}],
+            "model-x",
+            temperature=0.0, max_tokens=32,
+        ))
+
+
+def test_openrouter_chat_all_429_returns_friendly_quota_message():
+    """Когда ВСЕ модели возвращают HTTP 429, должно подняться
+    OpenRouterError с понятным сообщением про исчерпанную квоту."""
+    import asyncio
+    import httpx
+    from shared.openrouter_client import OpenRouterError
+
+    def handler(request):
+        return httpx.Response(429, json={"error": {"message": "Too Many Requests"}})
+
+    client = _openrouter_mock_client(handler)
+    with pytest.raises(OpenRouterError) as excinfo:
+        asyncio.run(client.chat(
+            [{"role": "user", "content": "hi"}],
+            ["m1:free", "m2:free", "m3:free"],
+            temperature=0.0, max_tokens=32,
+        ))
+    msg = str(excinfo.value)
+    assert "429" in msg or "исчерпан" in msg
+    assert "квот" in msg
+    assert "OPENROUTER_MODELS" in msg
+
+
+def test_openrouter_chat_fallback_skips_content_none_to_next():
+    """Если первая модель отдала content=None, переходим к следующей,
+    которая возвращает нормальный ответ."""
+    import asyncio
+    import httpx
+
+    state = {"calls": 0}
+
+    def handler(request):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return httpx.Response(200, json={"choices": [{"message": {"content": None}}]})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "OK"}}],
+        })
+
+    client = _openrouter_mock_client(handler)
+    content, used = asyncio.run(client.chat(
+        [{"role": "user", "content": "hi"}],
+        ["openrouter/free", "qwen/qwen3-next-80b-a3b-instruct:free"],
+        temperature=0.0, max_tokens=32,
+    ))
+    assert content == "OK"
+    assert used == "qwen/qwen3-next-80b-a3b-instruct:free"
+    assert state["calls"] == 2
+
+
+def test_cloud_chat_with_fallback_quota_exhausted_friendly_error(cloud_module, monkeypatch):
+    """`_chat_with_fallback` в cloud/main.py отдаёт понятную ошибку,
+    когда все MODELS вернули 429."""
+    import asyncio
+    import httpx
+    from shared.openrouter_client import OpenRouterError
+
+    async def fake_call_model(messages, model):
+        request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+        response = httpx.Response(429, request=request, json={
+            "error": {"message": "Rate limit exceeded"},
+        })
+        raise httpx.HTTPStatusError("429", request=request, response=response)
+
+    monkeypatch.setattr(cloud_module, "call_model", fake_call_model)
+    monkeypatch.setattr(cloud_module, "MODELS", ["m1:free", "m2:free", "m3:free"])
+    with pytest.raises(OpenRouterError) as excinfo:
+        asyncio.run(cloud_module._chat_with_fallback([{"role": "user", "content": "hi"}]))
+    msg = str(excinfo.value)
+    assert "429" in msg
+    assert "квот" in msg
+    assert "OPENROUTER_MODELS" in msg

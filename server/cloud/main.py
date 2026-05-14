@@ -295,6 +295,7 @@ async def _chat_with_fallback(messages: list) -> tuple[str, str]:
     мокировать одну точку входа.
     """
     last_err = "нет ответа"
+    statuses: list[int | None] = []
     for model in MODELS:
         try:
             content = await call_model(messages, model)
@@ -304,17 +305,36 @@ async def _chat_with_fallback(messages: list) -> tuple[str, str]:
             last_err = f"[{model}] HTTP {status}: {e.response.text[:160]}"
             if status in (429, 502, 503, 504):
                 logger.info("OpenRouter: %s -> HTTP %d, пробую следующую", model, status)
+                statuses.append(status)
                 continue
             logger.warning("OpenRouter: %s -> HTTP %d (не retry)", model, status)
             raise OpenRouterError(last_err) from e
         except (httpx.TimeoutException, httpx.NetworkError) as e:
             last_err = f"[{model}] {type(e).__name__}: {str(e)[:120]}"
             logger.info("OpenRouter: %s timeout/network, пробую следующую", model)
+            statuses.append(None)
+            continue
+        except OpenRouterError as e:
+            # 200 OK + content=None / error в теле / неверный формат —
+            # soft-fail, без traceback в лог.
+            last_err = f"[{model}] {e}"
+            logger.info("OpenRouter: %s soft-fail: %s", model, str(e)[:160])
+            statuses.append(None)
             continue
         except Exception as e:  # noqa: BLE001
             last_err = f"[{model}] {type(e).__name__}: {str(e)[:160]}"
             logger.exception("OpenRouter: непредвиденная ошибка на %s", model)
+            statuses.append(None)
             continue
+    if statuses and all(s == 429 for s in statuses):
+        raise OpenRouterError(
+            "Все модели OpenRouter вернули HTTP 429 (исчерпана дневная квота "
+            "free-tier OpenRouter). Варианты: (1) пополнить баланс OpenRouter "
+            "на $10 — это открывает 1000 запросов/день по всем :free моделям, "
+            "(2) подождать 24 часа (квота обновляется), (3) в server/cloud/.env "
+            "прописать OPENROUTER_MODELS=... с платной моделью (например "
+            "meta-llama/llama-3.3-70b-instruct без суффикса :free)."
+        )
     raise OpenRouterError(f"Все модели недоступны. Последняя ошибка: {last_err}")
 
 
