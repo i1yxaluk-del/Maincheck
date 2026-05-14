@@ -111,13 +111,42 @@ class OpenRouterClient:
             )
             r.raise_for_status()
             data = r.json()
-            try:
-                return data["choices"][0]["message"]["content"].strip()
-            except (KeyError, IndexError, TypeError) as exc:
+            # OpenRouter иногда возвращает HTTP 200 + error в теле (рейтлимит
+            # провайдера, недоступный маршрут, content-policy). Это soft-
+            # fail — верхний уровень должен уйти на следующую модель.
+            if isinstance(data, dict) and data.get("error"):
+                err = data["error"]
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
                 raise OpenRouterError(
-                    f"OpenRouter: неожиданный формат ответа от {model}: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{model}: 200 OK + error в теле: {str(msg)[:200]}"
+                )
+            try:
+                choices = data["choices"]
+            except (KeyError, TypeError) as exc:
+                raise OpenRouterError(
+                    f"{model}: ответ без поля 'choices'"
                 ) from exc
+            if not choices:
+                raise OpenRouterError(f"{model}: пустой 'choices'")
+            first = choices[0] if isinstance(choices[0], dict) else None
+            message = first.get("message") if first else None
+            if not isinstance(message, dict):
+                raise OpenRouterError(f"{model}: нет 'message' в choices[0]")
+            content = message.get("content")
+            # Ключевой фикс: openrouter/free auto-router иногда отвечает
+            # content=None (например, выбрал модель под rate-limit). До
+            # фикса это приводило к AttributeError в _chat_with_fallback.
+            if content is None:
+                raise OpenRouterError(
+                    f"{model}: content=None (модель ничего не сгенерировала, "
+                    "вероятно rate-limit на стороне провайдера)"
+                )
+            if not isinstance(content, str):
+                raise OpenRouterError(
+                    f"{model}: content неожиданного типа "
+                    f"{type(content).__name__}"
+                )
+            return content.strip()
 
     async def chat(
         self,
@@ -141,6 +170,7 @@ class OpenRouterClient:
             raise OpenRouterError("Список моделей пуст")
 
         last_err: str = ""
+        statuses: list[Optional[int]] = []
         for model in models:
             try:
                 content = await self._post_chat(
@@ -158,6 +188,7 @@ class OpenRouterClient:
                         "OpenRouter: %s вернул HTTP %d, пробую следующую модель",
                         model, status,
                     )
+                    statuses.append(status)
                     continue
                 # 4xx (auth, неверный модель-id) — нет смысла перебирать дальше
                 logger.warning("OpenRouter: %s вернул HTTP %d (не retry-able)", model, status)
@@ -165,15 +196,30 @@ class OpenRouterClient:
             except (httpx.TimeoutException, httpx.NetworkError) as e:
                 last_err = f"[{model}] {type(e).__name__}: {str(e)[:160]}"
                 logger.info("OpenRouter: %s timeout/network, пробую следующую модель", model)
+                statuses.append(None)
                 continue
-            except OpenRouterError:
-                # неверный формат ответа — пробуем следующую модель
-                last_err = f"[{model}] неверный формат ответа"
+            except OpenRouterError as e:
+                # неверный формат / content=None / 200 OK + error в теле —
+                # soft fail, пробуем следующую модель.
+                last_err = f"[{model}] {e}"
+                logger.info("OpenRouter: %s soft-fail, пробую следующую: %s", model, str(e)[:120])
+                statuses.append(None)
                 continue
             except Exception as e:  # noqa: BLE001
                 last_err = f"[{model}] {type(e).__name__}: {str(e)[:160]}"
                 logger.exception("OpenRouter: непредвиденная ошибка на %s", model)
+                statuses.append(None)
                 continue
+        # Если все модели вернули 429 — это исчерпание квоты free-tier.
+        if statuses and all(s == 429 for s in statuses):
+            raise OpenRouterError(
+                "Все модели OpenRouter вернули HTTP 429 (исчерпана дневная "
+                "квота free-tier). Варианты: (1) пополнить баланс OpenRouter "
+                "на $10 — это открывает 1000 запросов/день по всем :free моделям, "
+                "(2) подождать 24 часа (квота обновляется), (3) в server/cloud/.env "
+                "прописать OPENROUTER_MODELS=... с платной моделью (например "
+                "meta-llama/llama-3.3-70b-instruct без суффикса :free)."
+            )
         raise OpenRouterError(f"Все модели недоступны. Последняя ошибка: {last_err}")
 
     async def probe(self, model: str) -> str:
