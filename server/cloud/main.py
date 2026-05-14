@@ -51,9 +51,14 @@ from shared.audit import AuditStore, Timer, count_changes  # noqa: E402
 from shared.logging_setup import setup_logger  # noqa: E402
 from shared.openrouter_client import (  # noqa: E402
     CLOUD_PRESETS,
+    OpenAICompatibleClient,
+    OpenAIError,
     OpenRouterClient,
     OpenRouterError,
-    resolve_models,
+)
+from shared.providers import (  # noqa: E402
+    ProviderConfig,
+    load_providers_from_env,
 )
 from shared.postprocess import (  # noqa: E402
     _drop_changes_not_in_text,
@@ -68,24 +73,52 @@ from shared.postprocess import (  # noqa: E402
 load_dotenv()
 
 
-# ─── OpenRouter ───────────────────────────────────────────────────────
+# ─── Multi-provider конфиг (v2.2.3+) ──────────────────────────────────
+#
+# `CLOUD_PROVIDERS=openrouter,deepseek,fireworks` в .env — список
+# OpenAI-compatible провайдеров для перебора. Для каждого — отдельные
+# env-переменные <NAME>_API_KEY, <NAME>_BASE_URL (опц.), <NAME>_MODELS.
+# Если CLOUD_PROVIDERS не задан — дефолт `openrouter` (back-compat).
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", "90"))
 OPENROUTER_TEMPERATURE = float(os.getenv("OPENROUTER_TEMPERATURE", "0.1"))
 OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "3000"))
-OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "http://localhost")
-OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "AI LibreOffice Suggester")
 
-# CLOUD_PRESET выбирает primary-модель + дефолтный fallback-список.
-# OPENROUTER_MODELS (CSV) перебивает preset, если задан.
+# CLOUD_PRESET (A/B/C/D) — fallback для openrouter, если не задан OPENROUTER_MODELS.
 CLOUD_PRESET = os.getenv("CLOUD_PRESET", "A").strip().upper()
 if CLOUD_PRESET not in CLOUD_PRESETS:
     CLOUD_PRESET = "A"
-_override_models = [
-    s.strip() for s in os.getenv("OPENROUTER_MODELS", "").split(",") if s.strip()
+
+_RAW_PROVIDERS: list[ProviderConfig] = load_providers_from_env()
+
+# Только провайдеры с заполненным ключом и непустым списком моделей.
+PROVIDERS: list[ProviderConfig] = [
+    p for p in _RAW_PROVIDERS if p.key_present and p.models
 ]
-MODELS = resolve_models(CLOUD_PRESET, _override_models or None)
+
+# Плоский список моделей в порядке (provider1.models, provider2.models, ...).
+# Используется в `_chat_with_fallback` для последовательного перебора.
+MODELS: list[str] = [m for p in PROVIDERS for m in p.models]
+
+# Роутинг: model_id → (provider, client). Первая регистрация выигрывает,
+# поэтому порядок CLOUD_PROVIDERS определяет какой провайдер выберется,
+# если модель с одним именем настроена в нескольких провайдерах.
+_PROVIDER_CLIENTS: dict[str, OpenAICompatibleClient] = {}
+_MODEL_ROUTING: dict[str, tuple[ProviderConfig, OpenAICompatibleClient]] = {}
+for _p in PROVIDERS:
+    _client = _p.build_client(timeout=OPENROUTER_TIMEOUT)
+    _PROVIDER_CLIENTS[_p.name] = _client
+    for _m in _p.models:
+        if _m not in _MODEL_ROUTING:
+            _MODEL_ROUTING[_m] = (_p, _client)
+
+# Back-compat: первый openrouter-клиент (или просто первый, если openrouter
+# не настроен). Используется только для `/test_api`, `_key_missing` и старыми
+# тестами через `cloud_module.or_client`.
+_first_or = next((c for n, c in _PROVIDER_CLIENTS.items() if n.lower() == "openrouter"), None)
+or_client = _first_or or next(iter(_PROVIDER_CLIENTS.values()), None) or OpenRouterClient(
+    api_key="",
+)
 
 
 # ─── RAG (опционально, RAG_ENABLED=true) ──────────────────────────────
@@ -109,18 +142,22 @@ USER_DICT_ENABLED = os.getenv("USER_DICT_ENABLED", "true").lower() in ("1", "tru
 logger = setup_logger("ai_suggester.cloud")
 audit = AuditStore()
 
-or_client = OpenRouterClient(
-    api_key=OPENROUTER_API_KEY,
-    referer=OPENROUTER_REFERER,
-    title=OPENROUTER_TITLE,
-    timeout=OPENROUTER_TIMEOUT,
-)
-
 logger.info(
-    "Cloud server v2.2 starting: preset=%s primary=%s fallback=%d models",
-    CLOUD_PRESET, MODELS[0] if MODELS else "(none)", max(len(MODELS) - 1, 0),
+    "Cloud server v2.2.3 starting: providers=%s total_models=%d",
+    [p.name for p in PROVIDERS] or "(none configured)", len(MODELS),
 )
-logger.info("Key: %s, key_present=%s", or_client.key_redacted, or_client.key_present)
+for _p in _RAW_PROVIDERS:
+    if not _p.key_present:
+        logger.warning("Provider %s: ключ не задан — провайдер пропущен", _p.name)
+        continue
+    if not _p.models:
+        logger.warning("Provider %s: список моделей пуст — провайдер пропущен", _p.name)
+        continue
+    _c = _PROVIDER_CLIENTS[_p.name]
+    logger.info(
+        "Provider %s: key=%s, base_url=%s, models=%d (primary=%s)",
+        _p.name, _c.key_redacted, _p.base_url, len(_p.models), _p.models[0],
+    )
 
 
 # ─── Lazy singletons ──────────────────────────────────────────────────
@@ -270,7 +307,27 @@ def _normalize_line_breaks(text: str) -> str:
 
 
 def _key_missing() -> bool:
-    return not or_client.key_present
+    """True, если ни один провайдер не настроен (нет ни одного валидного ключа)."""
+    return not PROVIDERS
+
+
+def _client_for_model(model: str) -> tuple[ProviderConfig, OpenAICompatibleClient]:
+    """Находит провайдера и клиент для конкретной модели.
+
+    Если модель не зарегистрирована ни в одном провайдере — фоллбек на
+    `or_client` (back-compat: тесты, мокирующие `call_model`, могут
+    подсунуть произвольную модель).
+    """
+    entry = _MODEL_ROUTING.get(model)
+    if entry:
+        return entry
+    # Back-compat: модель не из конфигурации (например, тестовая) —
+    # используем openrouter-клиент по умолчанию.
+    fallback = PROVIDERS[0] if PROVIDERS else ProviderConfig(
+        name="openrouter", base_url="https://openrouter.ai/api/v1",
+        api_key="", models=[],
+    )
+    return fallback, or_client
 
 
 async def call_model(messages: list, model: str) -> str:
@@ -279,8 +336,13 @@ async def call_model(messages: list, model: str) -> str:
     Бросает `httpx.HTTPStatusError` на 4xx/5xx, чтобы верхний уровень мог
     решить, переходить ли к следующей модели по fallback-цепочке. Тесты
     подменяют эту функцию для мокирования.
+
+    Роутинг провайдера — по `_MODEL_ROUTING`, заполненному из
+    `CLOUD_PROVIDERS`. Если модель не привязана к провайдеру, используется
+    `or_client` (back-compat).
     """
-    return await or_client._post_chat(
+    _, client = _client_for_model(model)
+    return await client._post_chat(
         messages, model,
         temperature=OPENROUTER_TEMPERATURE,
         max_tokens=OPENROUTER_MAX_TOKENS,
@@ -291,49 +353,57 @@ async def _chat_with_fallback(messages: list) -> tuple[str, str]:
     """Перебирает MODELS до первого успешного ответа. Возвращает
     (content, used_model). На полном фейле — поднимает OpenRouterError.
 
-    Использует `call_model` для каждой попытки — это позволяет тестам
-    мокировать одну точку входа.
+    Multi-provider: MODELS — плоский список из всех настроенных
+    провайдеров. Каждая модель роутится через `_MODEL_ROUTING` в
+    соответствующий клиент. Использует `call_model` для каждой попытки —
+    это позволяет тестам мокировать одну точку входа.
     """
     last_err = "нет ответа"
     statuses: list[int | None] = []
     for model in MODELS:
+        provider, _ = _client_for_model(model)
+        prefix = f"{provider.name}/{model}"
         try:
             content = await call_model(messages, model)
             return content, model
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            last_err = f"[{model}] HTTP {status}: {e.response.text[:160]}"
+            last_err = f"[{prefix}] HTTP {status}: {e.response.text[:160]}"
             if status in (429, 502, 503, 504):
-                logger.info("OpenRouter: %s -> HTTP %d, пробую следующую", model, status)
+                logger.info("%s: HTTP %d, пробую следующую", prefix, status)
                 statuses.append(status)
                 continue
-            logger.warning("OpenRouter: %s -> HTTP %d (не retry)", model, status)
+            logger.warning("%s: HTTP %d (не retry)", prefix, status)
             raise OpenRouterError(last_err) from e
         except (httpx.TimeoutException, httpx.NetworkError) as e:
-            last_err = f"[{model}] {type(e).__name__}: {str(e)[:120]}"
-            logger.info("OpenRouter: %s timeout/network, пробую следующую", model)
+            last_err = f"[{prefix}] {type(e).__name__}: {str(e)[:120]}"
+            logger.info("%s: timeout/network, пробую следующую", prefix)
             statuses.append(None)
             continue
         except OpenRouterError as e:
             # 200 OK + content=None / error в теле / неверный формат —
             # soft-fail, без traceback в лог.
-            last_err = f"[{model}] {e}"
-            logger.info("OpenRouter: %s soft-fail: %s", model, str(e)[:160])
+            last_err = f"[{prefix}] {e}"
+            logger.info("%s: soft-fail: %s", prefix, str(e)[:160])
             statuses.append(None)
             continue
         except Exception as e:  # noqa: BLE001
-            last_err = f"[{model}] {type(e).__name__}: {str(e)[:160]}"
-            logger.exception("OpenRouter: непредвиденная ошибка на %s", model)
+            last_err = f"[{prefix}] {type(e).__name__}: {str(e)[:160]}"
+            logger.exception("%s: непредвиденная ошибка", prefix)
             statuses.append(None)
             continue
     if statuses and all(s == 429 for s in statuses):
+        provider_names = ", ".join(p.name for p in PROVIDERS) or "openrouter"
         raise OpenRouterError(
-            "Все модели OpenRouter вернули HTTP 429 (исчерпана дневная квота "
-            "free-tier OpenRouter). Варианты: (1) пополнить баланс OpenRouter "
-            "на $10 — это открывает 1000 запросов/день по всем :free моделям, "
-            "(2) подождать 24 часа (квота обновляется), (3) в server/cloud/.env "
-            "прописать OPENROUTER_MODELS=... с платной моделью (например "
-            "meta-llama/llama-3.3-70b-instruct без суффикса :free)."
+            f"Все модели всех провайдеров ({provider_names}) вернули HTTP 429 "
+            "(исчерпана дневная квота на всех настроенных провайдерах). Варианты: "
+            "(1) пополнить баланс на одном из провайдеров (для OpenRouter — $10 "
+            "даёт 1000 запросов/день по всем :free моделям), "
+            "(2) подождать 24 часа (квоты обновляются), "
+            "(3) в server/cloud/.env добавить ещё одного провайдера в "
+            "CLOUD_PROVIDERS=openrouter,deepseek,fireworks,... и указать для него "
+            "<NAME>_API_KEY + <NAME>_MODELS — fallback автоматически переключится "
+            "на резервного провайдера."
         )
     raise OpenRouterError(f"Все модели недоступны. Последняя ошибка: {last_err}")
 
@@ -370,10 +440,16 @@ def _rag_context(text: str) -> str:
 @app.get("/health", response_class=PlainTextResponse)
 async def health():
     if _key_missing():
-        return "ОШИБКА: OPENROUTER_API_KEY не задан в .env"
+        return (
+            "ОШИБКА: ни один провайдер не настроен. Задайте хотя бы "
+            "OPENROUTER_API_KEY + OPENROUTER_MODELS в server/cloud/.env, "
+            "либо CLOUD_PROVIDERS=... с другими провайдерами."
+        )
     probe_msgs = [{"role": "user", "content": "Ответь одним словом: OK"}]
     last_err = "нет ответа"
     for model in MODELS:
+        provider, _ = _client_for_model(model)
+        prefix = f"{provider.name}/{model}"
         try:
             ans = await call_model(probe_msgs, model)
             extras = []
@@ -382,12 +458,12 @@ async def health():
             if _user_dict is not None:
                 extras.append(f"Dict: {len(_user_dict.list_words())} слов")
             suffix = (" | " + " | ".join(extras)) if extras else ""
-            return f"OK | Работает: {model} | Ответ: {ans[:40]}{suffix}"
+            return f"OK | Работает: {prefix} | Ответ: {ans[:40]}{suffix}"
         except httpx.HTTPStatusError as e:
             last_err = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
             if e.response.status_code in (429, 502, 503, 504):
                 continue
-            return f"ОШИБКА HTTP на {model}: {last_err}"
+            return f"ОШИБКА HTTP на {prefix}: {last_err}"
         except Exception as e:
             last_err = f"{type(e).__name__}: {str(e)[:200]}"
             continue
@@ -397,20 +473,25 @@ async def health():
 @app.get("/test_api", response_class=PlainTextResponse)
 async def test_api():
     if _key_missing():
-        return "ОШИБКА: OPENROUTER_API_KEY не задан в .env"
-    lines = [
-        f"Ключ: {or_client.key_redacted}",
-        f"Preset: {CLOUD_PRESET} ({CLOUD_PRESETS[CLOUD_PRESET]['DESCRIPTION']})",
-        "",
-    ]
-    for model in MODELS:
-        try:
-            ans = await call_model(
-                [{"role": "user", "content": "Ответь одним словом: OK"}], model,
-            )
-            lines.append(f"[OK]   {model}\n       → {ans[:80]}")
-        except Exception as e:
-            lines.append(f"[FAIL] {model}\n       {str(e)[:160]}")
+        return (
+            "ОШИБКА: ни один провайдер не настроен. Задайте хотя бы "
+            "OPENROUTER_API_KEY + OPENROUTER_MODELS в server/cloud/.env."
+        )
+    lines: list[str] = []
+    for provider in PROVIDERS:
+        client = _PROVIDER_CLIENTS[provider.name]
+        header = f"Provider: {provider.name} | key={client.key_redacted} | base_url={provider.base_url}"
+        if provider.name.lower() == "openrouter":
+            header += f" | preset={CLOUD_PRESET}"
+        lines.append(header)
+        for model in provider.models:
+            try:
+                ans = await call_model(
+                    [{"role": "user", "content": "Ответь одним словом: OK"}], model,
+                )
+                lines.append(f"  [OK]   {model}\n         → {ans[:80]}")
+            except Exception as e:
+                lines.append(f"  [FAIL] {model}\n         {str(e)[:160]}")
         lines.append("")
     return "\n".join(lines)
 
@@ -419,10 +500,23 @@ async def test_api():
 async def metrics(hours: int = 24):
     return JSONResponse({
         "server": "cloud",
-        "version": "2.2.0",
+        "version": "2.2.3",
         "models": MODELS,
         "cloud_preset": CLOUD_PRESET,
         "cloud_preset_description": CLOUD_PRESETS[CLOUD_PRESET]["DESCRIPTION"],
+        "providers": [
+            {
+                "name": p.name,
+                "base_url": p.base_url,
+                "models": p.models,
+                "key_present": p.key_present,
+            }
+            for p in PROVIDERS
+        ],
+        "providers_configured": [p.name for p in PROVIDERS],
+        "providers_skipped": [
+            p.name for p in _RAW_PROVIDERS if not (p.key_present and p.models)
+        ],
         "rag_enabled": RAG_ENABLED,
         "rag_documents": len(_rag_store.docs) if _rag_store else 0,
         "rag_chunks": len(_rag_store.entries) if _rag_store else 0,

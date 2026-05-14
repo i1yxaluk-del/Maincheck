@@ -167,6 +167,69 @@ pip install -r requirements.txt
   ```
   CSV перебивает выбранный `CLOUD_PRESET`, модели пробуются по очереди.
 
+### Multi-provider (`v2.2.3+`)
+
+С v2.2.3 cloud-сервер поддерживает **любые OpenAI-compatible
+провайдеры**, не только OpenRouter. Это даёт два важных свойства:
+
+1. **Резервный провайдер на случай 429** — если у OpenRouter
+   закончилась free-квота, сервер автоматически переключится на
+   DeepSeek/Fireworks/любой другой провайдер из списка.
+2. **Удобство смены поставщика** — модели и base URL описаны в
+   `.env`, код менять не нужно.
+
+Схема `server/cloud/.env`:
+
+```env
+# Порядок перебора (по очереди).
+CLOUD_PROVIDERS=openrouter,deepseek,fireworks
+
+# Для каждого провайдера три переменные:
+#   <NAME>_API_KEY    — обязательно
+#   <NAME>_BASE_URL   — опционально (есть дефолт для известных)
+#   <NAME>_MODELS     — CSV-список model id
+
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER_MODELS=openrouter/free,qwen/qwen3-next-80b-a3b-instruct:free
+
+DEEPSEEK_API_KEY=sk-deepseek-...
+DEEPSEEK_MODELS=deepseek-chat,deepseek-reasoner
+
+FIREWORKS_API_KEY=fw_...
+FIREWORKS_MODELS=accounts/fireworks/models/llama-v3p3-70b-instruct
+```
+
+**Известные провайдеры** (имя → дефолтный base_url, можно не
+указывать `<NAME>_BASE_URL`):
+
+| name        | base_url                                |
+|-------------|------------------------------------------|
+| `openrouter`| `https://openrouter.ai/api/v1`           |
+| `deepseek`  | `https://api.deepseek.com/v1`            |
+| `fireworks` | `https://api.fireworks.ai/inference/v1`  |
+| `groq`      | `https://api.groq.com/openai/v1`         |
+| `together`  | `https://api.together.xyz/v1`            |
+| `openai`    | `https://api.openai.com/v1`              |
+| `mistral`   | `https://api.mistral.ai/v1`              |
+
+Для **неизвестного** провайдера (любого OpenAI-compatible API) —
+обязательно укажите `<NAME>_BASE_URL`:
+
+```env
+CLOUD_PROVIDERS=openrouter,myllm
+MYLLM_API_KEY=sk-my-key
+MYLLM_BASE_URL=https://api.myllm.example/v1
+MYLLM_MODELS=model-x,model-y
+```
+
+Если провайдер без ключа или без моделей — он молча пропускается с
+предупреждением в лог. Если `CLOUD_PROVIDERS` не задан — дефолт
+`openrouter` (полная back-compat с v2.2.2).
+
+`GET /metrics` показывает список настроенных провайдеров, их
+base_url и модели. `GET /test_api` пингует все модели всех
+провайдеров. `GET /health` пытается ответить с любой модели.
+
 **Архитектура cloud (`v2.2`)** — сознательно упрощён по сравнению с
 локальным сервером. Сетевая модель сама справляется с орфографией,
 пунктуацией, согласованием, стилем и логикой, поэтому local-specific

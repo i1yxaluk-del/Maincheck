@@ -1,8 +1,9 @@
-"""HTTP-клиент OpenRouter с fallback-цепочкой моделей.
+"""HTTP-клиент для OpenAI-совместимых API с fallback-цепочкой моделей.
 
-Извлечён из `server/cloud/main.py` (v2.1) — раньше логика fallback'а жила
-прямо в `/suggest` и `/health`. Теперь это переиспользуемый клиент с
-chat-завершением, probe-методом и явным контролем retry-семантики.
+v2.2.3: обобщён `OpenRouterClient` → `OpenAICompatibleClient`. Любой
+OpenAI-compatible эндпоинт (`/chat/completions`) работает через этот
+клиент: OpenRouter, DeepSeek, Fireworks, Groq, Together, OpenAI, и т. д.
+`OpenRouterClient` остаётся как тонкая обёртка для back-compat.
 
 Поведение:
     - `chat(messages, models, ...)` — пробует список моделей по очереди.
@@ -12,13 +13,15 @@ chat-завершением, probe-методом и явным контроле
     - `probe(model)` — короткий запрос «Ответь одним словом: OK», для
       `/health` и `/test_api`.
 
-Конструктор:
-    api_key:   ключ OpenRouter (sk-or-v1-...)
-    referer:   `HTTP-Referer` header (для квот OpenRouter)
-    title:     `X-Title` header
-    timeout:   таймаут одного HTTP-запроса (сек)
-    transport: опциональный httpx.AsyncBaseTransport для unit-тестов
-               (мок без сети). По умолчанию — None.
+Конструктор `OpenAICompatibleClient`:
+    api_key:       Bearer-токен провайдера.
+    base_url:      URL без хвоста (например https://api.deepseek.com/v1).
+                   К нему будет добавлено `/chat/completions`.
+    extra_headers: дополнительные заголовки (например, HTTP-Referer
+                   и X-Title для OpenRouter).
+    provider_name: имя провайдера для логов (например, 'openrouter').
+    timeout:       таймаут одного HTTP-запроса (сек).
+    transport:     опциональный httpx.AsyncBaseTransport для unit-тестов.
 """
 from __future__ import annotations
 
@@ -35,26 +38,35 @@ logger = logging.getLogger(__name__)
 _RETRY_STATUSES = {429, 502, 503, 504}
 
 
-class OpenRouterError(Exception):
-    """Ошибка OpenRouter API: либо все модели отвалились, либо явный
-    HTTP-error (4xx, не 429), либо отсутствует ключ."""
+class OpenAIError(Exception):
+    """Ошибка OpenAI-compatible API: либо все модели отвалились, либо
+    явный HTTP-error (4xx, не 429), либо отсутствует ключ."""
 
 
-class OpenRouterClient:
-    """Async-клиент OpenRouter с fallback-цепочкой моделей."""
+# Back-compat alias — все существующие импорты `OpenRouterError`
+# продолжают работать. Новый код должен использовать OpenAIError.
+OpenRouterError = OpenAIError
+
+
+class OpenAICompatibleClient:
+    """Async-клиент для любого OpenAI-compatible эндпоинта."""
 
     def __init__(
         self,
         api_key: str,
         *,
-        referer: str = "http://localhost",
-        title: str = "AI LibreOffice Suggester",
+        base_url: str = "https://openrouter.ai/api/v1",
+        extra_headers: Optional[dict[str, str]] = None,
+        provider_name: str = "openai-compatible",
         timeout: float = 90.0,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ) -> None:
         self.api_key = (api_key or "").strip()
-        self.referer = referer
-        self.title = title
+        # base_url без хвостового слэша — `_chat_completions_url`
+        # добавит `/chat/completions` сам.
+        self.base_url = (base_url or "").rstrip("/")
+        self.extra_headers = dict(extra_headers or {})
+        self.provider_name = provider_name or "openai-compatible"
         self.timeout = timeout
         self._transport = transport
 
@@ -79,13 +91,17 @@ class OpenRouterClient:
 
     # ─── Core call ─────────────────────────────────────────────────
 
+    @property
+    def _chat_completions_url(self) -> str:
+        return f"{self.base_url}/chat/completions"
+
     def _headers(self) -> dict[str, str]:
-        return {
+        headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": self.referer,
-            "X-Title": self.title,
         }
+        headers.update(self.extra_headers)
+        return headers
 
     async def _post_chat(
         self,
@@ -100,7 +116,7 @@ class OpenRouterClient:
             timeout=self.timeout, transport=self._transport,
         ) as client:
             r = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
+                self._chat_completions_url,
                 headers=self._headers(),
                 json={
                     "model": model,
@@ -117,33 +133,33 @@ class OpenRouterClient:
             if isinstance(data, dict) and data.get("error"):
                 err = data["error"]
                 msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                raise OpenRouterError(
-                    f"{model}: 200 OK + error в теле: {str(msg)[:200]}"
+                raise OpenAIError(
+                    f"{self.provider_name}/{model}: 200 OK + error в теле: {str(msg)[:200]}"
                 )
             try:
                 choices = data["choices"]
             except (KeyError, TypeError) as exc:
-                raise OpenRouterError(
-                    f"{model}: ответ без поля 'choices'"
+                raise OpenAIError(
+                    f"{self.provider_name}/{model}: ответ без поля 'choices'"
                 ) from exc
             if not choices:
-                raise OpenRouterError(f"{model}: пустой 'choices'")
+                raise OpenAIError(f"{self.provider_name}/{model}: пустой 'choices'")
             first = choices[0] if isinstance(choices[0], dict) else None
             message = first.get("message") if first else None
             if not isinstance(message, dict):
-                raise OpenRouterError(f"{model}: нет 'message' в choices[0]")
+                raise OpenAIError(f"{self.provider_name}/{model}: нет 'message' в choices[0]")
             content = message.get("content")
-            # Ключевой фикс: openrouter/free auto-router иногда отвечает
-            # content=None (например, выбрал модель под rate-limit). До
-            # фикса это приводило к AttributeError в _chat_with_fallback.
+            # Авто-роутеры (например openrouter/free) иногда отвечают
+            # content=None (выбрали модель под rate-limit). Без этой
+            # проверки это приводило к AttributeError на .strip().
             if content is None:
-                raise OpenRouterError(
-                    f"{model}: content=None (модель ничего не сгенерировала, "
-                    "вероятно rate-limit на стороне провайдера)"
+                raise OpenAIError(
+                    f"{self.provider_name}/{model}: content=None (модель ничего "
+                    "не сгенерировала, вероятно rate-limit на стороне провайдера)"
                 )
             if not isinstance(content, str):
-                raise OpenRouterError(
-                    f"{model}: content неожиданного типа "
+                raise OpenAIError(
+                    f"{self.provider_name}/{model}: content неожиданного типа "
                     f"{type(content).__name__}"
                 )
             return content.strip()
@@ -165,9 +181,9 @@ class OpenRouterClient:
         сразу, без перебора остальных моделей.
         """
         if not self.key_present:
-            raise OpenRouterError("OPENROUTER_API_KEY не задан")
+            raise OpenAIError(f"Ключ провайдера {self.provider_name} не задан")
         if not models:
-            raise OpenRouterError("Список моделей пуст")
+            raise OpenAIError("Список моделей пуст")
 
         last_err: str = ""
         statuses: list[Optional[int]] = []
@@ -177,50 +193,49 @@ class OpenRouterClient:
                     messages, model,
                     temperature=temperature, max_tokens=max_tokens,
                 )
-                logger.info("OpenRouter: %s ответил (%d символов)", model, len(content))
+                logger.info("%s: %s ответил (%d символов)", self.provider_name, model, len(content))
                 return content, model
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
                 body = e.response.text[:200]
-                last_err = f"[{model}] HTTP {status}: {body}"
+                last_err = f"[{self.provider_name}/{model}] HTTP {status}: {body}"
                 if status in _RETRY_STATUSES:
                     logger.info(
-                        "OpenRouter: %s вернул HTTP %d, пробую следующую модель",
-                        model, status,
+                        "%s: %s вернул HTTP %d, пробую следующую модель",
+                        self.provider_name, model, status,
                     )
                     statuses.append(status)
                     continue
                 # 4xx (auth, неверный модель-id) — нет смысла перебирать дальше
-                logger.warning("OpenRouter: %s вернул HTTP %d (не retry-able)", model, status)
-                raise OpenRouterError(last_err) from e
+                logger.warning("%s: %s вернул HTTP %d (не retry-able)", self.provider_name, model, status)
+                raise OpenAIError(last_err) from e
             except (httpx.TimeoutException, httpx.NetworkError) as e:
-                last_err = f"[{model}] {type(e).__name__}: {str(e)[:160]}"
-                logger.info("OpenRouter: %s timeout/network, пробую следующую модель", model)
+                last_err = f"[{self.provider_name}/{model}] {type(e).__name__}: {str(e)[:160]}"
+                logger.info("%s: %s timeout/network, пробую следующую модель", self.provider_name, model)
                 statuses.append(None)
                 continue
-            except OpenRouterError as e:
+            except OpenAIError as e:
                 # неверный формат / content=None / 200 OK + error в теле —
                 # soft fail, пробуем следующую модель.
-                last_err = f"[{model}] {e}"
-                logger.info("OpenRouter: %s soft-fail, пробую следующую: %s", model, str(e)[:120])
+                last_err = f"[{self.provider_name}/{model}] {e}"
+                logger.info("%s: %s soft-fail, пробую следующую: %s", self.provider_name, model, str(e)[:120])
                 statuses.append(None)
                 continue
             except Exception as e:  # noqa: BLE001
-                last_err = f"[{model}] {type(e).__name__}: {str(e)[:160]}"
-                logger.exception("OpenRouter: непредвиденная ошибка на %s", model)
+                last_err = f"[{self.provider_name}/{model}] {type(e).__name__}: {str(e)[:160]}"
+                logger.exception("%s: непредвиденная ошибка на %s", self.provider_name, model)
                 statuses.append(None)
                 continue
-        # Если все модели вернули 429 — это исчерпание квоты free-tier.
+        # Если все модели вернули 429 — это исчерпание квоты.
         if statuses and all(s == 429 for s in statuses):
-            raise OpenRouterError(
-                "Все модели OpenRouter вернули HTTP 429 (исчерпана дневная "
-                "квота free-tier). Варианты: (1) пополнить баланс OpenRouter "
-                "на $10 — это открывает 1000 запросов/день по всем :free моделям, "
-                "(2) подождать 24 часа (квота обновляется), (3) в server/cloud/.env "
-                "прописать OPENROUTER_MODELS=... с платной моделью (например "
-                "meta-llama/llama-3.3-70b-instruct без суффикса :free)."
+            raise OpenAIError(
+                f"Все модели провайдера {self.provider_name} вернули HTTP 429 "
+                "(исчерпана дневная квота). Варианты: (1) пополнить баланс "
+                "провайдера, (2) подождать 24 часа, (3) в server/cloud/.env "
+                "добавить второго провайдера (CLOUD_PROVIDERS=openrouter,deepseek,...) "
+                "или платные модели в список."
             )
-        raise OpenRouterError(f"Все модели недоступны. Последняя ошибка: {last_err}")
+        raise OpenAIError(f"Все модели {self.provider_name} недоступны. Последняя ошибка: {last_err}")
 
     async def probe(self, model: str) -> str:
         """Минимальный probe-запрос для /health и /test_api."""
@@ -231,6 +246,38 @@ class OpenRouterClient:
             max_tokens=32,
         )
         return content
+
+
+class OpenRouterClient(OpenAICompatibleClient):
+    """Back-compat: тонкая обёртка над OpenAICompatibleClient с
+    дефолтами для OpenRouter (base_url + HTTP-Referer + X-Title).
+
+    Сохранена для существующего кода и тестов. Новый код должен
+    использовать `OpenAICompatibleClient` напрямую или `ProviderConfig`
+    из `shared.providers`.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        referer: str = "http://localhost",
+        title: str = "AI LibreOffice Suggester",
+        timeout: float = 90.0,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+    ) -> None:
+        super().__init__(
+            api_key,
+            base_url="https://openrouter.ai/api/v1",
+            extra_headers={"HTTP-Referer": referer, "X-Title": title},
+            provider_name="openrouter",
+            timeout=timeout,
+            transport=transport,
+        )
+        # Сохраняем атрибуты для back-compat — тесты могут читать
+        # client.referer / client.title.
+        self.referer = referer
+        self.title = title
 
 
 # ─── Preset selection (cloud-side analog of LLM_PRESET) ───────────────
