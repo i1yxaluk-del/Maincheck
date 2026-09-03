@@ -188,13 +188,12 @@ async def decision_call_ollama(messages: list) -> str:
     return _render(corrected, accepted, secondary_edits)
 
 
-async def _startup_secondary_check() -> None:
-    if SECONDARY is None:
-        return
-    await SECONDARY.check_available()
-
-
 # Reuse the single existing FastAPI application/process.
 app = legacy.app
-app.add_event_handler("startup", _startup_secondary_check)
+
+if SECONDARY is not None:
+    @app.on_event("startup")
+    async def _startup_secondary_check() -> None:
+        await SECONDARY.check_available()
+
 legacy.call_ollama = decision_call_ollama
