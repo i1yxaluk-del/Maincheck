@@ -1,11 +1,15 @@
 # AI LibreOffice Suggester — локальный GEC-сервер
 
-Профиль `qwen3.5:4b` теперь работает через отдельный **DecisionEngine**. Это важнее простой смены модели: LLM больше не формирует финальный документ и список правок одновременно.
+Профиль `qwen3.5:4b` работает через существующий systemd-сервис `ai-suggester.service` и отдельный **DecisionEngine**. Мы не запускаем второй uvicorn поверх production-инстанса.
 
-## Архитектура
+## Production-архитектура
 
 ```text
-LibreOffice
+systemd ai-suggester.service
+   ↓
+uvicorn decision_app:app :8000
+   ↓
+существующий main.app / /suggest
    ↓
 retrieval / few-shot
    ↓
@@ -21,20 +25,73 @@ DecisionEngine
 server-generated CORRECTED + CHANGES
    ↓
 existing deterministic post-processing
+   ↓
+LibreOffice
 ```
+
+`decision_app:app` импортирует существующий `main.app` и подменяет только `call_ollama()`. Поэтому сохраняются существующие `/suggest`, `/health`, `/metrics`, `/dict/*`, аудит, retrieval и исторический LibreOffice protocol.
 
 Ollama поддерживает structured outputs через `format` с JSON Schema; это позволяет получать машинно проверяемые объекты вместо свободного `CORRECTED + CHANGES`.
 
 ## Qwen3.5-4B
 
-Официальный Ollama registry сейчас показывает `qwen3.5:4b` как Q4_K_M около 3.4 GB с native context 262,144 токена. Для CPU-профиля оставлены только 4096 токенов контекста и 512 токенов генерации — это сознательный latency/RAM trade-off.
+Официальный Ollama registry сейчас показывает `qwen3.5:4b` как Q4_K_M около 3.4 GB с native context 262,144 токена. Для CPU-профиля оставлены 4096 токенов контекста и 512 токенов генерации — это сознательный latency/RAM trade-off.
 
-## Как запустить
+## Production через systemd
+
+Рабочий сервер использует `EnvironmentFile`:
+
+```text
+WorkingDirectory=/home/service/llama/server/local
+EnvironmentFile=/home/service/llama/server/local/.env
+```
+
+Для Qwen-профиля `ExecStart` должен указывать на тот же единственный uvicorn-процесс, но на wrapper-модуль:
+
+```ini
+ExecStart=/home/service/llama/server/local/venv/bin/python3 -m uvicorn decision_app:app --host 0.0.0.0 --port 8000
+```
+
+Команды управления остаются системными:
 
 ```bash
-cp .env.qwen35.example .env
-./start-qwen35.sh
+sudo systemctl daemon-reload
+sudo systemctl restart ai-suggester.service
+sudo systemctl status ai-suggester.service
+journalctl -u ai-suggester.service -n 100 --no-pager
 ```
+
+`start-qwen35.sh` теперь не запускает `uvicorn`: он проверяет/скачивает модель и затем делает `sudo systemctl restart ai-suggester.service`. Это исключает конфликт за порт 8000.
+
+## Конфигурация `.env`
+
+```text
+MODEL_NAME=qwen3.5:4b
+NUM_THREADS=28
+OLLAMA_NUM_CTX=4096
+OLLAMA_NUM_PREDICT=512
+OLLAMA_TIMEOUT=300
+OLLAMA_WARMUP=true
+OLLAMA_KEEP_ALIVE=24h
+OLLAMA_THINK=false
+OLLAMA_TEMPERATURE=0
+DECISION_ENGINE_ENABLED=true
+DECISION_MIN_CONFIDENCE=0.55
+DECISION_MAX_CHANGES=40
+DECISION_MAX_BEFORE_CHARS=180
+```
+
+В Qwen-профиле сохранены существующие retrieval и пользовательский словарь:
+
+```text
+USE_FEW_SHOT=true
+GEC_TOP_K=1
+GEC_RETRIEVAL_MODE=hybrid
+GEC_EMBED_MODEL=bge-m3
+USER_DICT_ENABLED=true
+```
+
+`MORPH_FILTER_ENABLED=true` остаётся включён. `MORPH_DETECTOR_ENABLED=false` и `LANGUAGETOOL_ENABLED=false` в этом профиле выключены намеренно: они создают независимые правки после LLM и тем самым обходят DecisionEngine. Для A/B их можно включить отдельно.
 
 ## Почему 4B GEC
 
@@ -71,6 +128,7 @@ DecisionEngine отклоняет:
 
 - изменения ниже `DECISION_MIN_CONFIDENCE`;
 - `before`, которого нет в исходном тексте;
+- неоднозначный `before`, который встречается больше одного раза;
 - перекрывающиеся правки;
 - слишком длинные кандидаты;
 - изменения терминов из user dictionary;
@@ -79,24 +137,6 @@ DecisionEngine отклоняет:
 - больше `DECISION_MAX_CHANGES` правок.
 
 После этого сервер сам строит `CORRECTED` и `CHANGES`. Старый LibreOffice protocol при этом сохраняется.
-
-## Параметры CPU
-
-```text
-MODEL_NAME=qwen3.5:4b
-NUM_THREADS=28
-OLLAMA_NUM_CTX=4096
-OLLAMA_NUM_PREDICT=512
-OLLAMA_THINK=false
-OLLAMA_TEMPERATURE=0
-OLLAMA_KEEP_ALIVE=24h
-```
-
-Ollama предоставляет runtime-метрики `total_duration`, `load_duration`, `prompt_eval_count`, `eval_count` и длительности eval; следующим шагом benchmark должен выбирать оптимальное число CPU threads не теоретически, а измерением на конкретной VMware-гостевой системе.
-
-## Важное про маленькую GEC-модель
-
-Есть также отдельная Qwen3.5-0.8B GEC-модель для RU/KZ/EN в GGUF Q4_0 (~537 MB), рассчитанная на CPU и temperature 0; её заявленный training context — 2048 токенов. Она интересна как будущий дешёвый verifier, но в этом PR она не включена в основной путь, чтобы не добавлять второй LLM-запрос к каждому документу.
 
 ## A/B порядок
 
