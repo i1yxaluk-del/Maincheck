@@ -1,65 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE script:module PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "module.dtd">
 <script:module xmlns:script="http://openoffice.org/2000/script" script:name="Settings" script:language="StarBasic"><![CDATA[
-' ═══════════════════════════════════════════════════════════════════════════
-'  ⚠️  ЭТО АДМИНИСТРАТИВНЫЙ COMPILE-TIME КОНФИГ
-'
-'  Файл редактирует ТОЛЬКО администратор проекта, ОДИН РАЗ, ДО раздачи .oxt
-'  сотрудникам. После правки админ пересобирает AI_Suggester.oxt (см.
-'  docs/ADMIN_GUIDE.md) и отправляет готовый файл работникам.
-'
-'  СОТРУДНИК НИЧЕГО ЗДЕСЬ НЕ МЕНЯЕТ. У него на панели инструментов только
-'  одна кнопка — «AI: Улучшить текст». Весь адрес сервера, таймауты,
-'  режим Track Changes уже «зашиты» в значения функций ниже.
-' ═══════════════════════════════════════════════════════════════════════════
-
-' ── Адрес корпоративного сервера AI Suggester ──────────────────────────────
-'   Замените на ваш внутренний URL перед сборкой.
-'   Можно указать несколько через | (pipe) — макрос переберёт их по очереди
-'   при ошибке (основной → резервный).
-'   Примеры:
-'     GetServerList = "http://ai-gw.corp.local:8000/suggest"
-'     GetServerList = "http://ai-prime:8000/suggest|http://ai-backup:8000/suggest"
+' Административный compile-time конфиг AI Suggester.
+' Локальный профиль: Qwen3.5-9B + Ollama, CPU-only Broadwell/VMware.
 Public Function GetServerList() As String
     GetServerList = "http://localhost:8000/suggest"
 End Function
-
-' Адрес для /health (служебный диагностический макрос Health.AICheckServer).
-' Вычисляется автоматически из GetServerList, обычно менять не нужно.
 Public Function GetHealthList() As String
     GetHealthList = Replace(GetServerList(), "/suggest", "/health")
 End Function
-
-' ── Таймаут одного HTTP-запроса (секунды) ──────────────────────────────────
-'   Локальная t-tech/T-lite-it-2.1:q4_K_M (дефолт v1.5) отвечает 30–50 с
-'   после прогрева, без thinking-режима. На старых CPU (Broadwell/Ivy Bridge
-'   без AVX-512) — до 90 с. Если модель ещё не прогрета (первый запрос после
-'   рестарта Ollama), она грузится с диска ~10–30 с. Сервер с OLLAMA_WARMUP=true
-'   сам прогревает модель при старте, но если warmup пропущен — нужен запас.
-'   На сервере OLLAMA_TIMEOUT должен быть БОЛЬШЕ этого значения
-'   (по умолчанию 300), иначе клиент успеет отвалиться раньше.
 Public Function GetTimeout() As Integer
-    GetTimeout = 250
+    GetTimeout = 280
 End Function
-
-' ── Размер контекста (символы) перед/после выделения ───────────────────────
-'   2000 — компромисс между точностью стиля и нагрузкой на модель.
 Public Function GetContextSize() As Integer
-    GetContextSize = 2000
+    GetContextSize = 2500
 End Function
-
-' ── Применять исправления как отслеживаемые изменения (Track Changes) ──────
-'   True  — правки показываются зачёркнутыми/цветными, сотрудник принимает
-'           или отклоняет каждую через «Правка → Отслеживать изменения → Управление».
-'   False — текст заменяется напрямую (как было в v1.2), без истории.
-'   Настоятельно рекомендуется True.
 Public Function GetUseTrackChanges() As Boolean
     GetUseTrackChanges = True
 End Function
-
-' ── Максимальное число пунктов в диалоге правок (остальные обрезаются) ─────
 Public Function GetMaxChanges() As Integer
     GetMaxChanges = 60
 End Function
-
 ]]></script:module>
