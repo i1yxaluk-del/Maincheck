@@ -2,7 +2,7 @@
 <!DOCTYPE script:module PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "module.dtd">
 <script:module xmlns:script="http://openoffice.org/2000/script" script:name="Settings" script:language="StarBasic"><![CDATA[
 ' Административный compile-time конфиг AI Suggester.
-' Локальный профиль: Qwen3.5-9B + Ollama, CPU-only Broadwell/VMware.
+' Локальный профиль: Qwen3.5-4B GEC + DecisionEngine + Ollama, CPU-only Broadwell/VMware.
 Public Function GetServerList() As String
     GetServerList = "http://localhost:8000/suggest"
 End Function
@@ -10,7 +10,7 @@ Public Function GetHealthList() As String
     GetHealthList = Replace(GetServerList(), "/suggest", "/health")
 End Function
 Public Function GetTimeout() As Integer
-    GetTimeout = 280
+    GetTimeout = 220
 End Function
 Public Function GetContextSize() As Integer
     GetContextSize = 2500
@@ -19,6 +19,6 @@ Public Function GetUseTrackChanges() As Boolean
     GetUseTrackChanges = True
 End Function
 Public Function GetMaxChanges() As Integer
-    GetMaxChanges = 60
+    GetMaxChanges = 40
 End Function
 ]]></script:module>
