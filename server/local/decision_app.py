@@ -112,10 +112,16 @@ def _extract_text(messages: list[dict]) -> str:
 
 
 def _render(corrected: str, accepted, secondary_edits: list[SecondaryEdit]) -> str:
-    lines = [f"{i}. {c.before} → {c.after}" for i, c in enumerate(accepted, 1)]
+    # CHANGES is parsed later by the shared postprocess. Keep the structural
+    # form it expects; otherwise it may think the model forgot its report and
+    # reconstruct extra changes from a broad character diff.
+    lines = [
+        f"{i}. «{c.before}» → «{c.after}»"
+        for i, c in enumerate(accepted, 1)
+    ]
     start = len(lines) + 1
     lines.extend(
-        f"{i}. {e.before} → {e.after}"
+        f"{i}. «{e.before}» → «{e.after}»"
         for i, e in enumerate(secondary_edits, start)
     )
     changes = "\n".join(lines) if lines else "Ошибок не найдено."
