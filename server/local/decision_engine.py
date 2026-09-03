@@ -17,21 +17,10 @@ class EditCandidate:
 
 
 class DecisionEngine:
-    """Conservative merger between LLM edit candidates and deterministic guards.
+    """Conservative merger between LLM edit candidates and deterministic guards."""
 
-    The engine never asks a model to produce the final document. It validates
-    candidate edits against the original text, rejects overlaps and protected
-    terms, then applies accepted edits from right to left. The legacy server
-    can still render its ===CORRECTED===/===CHANGES=== protocol afterwards.
-    """
-
-    def __init__(
-        self,
-        min_confidence: float = 0.55,
-        max_changes: int = 40,
-        max_before_chars: int = 180,
-        protected_words: set[str] | None = None,
-    ) -> None:
+    def __init__(self, min_confidence: float = 0.55, max_changes: int = 40,
+                 max_before_chars: int = 180, protected_words: set[str] | None = None) -> None:
         self.min_confidence = min_confidence
         self.max_changes = max_changes
         self.max_before_chars = max_before_chars
@@ -39,14 +28,7 @@ class DecisionEngine:
 
     @staticmethod
     def parse(payload: str | dict[str, Any]) -> list[EditCandidate]:
-        if isinstance(payload, dict):
-            data = payload
-        else:
-            text = payload.strip()
-            # Be tolerant of accidental markdown fences despite JSON schema.
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S)
-            data = json.loads(text)
+        data = payload if isinstance(payload, dict) else json.loads(payload.strip().strip("`"))
         raw = data.get("edits", []) if isinstance(data, dict) else []
         if not isinstance(raw, list):
             return []
@@ -54,8 +36,7 @@ class DecisionEngine:
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            before = item.get("before")
-            after = item.get("after")
+            before, after = item.get("before"), item.get("after")
             if not isinstance(before, str) or not isinstance(after, str):
                 continue
             try:
@@ -63,18 +44,10 @@ class DecisionEngine:
             except (TypeError, ValueError):
                 confidence = 0.0
             out.append(EditCandidate(
-                before=before,
-                after=after,
-                confidence=max(0.0, min(1.0, confidence)),
-                category=str(item.get("category", "unknown")),
-                reason=str(item.get("reason", "")),
+                before, after, max(0.0, min(1.0, confidence)),
+                str(item.get("category", "unknown")), str(item.get("reason", "")),
             ))
         return out
-
-    @staticmethod
-    def _span(text: str, needle: str, start: int = 0) -> tuple[int, int] | None:
-        pos = text.find(needle, start)
-        return None if pos < 0 else (pos, pos + len(needle))
 
     def _protected(self, before: str) -> bool:
         if not self.protected_words:
@@ -82,55 +55,40 @@ class DecisionEngine:
         tokens = re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9_-]*", before)
         return any(t.casefold() in self.protected_words for t in tokens)
 
-    def validate(self, text: str, candidates: list[EditCandidate]) -> list[EditCandidate]:
-        accepted: list[EditCandidate] = []
+    def validate(self, text: str, candidates: list[EditCandidate]) -> list[tuple[int, EditCandidate]]:
+        accepted: list[tuple[int, EditCandidate]] = []
         occupied: list[tuple[int, int]] = []
-        cursor = 0
-        # Deterministic ordering makes identical requests reproducible.
-        ranked = sorted(candidates, key=lambda x: (-x.confidence, -len(x.before)))
-        for c in ranked:
-            if len(accepted) >= self.max_changes:
-                break
-            if not c.before or c.before == c.after:
+        for c in sorted(candidates, key=lambda x: (-x.confidence, -len(x.before))):
+            if len(accepted) >= self.max_changes or not c.before or c.before == c.after:
                 continue
             if len(c.before) > self.max_before_chars or c.confidence < self.min_confidence:
                 continue
-            # Pure ё/е substitutions are stylistic normalization, not GEC.
             if c.before.replace("ё", "е").replace("Ё", "Е") == c.after.replace("ё", "е").replace("Ё", "Е"):
                 continue
             if self._protected(c.before):
                 continue
-            span = self._span(text, c.before, cursor)
-            if span is None:
-                span = self._span(text, c.before)
-            if span is None:
+            # Ambiguous BEFORE text cannot be safely mapped to one occurrence.
+            positions = [m.start() for m in re.finditer(re.escape(c.before), text)]
+            if len(positions) != 1:
                 continue
-            if any(not (span[1] <= a or span[0] >= b) for a, b in occupied):
+            start, end = positions[0], positions[0] + len(c.before)
+            if any(not (end <= a or start >= b) for a, b in occupied):
                 continue
-            occupied.append(span)
-            accepted.append(c)
-            cursor = span[1]
-        return sorted(accepted, key=lambda x: text.find(x.before), reverse=True)
+            occupied.append((start, end))
+            accepted.append((start, c))
+        return sorted(accepted, key=lambda x: x[0], reverse=True)
 
     def apply(self, text: str, candidates: list[EditCandidate]) -> tuple[str, list[EditCandidate]]:
-        accepted = self.validate(text, candidates)
+        accepted_spans = self.validate(text, candidates)
         result = text
-        for c in accepted:
-            pos = result.find(c.before)
-            if pos >= 0:
-                result = result[:pos] + c.after + result[pos + len(c.before):]
-        return result, list(reversed(accepted))
+        for start, c in accepted_spans:
+            result = result[:start] + c.after + result[start + len(c.before):]
+        return result, [c for _, c in reversed(accepted_spans)]
 
     @staticmethod
     def diff_candidates(original: str, corrected: str) -> list[EditCandidate]:
         if original == corrected:
             return []
         sm = difflib.SequenceMatcher(a=original, b=corrected, autojunk=False)
-        out: list[EditCandidate] = []
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag == "equal":
-                continue
-            before, after = original[i1:i2], corrected[j1:j2]
-            if before or after:
-                out.append(EditCandidate(before, after, 1.0, "diff", "server diff"))
-        return out
+        return [EditCandidate(original[i1:i2], corrected[j1:j2], 1.0, "diff", "server diff")
+                for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal"]
