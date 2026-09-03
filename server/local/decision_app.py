@@ -54,11 +54,16 @@ TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "300"))
 TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
 KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "24h")
 THINK = os.getenv("OLLAMA_THINK", "false").lower() in ("1", "true", "yes", "on")
-SECONDARY = SecondaryGEC(
-    model=os.getenv("SECONDARY_GEC_MODEL", "hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0"),
-    timeout=float(os.getenv("SECONDARY_GEC_TIMEOUT", "90")),
-    keep_alive=os.getenv("SECONDARY_GEC_KEEP_ALIVE", "5m"),
-) if STACK["secondary"] else None
+SECONDARY = (
+    SecondaryGEC(
+        model=os.getenv("SECONDARY_GEC_MODEL", "hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0"),
+        timeout=float(os.getenv("SECONDARY_GEC_TIMEOUT", "90")),
+        keep_alive=os.getenv("SECONDARY_GEC_KEEP_ALIVE", "5m"),
+        max_edits=int(os.getenv("SECONDARY_GEC_MAX_EDITS", "4")),
+    )
+    if STACK["secondary"]
+    else None
+)
 
 SCHEMA = {
     "type": "object",
@@ -183,5 +188,13 @@ async def decision_call_ollama(messages: list) -> str:
     return _render(corrected, accepted, secondary_edits)
 
 
-legacy.call_ollama = decision_call_ollama
+async def _startup_secondary_check() -> None:
+    if SECONDARY is None:
+        return
+    await SECONDARY.check_available()
+
+
+# Reuse the single existing FastAPI application/process.
 app = legacy.app
+app.add_event_handler("startup", _startup_secondary_check)
+legacy.call_ollama = decision_call_ollama
