@@ -57,13 +57,15 @@ def merge_safe(primary: str, secondary: str, morph) -> tuple[str, list[Secondary
             continue
         before = primary[i1:i2]
         after = secondary[j1:j2]
-        if not before or not after:
-            continue
         before_words = _tokens(before)
         after_words = _tokens(after)
+        # Pure punctuation/spacing/capitalization, including insertion/deletion
+        # operations where one side is empty, because lexical tokens stay equal.
         if before_words == after_words:
             accepted.append((i1, i2, after))
             edits.append(SecondaryEdit(before, after, "punctuation/typography"))
+            continue
+        if not before or not after:
             continue
         if len(before_words) == len(after_words) == 1:
             src, dst = before_words[0], after_words[0]
