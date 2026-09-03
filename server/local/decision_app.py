@@ -3,13 +3,50 @@ from __future__ import annotations
 import json
 import os
 
+# A/B/C is the single experiment switch. The preset wins over any stale
+# MODEL_NAME left in the .env so a restart is enough to change stacks.
+LLM_PRESET = os.getenv("LLM_PRESET", "A").strip().upper()
+PRESETS = {
+    "A": {
+        "model": "t-tech/T-lite-it-2.1:q4_K_M",
+        "description": "T-lite baseline",
+        "secondary": False,
+    },
+    "B": {
+        "model": "qwen3.5:4b",
+        "description": "Qwen3.5-4B + DecisionEngine",
+        "secondary": False,
+    },
+    "C": {
+        "model": "t-tech/T-lite-it-2.1:q4_K_M",
+        "description": "Hybrid T-lite + compact surface GEC",
+        "secondary": True,
+    },
+}
+if LLM_PRESET not in PRESETS:
+    raise RuntimeError(f"Unsupported LLM_PRESET={LLM_PRESET!r}; expected A, B or C")
+
+STACK = PRESETS[LLM_PRESET]
+# main.py reads MODEL_NAME during import and also uses it for warmup/metrics.
+os.environ["MODEL_NAME"] = STACK["model"]
+os.environ["LLM_PRESET"] = LLM_PRESET
+if STACK["secondary"]:
+    os.environ["SECONDARY_GEC_ENABLED"] = "true"
+    os.environ.setdefault(
+        "SECONDARY_GEC_MODEL",
+        "hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0",
+    )
+else:
+    os.environ["SECONDARY_GEC_ENABLED"] = "false"
+
 import httpx
 
 import main as legacy
 from decision_engine import DecisionEngine
+from secondary_gec import SecondaryGEC, SecondaryEdit
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.5:4b")
+MODEL_NAME = STACK["model"]
 NUM_THREADS = int(os.getenv("NUM_THREADS", "28"))
 NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "512"))
@@ -17,6 +54,11 @@ TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "300"))
 TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
 KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "24h")
 THINK = os.getenv("OLLAMA_THINK", "false").lower() in ("1", "true", "yes", "on")
+SECONDARY = SecondaryGEC(
+    model=os.getenv("SECONDARY_GEC_MODEL", "hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0"),
+    timeout=float(os.getenv("SECONDARY_GEC_TIMEOUT", "90")),
+    keep_alive=os.getenv("SECONDARY_GEC_KEEP_ALIVE", "5m"),
+) if STACK["secondary"] else None
 
 SCHEMA = {
     "type": "object",
@@ -64,8 +106,13 @@ def _extract_text(messages: list[dict]) -> str:
     return ""
 
 
-def _render(corrected: str, accepted) -> str:
+def _render(corrected: str, accepted, secondary_edits: list[SecondaryEdit]) -> str:
     lines = [f"{i}. {c.before} → {c.after}" for i, c in enumerate(accepted, 1)]
+    start = len(lines) + 1
+    lines.extend(
+        f"{i}. {e.before} → {e.after}"
+        for i, e in enumerate(secondary_edits, start)
+    )
     changes = "\n".join(lines) if lines else "Ошибок не найдено."
     return f"===CORRECTED===\n{corrected}\n===CHANGES===\n{changes}\n===END==="
 
@@ -79,8 +126,6 @@ async def decision_call_ollama(messages: list) -> str:
         except Exception:
             pass
 
-    # Qwen3.5 is sensitive to duplicated system prompts. Keep one system
-    # message and preserve retrieved user/assistant few-shot turns.
     user_history = [m for m in messages if m.get("role") != "system"]
     prompt_messages = [{"role": "system", "content": SYSTEM}, *user_history]
     if not prompt_messages or prompt_messages[-1].get("role") != "user":
@@ -120,14 +165,23 @@ async def decision_call_ollama(messages: list) -> str:
         protected_words=protected,
     )
     corrected, accepted = engine.apply(raw_text, candidates)
+    secondary_edits: list[SecondaryEdit] = []
+    if SECONDARY is not None:
+        corrected, secondary_edits = await SECONDARY.enrich(corrected)
+
     logger = getattr(legacy, "logger", None)
     if logger is not None:
-        logger.info("DecisionEngine: candidates=%d accepted=%d", len(candidates), len(accepted))
-    return _render(corrected, accepted)
+        logger.info(
+            "Preset=%s (%s) model=%s DecisionEngine: candidates=%d accepted=%d secondary=%d",
+            LLM_PRESET,
+            STACK["description"],
+            MODEL_NAME,
+            len(candidates),
+            len(accepted),
+            len(secondary_edits),
+        )
+    return _render(corrected, accepted, secondary_edits)
 
 
-# Keep the existing FastAPI routes, audit, post-filters and LibreOffice protocol.
-# The systemd entrypoint points to this module, so there is still exactly one
-# uvicorn process on :8000; main.py remains the legacy application core.
 legacy.call_ollama = decision_call_ollama
 app = legacy.app
