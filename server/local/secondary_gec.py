@@ -31,6 +31,10 @@ def _tokens(text: str) -> list[str]:
     return [m.group(0) for m in WORD_RE.finditer(text)]
 
 
+def _tokens_lower(text: str) -> list[str]:
+    return [token.lower() for token in _tokens(text)]
+
+
 def _known(morph, word: str) -> bool:
     try:
         return bool(morph.word_is_known(word)) if morph else False
@@ -48,14 +52,65 @@ def _edit_distance(a: str, b: str) -> int:
     return prev[-1]
 
 
+def _same_tokens(a: str, b: str) -> bool:
+    return _tokens_lower(a) == _tokens_lower(b)
+
+
+def _single_token_spelling_change(primary: str, secondary: str, morph) -> bool:
+    before = _tokens(primary)
+    after = _tokens(secondary)
+    if len(before) != len(after) or not before:
+        return False
+
+    changed: list[tuple[str, str]] = []
+    for src, dst in zip(before, after):
+        if src != dst:
+            changed.append((src, dst))
+
+    if len(changed) != 1:
+        return False
+
+    src, dst = changed[0]
+    if src.lower() == dst.lower():
+        return False
+    if _known(morph, src) or not _known(morph, dst):
+        return False
+
+    # Only a very small orthographic typo is admissible. This deliberately
+    # rejects valid inflections, lexical rewrites and context-driven GEC.
+    limit = 1 if max(len(src), len(dst)) <= 6 else 2
+    return _edit_distance(src.lower(), dst.lower()) <= limit
+
+
 def merge_safe(
     primary: str,
     secondary: str,
     morph,
     max_edits: int = 4,
 ) -> tuple[str, list[SecondaryEdit]]:
-    """Merge only conservative surface edits from secondary into primary."""
+    """Merge only conservative surface edits from secondary into primary.
+
+    The secondary model is never allowed to rewrite lexical content. For
+    punctuation/spacing/capitalization the COMPLETE token sequence must stay
+    identical. For spelling, at most one token may change and every other
+    token must stay in the same position.
+    """
     if not secondary or secondary.strip() == primary.strip():
+        return primary, []
+
+    primary_tokens = _tokens_lower(primary)
+    secondary_tokens = _tokens_lower(secondary)
+
+    # Fast, whole-response guard. This is the critical protection against a
+    # secondary model hallucinating/reordering/merging words in an otherwise
+    # superficially similar passage.
+    if primary_tokens != secondary_tokens and not _single_token_spelling_change(primary, secondary, morph):
+        logger.info(
+            "SecondaryGEC: reject whole output, lexical token sequence changed "
+            "(primary=%d secondary=%d)",
+            len(primary_tokens),
+            len(secondary_tokens),
+        )
         return primary, []
 
     sm = difflib.SequenceMatcher(None, primary, secondary, autojunk=False)
@@ -69,25 +124,25 @@ def merge_safe(
         before_words = _tokens(before)
         after_words = _tokens(after)
 
-        # Punctuation/spacing/capitalization only: lexical tokens stay identical.
-        if before_words == after_words:
+        # Whole-response token validation has already happened. Punctuation,
+        # spacing, line breaks and capitalization are safe when this local
+        # chunk itself contains no lexical token change.
+        if _tokens_lower(before) == _tokens_lower(after):
             accepted.append((i1, i2, after))
             edits.append(SecondaryEdit(before, after, "punctuation/typography"))
             continue
 
-        # Never accept lexical insertion/deletion from the secondary model.
-        if not before or not after:
-            continue
-
-        # Conservative spelling correction only: one token, source unknown,
-        # target known, and small edit distance. Valid inflections are rejected.
-        if len(before_words) == len(after_words) == 1:
+        # Only the one-token spelling case can reach this branch.
+        if tag == "replace" and len(before_words) == len(after_words) == 1:
             src, dst = before_words[0], after_words[0]
-            if not _known(morph, src) and _known(morph, dst):
-                limit = 1 if max(len(src), len(dst)) <= 6 else 2
-                if _edit_distance(src.lower(), dst.lower()) <= limit:
-                    accepted.append((i1, i2, after))
-                    edits.append(SecondaryEdit(src, dst, "spelling"))
+            if (
+                not _known(morph, src)
+                and _known(morph, dst)
+                and _edit_distance(src.lower(), dst.lower())
+                <= (1 if max(len(src), len(dst)) <= 6 else 2)
+            ):
+                accepted.append((i1, i2, after))
+                edits.append(SecondaryEdit(src, dst, "spelling"))
 
     if not accepted:
         return primary, []
