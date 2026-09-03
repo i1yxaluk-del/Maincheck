@@ -6,16 +6,17 @@ import os
 import httpx
 
 import main as legacy
-from shared.decision_engine import DecisionEngine
+from decision_engine import DecisionEngine
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.5:4b")
 NUM_THREADS = int(os.getenv("NUM_THREADS", "28"))
 NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "512"))
-TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "240"))
+TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "300"))
 TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
 KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "24h")
+THINK = os.getenv("OLLAMA_THINK", "false").lower() in ("1", "true", "yes", "on")
 
 SCHEMA = {
     "type": "object",
@@ -59,7 +60,7 @@ def _extract_text(messages: list[dict]) -> str:
         content = str(msg.get("content", ""))
         marker = "ТЕКСТ ДЛЯ ПРОВЕРКИ:\n"
         if marker in content:
-            return content.split(marker, 1)[1].strip()
+            return content.split(marker, 1)[1].strip().removesuffix("\n\n/no_think")
     return ""
 
 
@@ -78,21 +79,21 @@ async def decision_call_ollama(messages: list) -> str:
         except Exception:
             pass
 
-    # Keep retrieved few-shot turns intact. Qwen3.5 is sensitive to duplicated
-    # system messages, so collapse the old system instruction and the new
-    # structured-output contract into exactly one system message.
+    # Qwen3.5 is sensitive to duplicated system prompts. Keep one system
+    # message and preserve retrieved user/assistant few-shot turns.
     user_history = [m for m in messages if m.get("role") != "system"]
     prompt_messages = [{"role": "system", "content": SYSTEM}, *user_history]
-
     if not prompt_messages or prompt_messages[-1].get("role") != "user":
         prompt_messages.append({"role": "user", "content": raw_text})
+    if prompt_messages and prompt_messages[-1].get("role") == "user" and not prompt_messages[-1].get("content", "").rstrip().endswith("/no_think"):
+        prompt_messages[-1]["content"] = prompt_messages[-1]["content"].rstrip() + "\n\n/no_think"
 
     payload = {
         "model": MODEL_NAME,
         "messages": prompt_messages,
         "stream": False,
         "format": SCHEMA,
-        "think": False,
+        "think": THINK,
         "keep_alive": KEEP_ALIVE,
         "options": {
             "temperature": TEMPERATURE,
@@ -119,11 +120,14 @@ async def decision_call_ollama(messages: list) -> str:
         protected_words=protected,
     )
     corrected, accepted = engine.apply(raw_text, candidates)
+    logger = getattr(legacy, "logger", None)
+    if logger is not None:
+        logger.info("DecisionEngine: candidates=%d accepted=%d", len(candidates), len(accepted))
     return _render(corrected, accepted)
 
 
-# Keep every existing FastAPI endpoint and post-processing stage. Only the
-# model boundary is replaced: the legacy endpoint now receives server-built
-# CORRECTED/CHANGES generated from validated structured edits.
+# Keep the existing FastAPI routes, audit, post-filters and LibreOffice protocol.
+# The systemd entrypoint points to this module, so there is still exactly one
+# uvicorn process on :8000; main.py remains the legacy application core.
 legacy.call_ollama = decision_call_ollama
 app = legacy.app
