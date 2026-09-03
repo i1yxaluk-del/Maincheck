@@ -1,65 +1,41 @@
 # AI LibreOffice Suggester — Локальный сервер
 
-Работает без интернета на Ollama. Рекомендуемая модель v1.5 (апрель 2026) —
-**`t-tech/T-lite-it-2.1:q4_K_M`** (30–50 с на типовой фрагмент после прогрева,
-~5 ГБ RAM, без thinking-режима).
+Локальный CPU-профиль проекта теперь включает отдельный экспериментальный preset **Qwen3.5-9B** для Broadwell Xeon E5-2690 v4 / 31 GB VMware guest.
 
-Полное руководство: [`../Инструкции/LOCAL_MODEL.md`](../Инструкции/LOCAL_MODEL.md).
+Qwen3.5:9b доступен в Ollama как Q4_K_M примерно на 6.6 GB и с 256K context window; upstream model card указывает 262,144 токена native context. Для нашего сервера это не означает, что надо выставлять 256K: на CPU это лишняя KV-cache нагрузка. Профиль ограничен 8192 токенами и 768 токенами генерации.
 
-## TL;DR
+## Профиль Qwen3.5-9B
 
 ```bash
-# Ollama + модель
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull t-tech/T-lite-it-2.1:q4_K_M
-ollama pull nomic-embed-text   # для RAG
-
-# Сервер
-cp .env.example .env           # при необходимости правим
-pip install -r requirements.txt
-./start.sh                     # Linux
-# или start.bat                # Windows
+cp .env.qwen35.example .env
+./start-qwen35.sh
 ```
 
-Проверка:
-```bash
-curl http://localhost:8000/health
-curl http://localhost:8000/metrics
-```
-
-## Переменные окружения
-
-Все параметры — в `.env.example`. Основные:
-
-- `MODEL_NAME` — имя модели Ollama (`t-tech/T-lite-it-2.1:q4_K_M`, `qwen2.5:14b`, `qwen2.5:32b`, `gemma3:27b`, …)
-- `NUM_THREADS` — потоков CPU (на 32 ядрах ставим 28, оставляем 4 ядра ОС)
-- `RAG_ENABLED` — `true/false`, включить обогащение промта выдержками из ведомственных документов
-- `LOG_LEVEL`, `LOG_RETENTION_DAYS`, `AUDIT_ENABLED` — см. `../Инструкции/LOGGING.md`
-
-## Автозапуск (Linux, systemd)
+Или вручную:
 
 ```bash
-# Отредактировать ai-suggester.service: заменить YOUR_USERNAME и путь
-sudo cp ai-suggester.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now ai-suggester
-systemctl status ai-suggester
+ollama pull qwen3.5:9b
+export MODEL_NAME=qwen3.5:9b
+export NUM_THREADS=28
+export OLLAMA_NUM_CTX=8192
+export OLLAMA_NUM_PREDICT=768
+export OLLAMA_KEEP_ALIVE=24h
+export OLLAMA_THINK=false
+export OLLAMA_TEMPERATURE=0.05
 ```
 
-## RAG (обучение на Гарант / КонсультантПлюс)
+### Почему это не просто смена модели
 
-Полное руководство: [`../Инструкции/RAG_GUIDE.md`](../Инструкции/RAG_GUIDE.md).
+1. **Один источник правок.** Qwen3.5 — основной генератор. `MORPH_FILTER_ENABLED=true` остаётся только как защитный фильтр. `MORPH_DETECTOR_ENABLED=false` и `LANGUAGETOOL_ENABLED=false` предотвращают сложение независимых генераторов правок.
+2. **Retrieval остаётся, но минимальный.** `GEC_RETRIEVAL_MODE=hybrid`, `GEC_TOP_K=1`: точные словоформы ловятся sparse-частью, а semantic retrieval даёт один релевантный пример без раздувания prompt.
+3. **Контекст увеличен с 2048 до 8192.** Это согласуется с длинным системным prompt/few-shot, но не пытается использовать полный 256K контекст модели на CPU.
+4. **Детерминизм почти сохранён.** Температура 0.05 вместо прежнего 0.0 оставляет минимальную вариативность, но не превращает корректуру в свободную генерацию.
+5. **VMware NUMA-bind не добавляется.** Профиль не использует `numactl --cpunodebind`; гостевая NUMA-топология не должна насильно сопоставляться с физическим хостом.
 
-Краткая шпаргалка:
-```bash
-# Из корня репозитория
-PYTHONPATH=server python -m shared.rag_cli add  ./data/docs/fz_44.docx --doc-id fz-44 --version 2025-03
-PYTHONPATH=server python -m shared.rag_cli list
-PYTHONPATH=server python -m shared.rag_cli remove fz-44
-PYTHONPATH=server python -m shared.rag_cli search "согласно распоряжения"
-PYTHONPATH=server python -m shared.rag_cli ingest-folder ./data/docs
-```
+### A/B
 
-## Траблшутинг
+Текущий T-lite остаётся доступным через обычный `.env.example`. Для сравнения прогоняйте один и тот же набор документов через оба профиля и сравнивайте не только скорость, но и false-positive rate: число правок, которые редактор отклоняет.
 
-См. [`../Инструкции/TROUBLESHOOTING.md`](../Инструкции/TROUBLESHOOTING.md).
+### Важное ограничение
+
+В репозитории нет CPU-бенчмарка именно Qwen3.5 на вашем VMware-госте, поэтому PR не заявляет, что Qwen3.5 уже доказанно лучше T-lite. Это воспроизводимый A/B-профиль, который должен быть подтверждён реальным корпусом деловой переписки.
