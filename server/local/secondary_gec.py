@@ -4,6 +4,7 @@ import difflib
 import logging
 import os
 import re
+from dataclasses import dataclass
 
 import httpx
 
@@ -16,6 +17,12 @@ SYSTEM = (
     "пунктуационные и типографические ошибки. Не меняй грамматику, управление, "
     "смысл, лексику или допустимые формы слов. Верни только исправленный текст."
 )
+
+@dataclass(frozen=True)
+class SecondaryEdit:
+    before: str
+    after: str
+    category: str
 
 
 def _tokens(text: str) -> list[str]:
@@ -39,11 +46,12 @@ def _edit_distance(a: str, b: str) -> int:
     return prev[-1]
 
 
-def merge_safe(primary: str, secondary: str, morph) -> tuple[str, int]:
+def merge_safe(primary: str, secondary: str, morph) -> tuple[str, list[SecondaryEdit]]:
     if not secondary or secondary.strip() == primary.strip():
-        return primary, 0
+        return primary, []
     sm = difflib.SequenceMatcher(None, primary, secondary, autojunk=False)
     accepted = []
+    edits: list[SecondaryEdit] = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
             continue
@@ -53,21 +61,19 @@ def merge_safe(primary: str, secondary: str, morph) -> tuple[str, int]:
             continue
         before_words = _tokens(before)
         after_words = _tokens(after)
-        # Pure punctuation/spacing/capitalization: lexical tokens unchanged.
         if before_words == after_words:
             accepted.append((i1, i2, after))
+            edits.append(SecondaryEdit(before, after, "punctuation/typography"))
             continue
-        # Spelling only: unknown -> known, small edit distance. Inflectional
-        # changes such as наряда -> нарядов remain rejected because both forms
-        # are valid dictionary words.
         if len(before_words) == len(after_words) == 1:
             src, dst = before_words[0], after_words[0]
             if not _known(morph, src) and _known(morph, dst):
                 limit = 1 if max(len(src), len(dst)) <= 6 else 2
                 if _edit_distance(src.lower(), dst.lower()) <= limit:
                     accepted.append((i1, i2, after))
+                    edits.append(SecondaryEdit(src, dst, "spelling"))
     if not accepted:
-        return primary, 0
+        return primary, []
     out = []
     cursor = 0
     for i1, i2, after in accepted:
@@ -76,27 +82,24 @@ def merge_safe(primary: str, secondary: str, morph) -> tuple[str, int]:
         out.extend((primary[cursor:i1], after))
         cursor = i2
     out.append(primary[cursor:])
-    return "".join(out), len(accepted)
+    return "".join(out), edits
 
 
 class SecondaryGEC:
-    def __init__(self) -> None:
-        self.enabled = os.getenv("SECONDARY_GEC_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-        self.model = os.getenv("SECONDARY_GEC_MODEL", MODEL_DEFAULT)
-        self.timeout = float(os.getenv("SECONDARY_GEC_TIMEOUT", "90"))
-        self.keep_alive = os.getenv("SECONDARY_GEC_KEEP_ALIVE", "5m")
+    def __init__(self, model: str, timeout: float, keep_alive: str) -> None:
+        self.enabled = True
+        self.model = model
+        self.timeout = timeout
+        self.keep_alive = keep_alive
         self.base_url = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
         self._morph = None
-        if self.enabled:
-            try:
-                import pymorphy3
-                self._morph = pymorphy3.MorphAnalyzer()
-            except Exception as exc:
-                logger.warning("SecondaryGEC: pymorphy3 unavailable: %s", exc)
+        try:
+            import pymorphy3
+            self._morph = pymorphy3.MorphAnalyzer()
+        except Exception as exc:
+            logger.warning("SecondaryGEC: pymorphy3 unavailable: %s", exc)
 
-    async def enrich(self, primary_text: str) -> str:
-        if not self.enabled:
-            return primary_text
+    async def enrich(self, primary_text: str) -> tuple[str, list[SecondaryEdit]]:
         payload = {
             "model": self.model,
             "messages": [
@@ -106,20 +109,16 @@ class SecondaryGEC:
             "stream": False,
             "think": False,
             "keep_alive": self.keep_alive,
-            "options": {
-                "temperature": 0,
-                "num_ctx": 2048,
-                "num_predict": 512,
-            },
+            "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 512},
         }
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(f"{self.base_url}/api/chat", json=payload)
                 response.raise_for_status()
                 secondary = response.json().get("message", {}).get("content", "").strip()
-            merged, accepted = merge_safe(primary_text, secondary, self._morph)
-            logger.info("SecondaryGEC: model=%s accepted=%d", self.model, accepted)
-            return merged
+            merged, edits = merge_safe(primary_text, secondary, self._morph)
+            logger.info("SecondaryGEC: model=%s accepted=%d", self.model, len(edits))
+            return merged, edits
         except Exception as exc:
             logger.warning("SecondaryGEC failed, keeping primary result: %s", exc)
-            return primary_text
+            return primary_text, []
