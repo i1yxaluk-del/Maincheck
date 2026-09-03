@@ -41,7 +41,7 @@ LLM_PRESET=B
 LLM_PRESET=C
 ```
 
-Основной GEC — T-lite. После него запускается `hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0`, который предназначен для punctuation/capitalization/typo/spelling и работает как одноходовой surface-correction слой. По документации модели для качества нужны её штатный русский system prompt, thinking OFF, temperature 0 и context 2048. citeturn518865search0
+Основной GEC — T-lite. После него запускается `hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0`, который предназначен для punctuation/capitalization/typo/spelling и работает как одноходовой surface-correction слой. Для модели используются её штатный русский system prompt, thinking OFF, temperature 0 и context 2048.
 
 Второй слой не имеет права менять валидные словоформы, лексику или смысл: изменения принимаются только при сохранении лексических токенов, либо для консервативной коррекции опечатки через `pymorphy3`. Дополнительно действует `SECONDARY_GEC_MAX_EDITS` (по умолчанию 4), чтобы небольшой secondary-модуль не создавал большой поток сомнительных предложений.
 
