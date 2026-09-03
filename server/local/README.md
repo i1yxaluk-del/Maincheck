@@ -1,65 +1,115 @@
-# AI LibreOffice Suggester — Локальный сервер
+# AI LibreOffice Suggester — локальный GEC-сервер
 
-Работает без интернета на Ollama. Рекомендуемая модель v1.5 (апрель 2026) —
-**`t-tech/T-lite-it-2.1:q4_K_M`** (30–50 с на типовой фрагмент после прогрева,
-~5 ГБ RAM, без thinking-режима).
+Профиль `qwen3.5:4b` теперь работает через отдельный **DecisionEngine**. Это важнее простой смены модели: LLM больше не формирует финальный документ и список правок одновременно.
 
-Полное руководство: [`../Инструкции/LOCAL_MODEL.md`](../Инструкции/LOCAL_MODEL.md).
+## Архитектура
 
-## TL;DR
-
-```bash
-# Ollama + модель
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull t-tech/T-lite-it-2.1:q4_K_M
-ollama pull nomic-embed-text   # для RAG
-
-# Сервер
-cp .env.example .env           # при необходимости правим
-pip install -r requirements.txt
-./start.sh                     # Linux
-# или start.bat                # Windows
+```text
+LibreOffice
+   ↓
+retrieval / few-shot
+   ↓
+Qwen3.5-4B
+   ↓  structured JSON edits
+DecisionEngine
+   ├─ confidence threshold
+   ├─ exact BEFORE validation
+   ├─ overlap protection
+   ├─ user-dictionary protection
+   └─ ё/е normalization rejection
+   ↓
+server-generated CORRECTED + CHANGES
+   ↓
+existing deterministic post-processing
 ```
 
-Проверка:
-```bash
-curl http://localhost:8000/health
-curl http://localhost:8000/metrics
-```
+Ollama поддерживает structured outputs через `format` с JSON Schema; это позволяет получать машинно проверяемые объекты вместо свободного `CORRECTED + CHANGES`.
 
-## Переменные окружения
+## Qwen3.5-4B
 
-Все параметры — в `.env.example`. Основные:
+Официальный Ollama registry сейчас показывает `qwen3.5:4b` как Q4_K_M около 3.4 GB с native context 262,144 токена. Для CPU-профиля оставлены только 4096 токенов контекста и 512 токенов генерации — это сознательный latency/RAM trade-off.
 
-- `MODEL_NAME` — имя модели Ollama (`t-tech/T-lite-it-2.1:q4_K_M`, `qwen2.5:14b`, `qwen2.5:32b`, `gemma3:27b`, …)
-- `NUM_THREADS` — потоков CPU (на 32 ядрах ставим 28, оставляем 4 ядра ОС)
-- `RAG_ENABLED` — `true/false`, включить обогащение промта выдержками из ведомственных документов
-- `LOG_LEVEL`, `LOG_RETENTION_DAYS`, `AUDIT_ENABLED` — см. `../Инструкции/LOGGING.md`
-
-## Автозапуск (Linux, systemd)
+## Как запустить
 
 ```bash
-# Отредактировать ai-suggester.service: заменить YOUR_USERNAME и путь
-sudo cp ai-suggester.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now ai-suggester
-systemctl status ai-suggester
+cp .env.qwen35.example .env
+./start-qwen35.sh
 ```
 
-## RAG (обучение на Гарант / КонсультантПлюс)
+## Почему 4B GEC
 
-Полное руководство: [`../Инструкции/RAG_GUIDE.md`](../Инструкции/RAG_GUIDE.md).
+Свежий BEA 2026 benchmark SyntErr публикует LoRA-адаптеры для русского GEC. Для Qwen3.5-4B опубликованный результат на LORuGEC — M2 F0.5 75.3 для режима SyntErr → LORuGEC, против 47.6 zero-shot; для Qwen3.5-9B — 70.9 против 49.2. Это делает 4B специализированный GEC особенно интересным для CPU-сервера.
 
-Краткая шпаргалка:
-```bash
-# Из корня репозитория
-PYTHONPATH=server python -m shared.rag_cli add  ./data/docs/fz_44.docx --doc-id fz-44 --version 2025-03
-PYTHONPATH=server python -m shared.rag_cli list
-PYTHONPATH=server python -m shared.rag_cli remove fz-44
-PYTHONPATH=server python -m shared.rag_cli search "согласно распоряжения"
-PYTHONPATH=server python -m shared.rag_cli ingest-folder ./data/docs
+В репозитории настроена точка конфигурации:
+
+```text
+GEC_ADAPTER_REPO=synterr-nlp/bea2026-gec-adapters
+GEC_ADAPTER_SUBFOLDER=v4_qwen35_4b_lorugec
 ```
 
-## Траблшутинг
+Но `GEC_ADAPTER_ENABLED=false` по умолчанию. Это намеренно: LoRA из BEA 2026 — адаптер, а не готовая Ollama-модель; его нужно отдельно собрать/подключить через совместимый Transformers/PEFT runtime. Мы не притворяемся, что `ollama pull qwen3.5:4b` автоматически загружает этот adapter.
 
-См. [`../Инструкции/TROUBLESHOOTING.md`](../Инструкции/TROUBLESHOOTING.md).
+## DecisionEngine
+
+LLM должна вернуть:
+
+```json
+{
+  "edits": [
+    {
+      "before": "согласно приказа",
+      "after": "согласно приказу",
+      "confidence": 0.97,
+      "category": "government",
+      "reason": "управление"
+    }
+  ]
+}
+```
+
+DecisionEngine отклоняет:
+
+- изменения ниже `DECISION_MIN_CONFIDENCE`;
+- `before`, которого нет в исходном тексте;
+- перекрывающиеся правки;
+- слишком длинные кандидаты;
+- изменения терминов из user dictionary;
+- чистую нормализацию `ё/е`;
+- идемпотентные изменения;
+- больше `DECISION_MAX_CHANGES` правок.
+
+После этого сервер сам строит `CORRECTED` и `CHANGES`. Старый LibreOffice protocol при этом сохраняется.
+
+## Параметры CPU
+
+```text
+MODEL_NAME=qwen3.5:4b
+NUM_THREADS=28
+OLLAMA_NUM_CTX=4096
+OLLAMA_NUM_PREDICT=512
+OLLAMA_THINK=false
+OLLAMA_TEMPERATURE=0
+OLLAMA_KEEP_ALIVE=24h
+```
+
+Ollama предоставляет runtime-метрики `total_duration`, `load_duration`, `prompt_eval_count`, `eval_count` и длительности eval; следующим шагом benchmark должен выбирать оптимальное число CPU threads не теоретически, а измерением на конкретной VMware-гостевой системе.
+
+## Важное про маленькую GEC-модель
+
+Есть также отдельная Qwen3.5-0.8B GEC-модель для RU/KZ/EN в GGUF Q4_0 (~537 MB), рассчитанная на CPU и temperature 0; её заявленный training context — 2048 токенов. Она интересна как будущий дешёвый verifier, но в этом PR она не включена в основной путь, чтобы не добавлять второй LLM-запрос к каждому документу.
+
+## A/B порядок
+
+1. T-lite — baseline.
+2. Qwen3.5-4B + DecisionEngine.
+3. Qwen3.5-4B + официальный BEA/SyntErr LoRA adapter — отдельный экспериментальный runtime.
+4. Qwen3.5-9B + DecisionEngine — контрольный CPU-вариант.
+
+Сравнивать нужно `precision`, `false-positive rate`, `F0.5`, median/p95 latency и tokens/s, а не только среднее число найденных ошибок.
+
+Источники:
+- https://docs.ollama.com/capabilities/structured-outputs
+- https://ollama.com/library/qwen3.5:4b
+- https://huggingface.co/synterr-nlp/bea2026-gec-adapters
+- https://huggingface.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG
+- https://docs.ollama.com/api/usage
