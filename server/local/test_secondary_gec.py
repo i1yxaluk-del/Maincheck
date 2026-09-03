@@ -26,3 +26,11 @@ def test_valid_inflection_is_not_overridden():
     )
     assert corrected == "после ночных нарядов"
     assert edits == []
+
+
+def test_secondary_flood_is_rejected():
+    primary = "Альфа бета гамма дельта эпсилон зета."
+    secondary = "Альфа, бета, гамма, дельта, эпсилон, зета."
+    corrected, edits = merge_safe(primary, secondary, FakeMorph(), max_edits=4)
+    assert corrected == primary
+    assert edits == []
