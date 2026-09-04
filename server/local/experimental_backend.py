@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import warnings
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
@@ -182,11 +183,24 @@ class ExperimentalBackend:
             except Exception as exc:
                 raise RuntimeError("D requires peft; install requirements-experimental.txt") from exc
             logger.info("Experimental[D]: loading adapter=%s", self.config.adapter)
-            self._model = PeftModel.from_pretrained(
-                self._model,
-                self.config.adapter,
-                subfolder="v4_qwen35_4b_lorugec",
-            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                self._model = PeftModel.from_pretrained(
+                    self._model,
+                    self.config.adapter,
+                    subfolder=os.getenv("D_ADAPTER_SUBFOLDER", "v4_qwen35_4b_lorugec"),
+                )
+            adapter_warnings = [
+                str(item.message)
+                for item in caught
+                if "missing adapter keys" in str(item.message).lower()
+            ]
+            if adapter_warnings:
+                raise RuntimeError(
+                    "D adapter did not load cleanly: PEFT reported missing adapter keys. "
+                    "Upgrade requirements-experimental.txt (PEFT>=0.19.1, Transformers>=5.5.0) "
+                    "and verify the Qwen3.5-4B adapter subfolder."
+                )
         self._model.eval()
         self._loaded = True
         logger.info("Experimental[%s]: model ready", self.config.preset)
@@ -198,20 +212,28 @@ class ExperimentalBackend:
             {"role": "system", "content": GEC_PROMPT},
             {"role": "user", "content": f"ИСХОДНЫЙ ТЕКСТ:\n{text}"},
         ]
-        inputs = self._tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_tensors="pt",
-            return_dict=True,
-        )
-        # Some tokenizer versions return a bare tensor, others BatchEncoding.
+        template_kwargs = {
+            "messages": messages,
+            "add_generation_prompt": True,
+            "tokenize": True,
+            "return_tensors": "pt",
+            "return_dict": True,
+        }
+        try:
+            # Qwen3.5 supports an explicit non-thinking generation mode. This is
+            # important for a low-latency GEC endpoint and keeps the output in JSON.
+            inputs = self._tokenizer.apply_chat_template(
+                enable_thinking=False,
+                **template_kwargs,
+            )
+        except TypeError:
+            inputs = self._tokenizer.apply_chat_template(**template_kwargs)
         if hasattr(inputs, "items"):
             target_device = self._model.device
             return {k: v.to(target_device) for k, v in inputs.items() if hasattr(v, "to")}
         return inputs.to(self._model.device)
 
-    def _generate(self, text: str, max_new_tokens: int = 512) -> str:
+    def _generate(self, text: str, max_new_tokens: int = 256) -> str:
         self._load_transformers()
         import torch
 
@@ -239,11 +261,21 @@ class ExperimentalBackend:
         return self._tokenizer.decode(generated, skip_special_tokens=True).strip()
 
     def warmup(self) -> None:
-        """Load model and run a tiny deterministic generation before serving."""
+        """Load model and optionally run a tiny deterministic generation before serving."""
         if not self._loaded:
             self._load_transformers()
-        _ = self._generate("Контрольный текст без ошибок.", max_new_tokens=8)
-        logger.info("Experimental[%s]: warmup OK", self.config.preset)
+        # D is CPU-heavy on the production host. Loading the model is enough to
+        # validate startup; generation warmup is opt-in so :8000 is not blocked
+        # for minutes during a preset switch.
+        generation_warmup = os.getenv(
+            "EXPERIMENTAL_GENERATION_WARMUP",
+            "false" if self.config.preset == "D" else "true",
+        ).lower() in {"1", "true", "yes", "on"}
+        if generation_warmup:
+            _ = self._generate("Контрольный текст без ошибок.", max_new_tokens=8)
+            logger.info("Experimental[%s]: warmup OK", self.config.preset)
+        else:
+            logger.info("Experimental[%s]: model load OK (generation warmup disabled)", self.config.preset)
 
     def candidates(self, raw_text: str) -> list[EditCandidate]:
         output = self._generate(raw_text)
