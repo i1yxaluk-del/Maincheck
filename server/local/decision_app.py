@@ -60,6 +60,9 @@ if STACK["experimental"]:
             f"LLM_PRESET={LLM_PRESET} requires EXPERIMENTAL_GEC_URL. "
             "See server/local/README.md for the D/E/F/G deployment contract."
         )
+    # Do not let the legacy startup warmup try to load an experimental model
+    # from Ollama. D-G are served by their dedicated backend only.
+    os.environ["OLLAMA_WARMUP"] = "false"
     os.environ["MODEL_NAME"] = STACK["model"]
     os.environ["LLM_PRESET"] = LLM_PRESET
 else:
@@ -184,7 +187,10 @@ def _openai_payload(raw_text: str) -> dict:
             },
         ],
         "stream": False,
-        "response_format": {"type": "json_schema", "json_schema": {"name": "gec_edits", "schema": SCHEMA, "strict": True}},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "gec_edits", "schema": SCHEMA, "strict": True},
+        },
         "temperature": TEMPERATURE,
         "max_tokens": NUM_PREDICT,
     }
