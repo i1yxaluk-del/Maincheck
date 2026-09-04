@@ -1,23 +1,23 @@
 # AI LibreOffice Suggester — локальный GEC-сервер
 
-Production запускается через один systemd-сервис `ai-suggester.service` и один `uvicorn decision_app:app` на :8000.
+Production запускается через один systemd-сервис `ai-suggester.service` и один `uvicorn decision_app:app` на :8000. Второй uvicorn не нужен.
 
-## A/B/C: переключение полного стека
+## Пресеты
 
-Модель и дополнительные локальные этапы выбираются одной переменной в `/home/service/llama/server/local/.env`:
+Переключение полного стека делается одной переменной в `/home/service/llama/server/local/.env`:
 
 ```text
 LLM_PRESET=A
 ```
 
-После изменения достаточно:
+После изменения:
 
 ```bash
 sudo systemctl restart ai-suggester.service
 journalctl -u ai-suggester.service -n 100 --no-pager
 ```
 
-Preset `MODEL_NAME` переопределяет старые значения `MODEL_NAME` из `.env`, поэтому не нужно вручную удалять прежнее имя модели.
+В репозитории остаются два базовых стека A/C и добавлены четыре экспериментальных направления D-G.
 
 ### A — T-lite baseline
 
@@ -25,77 +25,208 @@ Preset `MODEL_NAME` переопределяет старые значения `
 LLM_PRESET=A
 ```
 
-`T-lite-it-2.1:q4_K_M` — текущий production baseline, который подтвердил себя на реальном официально-деловом русском. Сохраняются few-shot retrieval, MorphFilter, MorphDetector и DecisionEngine.
+`t-tech/T-lite-it-2.1:q4_K_M` — текущий production baseline для русского официально-делового текста. Используются structured output, DecisionEngine, MorphFilter/MorphDetector, few-shot retrieval и существующий postprocess.
 
-### B — Qwen3.5-4B
-
-```text
-LLM_PRESET=B
-```
-
-`qwen3.5:4b` — экспериментальный профиль с тем же structured-output/DecisionEngine и существующими deterministic post-processing слоями. В нашем текущем тесте он показал заметно более низкий recall, поэтому остаётся сравнительным вариантом.
-
-### C — гибрид T-lite + compact surface GEC
+### C — T-lite + compact surface GEC
 
 ```text
 LLM_PRESET=C
 ```
 
-Основной GEC — T-lite. После него запускается `hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0`, который используется только как surface-correction слой для пунктуации, капитализации, опечаток и орфографии. Для качества ему нужны штатный русский system prompt, thinking OFF, temperature 0 и context 2048.
+Основной GEC — T-lite. После него запускается `hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0` как консервативный surface-слой. Secondary не имеет права переписывать лексику/словоформы целиком; применяется только через safe merge.
 
-Второй слой не имеет права менять валидные словоформы, лексику или смысл. Правки принимаются только при сохранении лексических токенов либо при консервативной spelling-коррекции через `pymorphy3`. Действует `SECONDARY_GEC_MAX_EDITS` (по умолчанию 4), чтобы compact-модель не раздувала список suggestions.
-
-Перед первым запуском C модель нужно один раз загрузить в локальный Ollama:
+Установка secondary на production host:
 
 ```bash
 ollama pull hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0
 ```
 
-При старте preset C проверяет `/api/tags` и пишет в журнал, найдена ли secondary-модель. Сервис сам ничего не скачивает.
+C остаётся experimental по качеству: используйте его только после проверки на вашем регрессионном наборе.
 
-## Pipeline
+## Новые экспериментальные стеки D-G
+
+Важное отличие: D-G **не направляются автоматически в Ollama**. Каждый из них требует отдельного inference backend с OpenAI-compatible endpoint `/v1/chat/completions`. Это сделано специально, чтобы нельзя было случайно загрузить несовместимую sequence-tagging модель как обычную chat-модель.
+
+### D — Qwen3.5-4B + SyntErr→LORuGEC LoRA
 
 ```text
-few-shot hybrid retrieval
-        ↓
-primary GEC + DecisionEngine
-        ↓
-MorphFilter / MorphDetector
-        ↓
-secondary surface GEC (только preset C)
-        ↓
-LanguageTool / Sage / другие опциональные стадии
-        ↓
+LLM_PRESET=D
+EXPERIMENTAL_GEC_URL=http://127.0.0.1:1234
+EXPERIMENTAL_MODEL=Qwen3.5-4B-SyntErr-LORuGEC
+```
+
+Идея — использовать Qwen3.5-4B с русским GEC-дообучением вместо zero-shot Qwen. Публичные SyntErr/BEA 2026 adapters содержат `v4_qwen35_4b_lorugec`, для которого на LORuGEC test опубликован M2 F0.5 75.3; это LoRA adapter, а не самостоятельная GGUF-модель, поэтому сначала нужен отдельный merge/quantize или PEFT/vLLM/llama.cpp runtime.
+
+Источник adapter: `synterr-nlp/bea2026-gec-adapters`.
+
+### E — Russian GEC Sequence Tagger
+
+```text
+LLM_PRESET=E
+EXPERIMENTAL_GEC_URL=http://127.0.0.1:8101
+EXPERIMENTAL_MODEL=RussianGEC_SeqTagger
+```
+
+Это другой класс модели: sequence tagging / edit-based GEC. Модель предсказывает локальные операции над токенами, а не переписывает весь абзац. Именно такой подход интересен нам как защита от галлюцинаций и разрушения текста.
+
+Источник кода: `ReginaNasyrova/RussianGEC_SeqTagger`.
+
+Для D/E backend обязан вернуть JSON, совместимый с нашим `DecisionEngine`:
+
+```json
+{
+  "edits": [
+    {
+      "before": "после ночных наряда",
+      "after": "после ночных нарядов",
+      "confidence": 0.96,
+      "category": "agreement",
+      "reason": "согласование"
+    }
+  ]
+}
+```
+
+### F — Spell-Corrector-RU-4B
+
+```text
+LLM_PRESET=F
+EXPERIMENTAL_GEC_URL=http://127.0.0.1:1234
+EXPERIMENTAL_MODEL=melsmm/Spell-Corrector-RU-4B
+```
+
+Это не замена основному GEC. Модель специализирована на русской орфографии, пунктуации и регистре. Её предполагаемая роль — отдельный surface слой с тем же принципом: только локальные правки через DecisionEngine.
+
+Модель: `melsmm/Spell-Corrector-RU-4B`.
+
+### G — Russian GEC Tagger + T-lite verifier
+
+```text
+LLM_PRESET=G
+EXPERIMENTAL_GEC_URL=http://127.0.0.1:8101
+EXPERIMENTAL_MODEL=RussianGEC_SeqTagger
+```
+
+Целевая архитектура production-класса:
+
+```text
+raw text
+   ↓
+Russian GEC Sequence Tagger
+   ↓
+локальные edit candidates
+   ↓
+pymorphy3 / user_dict / MorphDetector
+   ↓
+T-lite как verifier спорных кандидатов
+   ↓
+DecisionEngine
+   ↓
+минимальный набор CHANGES
+```
+
+G — самый интересный архитектурный вариант, но на текущем коммите verifier ещё не включён автоматически: сначала необходимо поднять tagger backend и отдельно проверить качество кандидатов.
+
+## Переменные D-G
+
+```text
+EXPERIMENTAL_GEC_URL=http://127.0.0.1:1234
+EXPERIMENTAL_MODEL=
+```
+
+Ожидается OpenAI-compatible endpoint:
+
+```text
+POST /v1/chat/completions
+```
+
+Сервер должен принимать `response_format=json_schema` и возвращать `choices[0].message.content` как JSON по схеме `edits`.
+
+## Развёртывание A/C
+
+Production `.env`:
+
+```bash
+cd /home/service/llama/server/local
+nano .env
+```
+
+Для A:
+
+```text
+LLM_PRESET=A
+```
+
+Для C:
+
+```text
+LLM_PRESET=C
+```
+
+Затем:
+
+```bash
+sudo systemctl restart ai-suggester.service
+journalctl -u ai-suggester.service -n 100 --no-pager
+```
+
+Проверка должна показывать:
+
+```text
+Preset=A ... model=t-tech/T-lite-it-2.1:q4_K_M
+```
+
+или:
+
+```text
+Preset=C ... model=t-tech/T-lite-it-2.1:q4_K_M
+SecondaryGEC ready: model=...
+```
+
+## Развёртывание D-F через LM Studio / llmster
+
+LM Studio может выступать как OpenAI-compatible локальный inference backend. Для headless Linux следует использовать server/headless runtime, а не запускать второй uvicorn нашего приложения.
+
+Общий контракт:
+
+```text
 LibreOffice
+   ↓
+FastAPI :8000
+   ↓
+experimental backend :1234
+   ↓
+D/F model
 ```
 
-`MORPH_DETECTOR_ENABLED`, `LANGUAGETOOL_ENABLED`, `SAGE_VALIDATOR_ENABLED` и остальные флаги можно по-прежнему включать/выключать из `.env` для A/B.
-
-## Runtime
+После запуска backend:
 
 ```text
-WorkingDirectory=/home/service/llama/server/local
-EnvironmentFile=/home/service/llama/server/local/.env
-ExecStart=/home/service/llama/server/local/venv/bin/python3 -m uvicorn decision_app:app --host 0.0.0.0 --port 8000
+EXPERIMENTAL_GEC_URL=http://127.0.0.1:1234
 ```
 
-Второй uvicorn не нужен.
+и:
 
-## Следующие эксперименты
-
-После честного прогона C имеет смысл сравнить три независимых направления: C без LanguageTool; C + только STYLE/TYPOGRAPHY от локального LanguageTool; и отдельный LoRA-эксперимент для Qwen3.5-4B. Такой порядок позволяет понять, какой слой повышает recall, а какой только увеличивает число suggestions.
-
-## Эксперимент с GEC LoRA
-
-В проекте сохранена конфигурационная точка для BEA/SyntErr adapters:
-
-```text
-GEC_ADAPTER_REPO=synterr-nlp/bea2026-gec-adapters
-GEC_ADAPTER_SUBFOLDER=v4_qwen35_4b_lorugec
+```bash
+sudo systemctl restart ai-suggester.service
+journalctl -u ai-suggester.service -n 100 --no-pager
 ```
 
-Это отдельный экспериментальный этап. Адаптер нужно сначала слить с базовой Qwen3.5 и отдельно конвертировать/квантизировать в GGUF перед Ollama.
+Для E/G endpoint `:8101` предполагает отдельный небольшой Python wrapper над `RussianGEC_SeqTagger`, потому что исходный репозиторий sequence-tagger не является готовым OpenAI-compatible server.
 
-## Требования к оценке
+## Важное ограничение текущего коммита
 
-Модели сравниваем на одном и том же регрессионном наборе по категориям: орфография, пунктуация, согласование, управление, типографика, стиль; отдельно смотрим precision, recall/F0.5, false positives, число отображаемых suggestions и latency.
+D-G — это **каркас экспериментов и безопасный routing**, а не готовые production-модели. В частности, репозиторий не пытается автоматически скачать LoRA adapter, слить его с Qwen3.5, конвертировать в GGUF или поднимать sequence-tagger HTTP wrapper. Эти операции зависят от конкретного runtime и железа.
+
+Это намеренно: A/C остаются рабочими базовыми пресетами, а D-G нельзя случайно включить без явного `EXPERIMENTAL_GEC_URL`.
+
+## Рекомендуемый порядок испытаний
+
+1. A — контрольный baseline.
+2. D — Qwen3.5-4B + SyntErr→LORuGEC.
+3. E — sequence tagger.
+4. G — sequence tagger + T-lite verifier.
+5. F — отдельный surface benchmark для орфографии/пунктуации.
+6. C — только как дополнительный hybrid surface эксперимент.
+
+Для сравнения используйте один и тот же набор реальных абзацев и отдельно считайте precision, recall/F0.5, false positives, гиперкоррекции, разрушение текста, число suggestions и latency.
