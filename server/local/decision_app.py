@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 
-# Production A/C stay self-contained in Ollama. D-G are experimental profiles
-# and require a separate model/runtime endpoint described in README.md.
+# A/C use the existing Ollama production path. D-G use the local
+# experimental backend in this same FastAPI process; no second uvicorn.
 LLM_PRESET = os.getenv("LLM_PRESET", "A").strip().upper()
 PRESETS = {
     "A": {
@@ -20,26 +20,26 @@ PRESETS = {
         "experimental": False,
     },
     "D": {
-        "model": os.getenv("EXPERIMENTAL_MODEL", "Qwen/Qwen3.5-4B"),
+        "model": os.getenv("D_MODEL", "Qwen/Qwen3.5-4B"),
         "description": "Qwen3.5-4B + SyntErr→LORuGEC LoRA",
         "secondary": False,
         "experimental": True,
     },
     "E": {
-        "model": os.getenv("EXPERIMENTAL_MODEL", "RussianGEC_SeqTagger"),
-        "description": "Russian GEC sequence tagger (edit-based)",
+        "model": "local-edit-tagger",
+        "description": "Local edit/tagger backend (MorphDetector-backed)",
         "secondary": False,
         "experimental": True,
     },
     "F": {
-        "model": os.getenv("EXPERIMENTAL_MODEL", "melsmm/Spell-Corrector-RU-4B"),
+        "model": os.getenv("F_MODEL", "melsmm/Spell-Corrector-RU-4B"),
         "description": "Spell-Corrector-RU-4B surface correction",
         "secondary": False,
         "experimental": True,
     },
     "G": {
-        "model": os.getenv("EXPERIMENTAL_MODEL", "RussianGEC_SeqTagger"),
-        "description": "GEC tagger + T-lite verifier",
+        "model": "local-edit-tagger + T-lite verifier",
+        "description": "Local edit/tagger + T-lite verifier",
         "secondary": False,
         "experimental": True,
     },
@@ -51,24 +51,12 @@ if LLM_PRESET not in PRESETS:
 
 STACK = PRESETS[LLM_PRESET]
 if STACK["experimental"]:
-    # Experimental stacks deliberately fail fast until their dedicated
-    # OpenAI-compatible backend is configured. This prevents accidentally
-    # sending a seq-tagger or LoRA adapter through Ollama as a plain chat model.
-    EXPERIMENTAL_URL = os.getenv("EXPERIMENTAL_GEC_URL", "").strip()
-    if not EXPERIMENTAL_URL:
-        raise RuntimeError(
-            f"LLM_PRESET={LLM_PRESET} requires EXPERIMENTAL_GEC_URL. "
-            "See server/local/README.md for the D/E/F/G deployment contract."
-        )
     # Do not let the legacy startup warmup try to load an experimental model
-    # from Ollama. D-G are served by their dedicated backend only.
+    # from Ollama. D-G resolve their own local backend after main.py is loaded.
     os.environ["OLLAMA_WARMUP"] = "false"
-    os.environ["MODEL_NAME"] = STACK["model"]
-    os.environ["LLM_PRESET"] = LLM_PRESET
-else:
-    # main.py reads MODEL_NAME during import and also uses it for warmup/metrics.
-    os.environ["MODEL_NAME"] = STACK["model"]
-    os.environ["LLM_PRESET"] = LLM_PRESET
+
+os.environ["MODEL_NAME"] = STACK["model"]
+os.environ["LLM_PRESET"] = LLM_PRESET
 
 if STACK["secondary"]:
     os.environ["SECONDARY_GEC_ENABLED"] = "true"
@@ -84,9 +72,9 @@ import httpx
 import main as legacy
 from decision_engine import DecisionEngine
 from secondary_gec import SecondaryGEC, SecondaryEdit
+from experimental_backend import ExperimentalRouter
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-EXPERIMENTAL_URL = os.getenv("EXPERIMENTAL_GEC_URL", "").rstrip("/")
 MODEL_NAME = STACK["model"]
 NUM_THREADS = int(os.getenv("NUM_THREADS", "28"))
 NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
@@ -106,6 +94,12 @@ SECONDARY = (
         max_edits=int(os.getenv("SECONDARY_GEC_MAX_EDITS", "4")),
     )
     if STACK["secondary"]
+    else None
+)
+
+EXPERIMENTAL = (
+    ExperimentalRouter(LLM_PRESET, getattr(legacy, "_morph_detector", None))
+    if STACK["experimental"]
     else None
 )
 
@@ -156,9 +150,6 @@ def _extract_text(messages: list[dict]) -> str:
 
 
 def _render(corrected: str, accepted, secondary_edits: list[SecondaryEdit]) -> str:
-    # CHANGES is parsed later by the shared postprocess. Keep the structural
-    # form it expects; otherwise it may think the model forgot its report and
-    # reconstruct extra changes from a broad character diff.
     lines = [
         f"{i}. «{c.before}» → «{c.after}»"
         for i, c in enumerate(accepted, 1)
@@ -172,39 +163,38 @@ def _render(corrected: str, accepted, secondary_edits: list[SecondaryEdit]) -> s
     return f"===CORRECTED===\n{corrected}\n===CHANGES===\n{changes}\n===END==="
 
 
-def _openai_payload(raw_text: str) -> dict:
-    return {
+async def _ollama_candidates(raw_text: str, messages: list) -> list:
+    user_history = [m for m in messages if m.get("role") != "system"]
+    prompt_messages = [{"role": "system", "content": SYSTEM}, *user_history]
+    if not prompt_messages or prompt_messages[-1].get("role") != "user":
+        prompt_messages.append({"role": "user", "content": raw_text})
+    if (
+        prompt_messages
+        and prompt_messages[-1].get("role") == "user"
+        and not prompt_messages[-1].get("content", "").rstrip().endswith("/no_think")
+    ):
+        prompt_messages[-1]["content"] = prompt_messages[-1]["content"].rstrip() + "\n\n/no_think"
+
+    payload = {
         "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": SYSTEM},
-            {
-                "role": "user",
-                "content": (
-                    "ТЕКСТ ДЛЯ ПРОВЕРКИ:\n"
-                    + raw_text
-                    + "\n\nВерни только JSON по схеме."
-                ),
-            },
-        ],
+        "messages": prompt_messages,
         "stream": False,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "gec_edits", "schema": SCHEMA, "strict": True},
+        "format": SCHEMA,
+        "think": THINK,
+        "keep_alive": KEEP_ALIVE,
+        "options": {
+            "temperature": TEMPERATURE,
+            "num_ctx": NUM_CTX,
+            "num_predict": NUM_PREDICT,
+            "num_thread": NUM_THREADS,
+            "repeat_penalty": 1.05,
         },
-        "temperature": TEMPERATURE,
-        "max_tokens": NUM_PREDICT,
     }
-
-
-async def _call_experimental(raw_text: str) -> str:
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        response = await client.post(
-            f"{EXPERIMENTAL_URL}/v1/chat/completions",
-            json=_openai_payload(raw_text),
-        )
+        response = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
         response.raise_for_status()
-        content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "{}").strip()
-    return content
+        content = response.json().get("message", {}).get("content", "{}").strip()
+    return DecisionEngine.parse(content)
 
 
 async def decision_call_ollama(messages: list) -> str:
@@ -217,43 +207,10 @@ async def decision_call_ollama(messages: list) -> str:
             pass
 
     if STACK["experimental"]:
-        content = await _call_experimental(raw_text)
+        assert EXPERIMENTAL is not None
+        candidates = await EXPERIMENTAL.candidates(raw_text)
     else:
-        user_history = [m for m in messages if m.get("role") != "system"]
-        prompt_messages = [{"role": "system", "content": SYSTEM}, *user_history]
-        if not prompt_messages or prompt_messages[-1].get("role") != "user":
-            prompt_messages.append({"role": "user", "content": raw_text})
-        if (
-            prompt_messages
-            and prompt_messages[-1].get("role") == "user"
-            and not prompt_messages[-1].get("content", "").rstrip().endswith("/no_think")
-        ):
-            prompt_messages[-1]["content"] = prompt_messages[-1]["content"].rstrip() + "\n\n/no_think"
-
-        payload = {
-            "model": MODEL_NAME,
-            "messages": prompt_messages,
-            "stream": False,
-            "format": SCHEMA,
-            "think": THINK,
-            "keep_alive": KEEP_ALIVE,
-            "options": {
-                "temperature": TEMPERATURE,
-                "num_ctx": NUM_CTX,
-                "num_predict": NUM_PREDICT,
-                "num_thread": NUM_THREADS,
-                "repeat_penalty": 1.05,
-            },
-        }
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            response = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-            response.raise_for_status()
-            content = response.json().get("message", {}).get("content", "{}").strip()
-
-    try:
-        candidates = DecisionEngine.parse(content)
-    except (ValueError, TypeError, json.JSONDecodeError):
-        candidates = []
+        candidates = await _ollama_candidates(raw_text, messages)
 
     engine = DecisionEngine(
         min_confidence=float(os.getenv("DECISION_MIN_CONFIDENCE", "0.55")),
