@@ -1,23 +1,21 @@
 # AI LibreOffice Suggester — локальный GEC-сервер
 
-Production запускается через один systemd-сервис `ai-suggester.service` и один `uvicorn decision_app:app` на :8000. Второй uvicorn не нужен.
+Production работает через один systemd-сервис `ai-suggester.service` и один `uvicorn decision_app:app` на `:8000`. Дополнительный uvicorn не нужен.
 
 ## Пресеты
 
-Переключение полного стека делается одной переменной в `/home/service/llama/server/local/.env`:
+Переключение полного стека:
 
 ```text
 LLM_PRESET=A
 ```
 
-После изменения:
+После изменения `.env`:
 
 ```bash
 sudo systemctl restart ai-suggester.service
-journalctl -u ai-suggester.service -n 100 --no-pager
+journalctl -u ai-suggester.service -n 120 --no-pager
 ```
-
-В репозитории остаются два базовых стека A/C и добавлены четыре экспериментальных направления D-G.
 
 ### A — T-lite baseline
 
@@ -25,7 +23,7 @@ journalctl -u ai-suggester.service -n 100 --no-pager
 LLM_PRESET=A
 ```
 
-`t-tech/T-lite-it-2.1:q4_K_M` — текущий production baseline для русского официально-делового текста. Используются structured output, DecisionEngine, MorphFilter/MorphDetector, few-shot retrieval и существующий postprocess.
+`t-tech/T-lite-it-2.1:q4_K_M` через Ollama. Это текущий production baseline. Используются structured output, DecisionEngine, MorphFilter/MorphDetector, few-shot retrieval и общий postprocess.
 
 ### C — T-lite + compact surface GEC
 
@@ -33,200 +31,158 @@ LLM_PRESET=A
 LLM_PRESET=C
 ```
 
-Основной GEC — T-lite. После него запускается `hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0` как консервативный surface-слой. Secondary не имеет права переписывать лексику/словоформы целиком; применяется только через safe merge.
+Основной GEC — T-lite. После него идёт `hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0` с консервативным safe-merge.
 
-Установка secondary на production host:
+Однократно на production host:
 
 ```bash
 ollama pull hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0
 ```
 
-C остаётся experimental по качеству: используйте его только после проверки на вашем регрессионном наборе.
-
-## Новые экспериментальные стеки D-G
-
-Важное отличие: D-G **не направляются автоматически в Ollama**. Каждый из них требует отдельного inference backend с OpenAI-compatible endpoint `/v1/chat/completions`. Это сделано специально, чтобы нельзя было случайно загрузить несовместимую sequence-tagging модель как обычную chat-модель.
-
 ### D — Qwen3.5-4B + SyntErr→LORuGEC LoRA
 
 ```text
 LLM_PRESET=D
-EXPERIMENTAL_GEC_URL=http://127.0.0.1:1234
-EXPERIMENTAL_MODEL=Qwen3.5-4B-SyntErr-LORuGEC
 ```
 
-Идея — использовать Qwen3.5-4B с русским GEC-дообучением вместо zero-shot Qwen. Публичные SyntErr/BEA 2026 adapters содержат `v4_qwen35_4b_lorugec`, для которого на LORuGEC test опубликован M2 F0.5 75.3; это LoRA adapter, а не самостоятельная GGUF-модель, поэтому сначала нужен отдельный merge/quantize или PEFT/vLLM/llama.cpp runtime.
+D загружает базовую `Qwen/Qwen3.5-4B` и PEFT adapter `synterr-nlp/bea2026-gec-adapters`, subfolder `v4_qwen35_4b_lorugec`, прямо внутри того же FastAPI-процесса. Отдельный inference server не нужен.
 
-Источник adapter: `synterr-nlp/bea2026-gec-adapters`.
+Опубликованные эксперименты для этого adapter дают 75.3 M2 F0.5 на LORuGEC test для Qwen3.5-4B в режиме SyntErr→LORuGEC. urladapter cardhttps://huggingface.co/synterr-nlp/bea2026-gec-adapters
 
-### E — Russian GEC Sequence Tagger
+Однократно:
+
+```bash
+cd /home/service/llama/server/local
+source venv/bin/activate
+pip install -r requirements-experimental.txt
+```
+
+Weights и adapter загружаются Hugging Face при первом обращении и кэшируются локально.
+
+### E — local edit/tagger
 
 ```text
 LLM_PRESET=E
-EXPERIMENTAL_GEC_URL=http://127.0.0.1:8101
-EXPERIMENTAL_MODEL=RussianGEC_SeqTagger
 ```
 
-Это другой класс модели: sequence tagging / edit-based GEC. Модель предсказывает локальные операции над токенами, а не переписывает весь абзац. Именно такой подход интересен нам как защита от галлюцинаций и разрушения текста.
+E не генерирует новый абзац. Он использует существующий `MorphDetector` как token-level candidate/tagger и передаёт локальные `before → after` в `DecisionEngine`.
 
-Источник кода: `ReginaNasyrova/RussianGEC_SeqTagger`.
+Это сделано намеренно: опубликованный `ReginaNasyrova/RussianGEC_SeqTagger` содержит код обучения и inference, но не готовый checkpoint для скачивания, поэтому выдавать его за готовую production-модель было бы неправильно. urlисходный Russian GEC Sequence Taggerhttps://github.com/ReginaNasyrova/RussianGEC_SeqTagger
 
-Для D/E backend обязан вернуть JSON, совместимый с нашим `DecisionEngine`:
-
-```json
-{
-  "edits": [
-    {
-      "before": "после ночных наряда",
-      "after": "после ночных нарядов",
-      "confidence": 0.96,
-      "category": "agreement",
-      "reason": "согласование"
-    }
-  ]
-}
-```
+E работает из текущего production Python-окружения и не требует второго сервера.
 
 ### F — Spell-Corrector-RU-4B
 
 ```text
 LLM_PRESET=F
-EXPERIMENTAL_GEC_URL=http://127.0.0.1:1234
-EXPERIMENTAL_MODEL=melsmm/Spell-Corrector-RU-4B
 ```
 
-Это не замена основному GEC. Модель специализирована на русской орфографии, пунктуации и регистре. Её предполагаемая роль — отдельный surface слой с тем же принципом: только локальные правки через DecisionEngine.
+F лениво загружает `melsmm/Spell-Corrector-RU-4B` через Transformers. Модель предназначена для русской орфографии, пунктуации и регистра и опубликована как готовая merged-модель. urlmodel cardhttps://huggingface.co/melsmm/Spell-Corrector-RU-4B
 
-Модель: `melsmm/Spell-Corrector-RU-4B`.
+Однократно требуется `requirements-experimental.txt`; модель скачивается Hugging Face при первом запросе.
 
-### G — Russian GEC Tagger + T-lite verifier
+### G — local edit/tagger + T-lite verifier
 
 ```text
 LLM_PRESET=G
-EXPERIMENTAL_GEC_URL=http://127.0.0.1:8101
-EXPERIMENTAL_MODEL=RussianGEC_SeqTagger
 ```
 
-Целевая архитектура production-класса:
+Pipeline:
 
 ```text
 raw text
-   ↓
-Russian GEC Sequence Tagger
-   ↓
-локальные edit candidates
-   ↓
-pymorphy3 / user_dict / MorphDetector
-   ↓
-T-lite как verifier спорных кандидатов
-   ↓
+  ↓
+MorphDetector / local edit candidates
+  ↓
+T-lite verifier (Ollama)
+  ↓
 DecisionEngine
-   ↓
-минимальный набор CHANGES
+  ↓
+минимальные CHANGES
 ```
 
-G — самый интересный архитектурный вариант, но на текущем коммите verifier ещё не включён автоматически: сначала необходимо поднять tagger backend и отдельно проверить качество кандидатов.
+G использует T-lite только как проверяющий, а не как генератор полного исправленного абзаца.
 
-## Переменные D-G
+## D/F: параметры загрузки
+
+Можно задать:
 
 ```text
-EXPERIMENTAL_GEC_URL=http://127.0.0.1:1234
-EXPERIMENTAL_MODEL=
+D_BASE_MODEL=Qwen/Qwen3.5-4B
+D_ADAPTER=synterr-nlp/bea2026-gec-adapters
+F_MODEL=melsmm/Spell-Corrector-RU-4B
+EXPERIMENTAL_DEVICE_MAP=auto
+EXPERIMENTAL_DTYPE=auto
 ```
 
-Ожидается OpenAI-compatible endpoint:
+`auto` позволяет Transformers подобрать устройство. Для CPU можно явно задать `EXPERIMENTAL_DEVICE_MAP=cpu`.
 
-```text
-POST /v1/chat/completions
-```
-
-Сервер должен принимать `response_format=json_schema` и возвращать `choices[0].message.content` как JSON по схеме `edits`.
-
-## Развёртывание A/C
-
-Production `.env`:
+## Установка D/F
 
 ```bash
 cd /home/service/llama/server/local
-nano .env
+source venv/bin/activate
+pip install -r requirements-experimental.txt
 ```
 
-Для A:
+После этого переключение остаётся тем же:
 
 ```text
-LLM_PRESET=A
-```
-
-Для C:
-
-```text
-LLM_PRESET=C
-```
-
-Затем:
-
-```bash
-sudo systemctl restart ai-suggester.service
-journalctl -u ai-suggester.service -n 100 --no-pager
-```
-
-Проверка должна показывать:
-
-```text
-Preset=A ... model=t-tech/T-lite-it-2.1:q4_K_M
+LLM_PRESET=D
 ```
 
 или:
 
 ```text
-Preset=C ... model=t-tech/T-lite-it-2.1:q4_K_M
-SecondaryGEC ready: model=...
+LLM_PRESET=F
 ```
 
-## Развёртывание D-F через LM Studio / llmster
-
-LM Studio может выступать как OpenAI-compatible локальный inference backend. Для headless Linux следует использовать server/headless runtime, а не запускать второй uvicorn нашего приложения.
-
-Общий контракт:
-
-```text
-LibreOffice
-   ↓
-FastAPI :8000
-   ↓
-experimental backend :1234
-   ↓
-D/F model
-```
-
-После запуска backend:
-
-```text
-EXPERIMENTAL_GEC_URL=http://127.0.0.1:1234
-```
-
-и:
+и затем:
 
 ```bash
 sudo systemctl restart ai-suggester.service
-journalctl -u ai-suggester.service -n 100 --no-pager
+journalctl -u ai-suggester.service -n 120 --no-pager
 ```
 
-Для E/G endpoint `:8101` предполагает отдельный небольшой Python wrapper над `RussianGEC_SeqTagger`, потому что исходный репозиторий sequence-tagger не является готовым OpenAI-compatible server.
+## Проверка
 
-## Важное ограничение текущего коммита
+A/C должны показывать Ollama model warmup, а D/E/F/G — не должны запускать Ollama warmup как основную модель.
 
-D-G — это **каркас экспериментов и безопасный routing**, а не готовые production-модели. В частности, репозиторий не пытается автоматически скачать LoRA adapter, слить его с Qwen3.5, конвертировать в GGUF или поднимать sequence-tagger HTTP wrapper. Эти операции зависят от конкретного runtime и железа.
+Для D ожидается лог вида:
 
-Это намеренно: A/C остаются рабочими базовыми пресетами, а D-G нельзя случайно включить без явного `EXPERIMENTAL_GEC_URL`.
+```text
+Preset=D ...
+Experimental[D]: loading base=Qwen/Qwen3.5-4B ...
+Experimental[D]: loading adapter=synterr-nlp/bea2026-gec-adapters
+Experimental[D]: model ready
+```
 
-## Рекомендуемый порядок испытаний
+Для F:
 
-1. A — контрольный baseline.
-2. D — Qwen3.5-4B + SyntErr→LORuGEC.
-3. E — sequence tagger.
-4. G — sequence tagger + T-lite verifier.
-5. F — отдельный surface benchmark для орфографии/пунктуации.
-6. C — только как дополнительный hybrid surface эксперимент.
+```text
+Preset=F ...
+Experimental[F]: loading base=melsmm/Spell-Corrector-RU-4B ...
+Experimental[F]: model ready
+```
 
-Для сравнения используйте один и тот же набор реальных абзацев и отдельно считайте precision, recall/F0.5, false positives, гиперкоррекции, разрушение текста, число suggestions и latency.
+Для E:
+
+```text
+Preset=E ... candidates=...
+```
+
+Для G дополнительно должна быть видна работа T-lite verifier.
+
+## Ограничения
+
+D и F требуют `torch/transformers/peft` и заметной RAM/CPU или GPU; это нормально для экспериментальных стеков. A/C не требуют этих дополнительных пакетов.
+
+E/G являются рабочими edit-based стеками, но E/G не являются буквальным запуском опубликованного checkpoint `RussianGEC_SeqTagger`: checkpoint автором не опубликован в исходном репозитории. Это различие оставлено явным в архитектуре.
+
+## Рекомендуемый порядок тестирования
+
+```text
+A → C → D → E → G → F
+```
+
+Сначала сравнивайте на одном и том же наборе из ваших реальных абзацев. Основные метрики: recall реальных ошибок, precision правок, false positives, гиперкоррекция, разрушение текста, количество suggestions и latency.
