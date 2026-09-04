@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
+# pipefail is useful but not required for installation; keep compatibility
+# with minimal/older bash builds used on some Astra Linux hosts.
+set -o pipefail 2>/dev/null || true
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
@@ -18,11 +21,11 @@ fi
 "$PYTHON_BIN" - <<'PY'
 from huggingface_hub import snapshot_download
 
-print('Downloading D base model: Qwen/Qwen3.5-4B')
-snapshot_download('Qwen/Qwen3.5-4B')
-print('Downloading D adapter: synterr-nlp/bea2026-gec-adapters')
-snapshot_download('synterr-nlp/bea2026-gec-adapters')
-print('Downloading F model: melsmm/Spell-Corrector-RU-4B')
-snapshot_download('melsmm/Spell-Corrector-RU-4B')
-print('Experimental models cached.')
+print("Downloading D base model: Qwen/Qwen3.5-4B")
+snapshot_download("Qwen/Qwen3.5-4B")
+print("Downloading D adapter: synterr-nlp/bea2026-gec-adapters")
+snapshot_download("synterr-nlp/bea2026-gec-adapters")
+print("Downloading F model: melsmm/Spell-Corrector-RU-4B")
+snapshot_download("melsmm/Spell-Corrector-RU-4B")
+print("Experimental models cached.")
 PY
