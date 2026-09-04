@@ -51,8 +51,6 @@ if LLM_PRESET not in PRESETS:
 
 STACK = PRESETS[LLM_PRESET]
 if STACK["experimental"]:
-    # Do not let the legacy startup warmup try to load an experimental model
-    # from Ollama. D-G resolve their own local backend after main.py is loaded.
     os.environ["OLLAMA_WARMUP"] = "false"
 
 os.environ["MODEL_NAME"] = STACK["model"]
@@ -240,9 +238,11 @@ async def decision_call_ollama(messages: list) -> str:
 
 app = legacy.app
 
-if SECONDARY is not None:
-    @app.on_event("startup")
-    async def _startup_secondary_check() -> None:
+@app.on_event("startup")
+async def _startup_stack() -> None:
+    if SECONDARY is not None:
         await SECONDARY.check_available()
+    if EXPERIMENTAL is not None:
+        await EXPERIMENTAL.warmup()
 
 legacy.call_ollama = decision_call_ollama
