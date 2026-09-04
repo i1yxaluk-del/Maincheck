@@ -1,0 +1,9 @@
+# Optional dependencies for presets D/F.
+# Install into the same venv only when these presets are needed.
+transformers>=4.55.0
+accelerate>=1.7.0
+peft>=0.15.0
+safetensors>=0.5.3
+torch>=2.2.0
+huggingface_hub>=0.30.0
+sentencepiece>=0.2.0
