@@ -191,11 +191,9 @@ class ExperimentalBackend:
         self._loaded = True
         logger.info("Experimental[%s]: model ready", self.config.preset)
 
-    def _generate(self, text: str, max_new_tokens: int = 512) -> str:
-        self._load_transformers()
-        import torch
-
-        assert self._tokenizer is not None and self._model is not None
+    def _prepare_inputs(self, text: str):
+        """Return a tensor mapping suitable for model.generate(**inputs)."""
+        assert self._tokenizer is not None
         messages = [
             {"role": "system", "content": GEC_PROMPT},
             {"role": "user", "content": f"ИСХОДНЫЙ ТЕКСТ:\n{text}"},
@@ -205,19 +203,47 @@ class ExperimentalBackend:
             add_generation_prompt=True,
             tokenize=True,
             return_tensors="pt",
+            return_dict=True,
         )
-        inputs = inputs.to(self._model.device)
+        # Some tokenizer versions return a bare tensor, others BatchEncoding.
+        if hasattr(inputs, "items"):
+            target_device = self._model.device
+            return {k: v.to(target_device) for k, v in inputs.items() if hasattr(v, "to")}
+        return inputs.to(self._model.device)
+
+    def _generate(self, text: str, max_new_tokens: int = 512) -> str:
+        self._load_transformers()
+        import torch
+
+        assert self._tokenizer is not None and self._model is not None
+        inputs = self._prepare_inputs(text)
+        input_ids = inputs["input_ids"] if isinstance(inputs, dict) else inputs
         with torch.inference_mode():
-            output = self._model.generate(
-                inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=0.0,
-                top_p=1.0,
-                repetition_penalty=1.03,
-            )
-        generated = output[0][inputs.shape[-1]:]
+            if isinstance(inputs, dict):
+                output = self._model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    top_p=1.0,
+                    repetition_penalty=1.03,
+                )
+            else:
+                output = self._model.generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    top_p=1.0,
+                    repetition_penalty=1.03,
+                )
+        generated = output[0][input_ids.shape[-1]:]
         return self._tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+    def warmup(self) -> None:
+        """Load model and run a tiny deterministic generation before serving."""
+        if not self._loaded:
+            self._load_transformers()
+        _ = self._generate("Контрольный текст без ошибок.", max_new_tokens=8)
+        logger.info("Experimental[%s]: warmup OK", self.config.preset)
 
     def candidates(self, raw_text: str) -> list[EditCandidate]:
         output = self._generate(raw_text)
@@ -346,3 +372,16 @@ class ExperimentalRouter:
         if self.preset == "G":
             return await verify_with_tlite(raw_text, local)
         return local
+
+    async def warmup(self) -> None:
+        if self.preset not in {"D", "F"} or self.backend is None:
+            logger.info("Experimental[%s]: warmup uses local edit backend (no model load)", self.preset)
+            return
+        if os.getenv("EXPERIMENTAL_WARMUP", "true").lower() not in {"1", "true", "yes", "on"}:
+            logger.info("Experimental[%s]: warmup disabled by EXPERIMENTAL_WARMUP=false", self.preset)
+            return
+        try:
+            await asyncio.to_thread(self.backend.warmup)
+        except Exception as exc:
+            logger.exception("Experimental[%s]: warmup failed: %s", self.preset, exc)
+            raise
