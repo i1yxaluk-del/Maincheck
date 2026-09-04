@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -67,21 +68,21 @@ def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[Ed
         bw = _words(before)
         aw = _words(after)
 
-        # Permit punctuation/spacing-only insertions and replacements, but
-        # never allow lexical word insertion/deletion.
+        # Permit punctuation/spacing-only replacements, but never lexical word
+        # insertion/deletion. DecisionEngine intentionally rejects empty BEFORE.
         if not bw or not aw:
             if _is_wordless(before) and _is_wordless(after):
-                result.append(EditCandidate(
-                    before=before,
-                    after=after,
-                    confidence=0.78,
-                    category="punctuation/typography",
-                    reason="safe surface diff",
-                ))
+                result.append(
+                    EditCandidate(
+                        before=before,
+                        after=after,
+                        confidence=0.78,
+                        category="punctuation/typography",
+                        reason="safe surface diff",
+                    )
+                )
             continue
-        if len(bw) != len(aw):
-            continue
-        if len(bw) > 2:
+        if len(bw) != len(aw) or len(bw) > 2:
             continue
         result.append(
             EditCandidate(
@@ -227,13 +228,7 @@ class ExperimentalBackend:
 
 
 class LocalEditTagger:
-    """Local token-level candidate generator used by E/G.
-
-    The published RussianGEC_SeqTagger repository contains training/inference
-    code but no ready-to-download checkpoint. We therefore keep E/G runnable
-    with the same edit-based architecture using the production MorphDetector
-    as the local tagger rather than pretending a missing checkpoint exists.
-    """
+    """Local token-level candidate generator used by E/G."""
 
     def __init__(self, morph_detector) -> None:
         self.detector = morph_detector
@@ -316,10 +311,7 @@ async def verify_with_tlite(raw_text: str, candidates: list[EditCandidate]) -> l
             content = response.json().get("message", {}).get("content", "{}")
         data = json.loads(content)
         flags = data.get("accept", [])
-        return [
-            c for i, c in enumerate(candidates[:12])
-            if i < len(flags) and bool(flags[i])
-        ]
+        return [c for i, c in enumerate(candidates[:12]) if i < len(flags) and bool(flags[i])]
     except Exception as exc:
         logger.warning("G verifier unavailable, rejecting local candidates: %s", exc)
         return []
@@ -349,7 +341,7 @@ class ExperimentalRouter:
 
     async def candidates(self, raw_text: str) -> list[EditCandidate]:
         if self.preset in {"D", "F"} and self.backend is not None:
-            return self.backend.candidates(raw_text)
+            return await asyncio.to_thread(self.backend.candidates, raw_text)
         local = self.morph_tagger.candidates(raw_text)
         if self.preset == "G":
             return await verify_with_tlite(raw_text, local)
