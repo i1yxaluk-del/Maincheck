@@ -49,16 +49,6 @@ D загружает базовую `Qwen/Qwen3.5-4B` и PEFT adapter `synterr-n
 
 Опубликованные эксперименты для этого adapter дают 75.3 M2 F0.5 на LORuGEC test для Qwen3.5-4B в режиме SyntErr→LORuGEC. urladapter cardhttps://huggingface.co/synterr-nlp/bea2026-gec-adapters
 
-Однократно:
-
-```bash
-cd /home/service/llama/server/local
-source venv/bin/activate
-pip install -r requirements-experimental.txt
-```
-
-Weights и adapter загружаются Hugging Face при первом обращении и кэшируются локально.
-
 ### E — local edit/tagger
 
 ```text
@@ -67,9 +57,7 @@ LLM_PRESET=E
 
 E не генерирует новый абзац. Он использует существующий `MorphDetector` как token-level candidate/tagger и передаёт локальные `before → after` в `DecisionEngine`.
 
-Это сделано намеренно: опубликованный `ReginaNasyrova/RussianGEC_SeqTagger` содержит код обучения и inference, но не готовый checkpoint для скачивания, поэтому выдавать его за готовую production-модель было бы неправильно. urlисходный Russian GEC Sequence Taggerhttps://github.com/ReginaNasyrova/RussianGEC_SeqTagger
-
-E работает из текущего production Python-окружения и не требует второго сервера.
+Опубликованный `ReginaNasyrova/RussianGEC_SeqTagger` содержит код обучения и inference, но не готовый checkpoint для скачивания. Поэтому E — рабочий локальный edit-based implementation, а не выдуманный wrapper над отсутствующими весами. urlисходный Russian GEC Sequence Taggerhttps://github.com/ReginaNasyrova/RussianGEC_SeqTagger
 
 ### F — Spell-Corrector-RU-4B
 
@@ -78,8 +66,6 @@ LLM_PRESET=F
 ```
 
 F лениво загружает `melsmm/Spell-Corrector-RU-4B` через Transformers. Модель предназначена для русской орфографии, пунктуации и регистра и опубликована как готовая merged-модель. urlmodel cardhttps://huggingface.co/melsmm/Spell-Corrector-RU-4B
-
-Однократно требуется `requirements-experimental.txt`; модель скачивается Hugging Face при первом запросе.
 
 ### G — local edit/tagger + T-lite verifier
 
@@ -103,9 +89,34 @@ DecisionEngine
 
 G использует T-lite только как проверяющий, а не как генератор полного исправленного абзаца.
 
-## D/F: параметры загрузки
+## Установка экспериментальных моделей
 
-Можно задать:
+D и F требуют дополнительные Python-пакеты:
+
+```bash
+cd /home/service/llama/server/local
+source venv/bin/activate
+pip install -r requirements-experimental.txt
+```
+
+Чтобы заранее скачать все HF-веса и не ждать первый запрос:
+
+```bash
+cd /home/service/llama/server/local
+bash install_experimental_models.sh
+```
+
+Скрипт кэширует:
+
+```text
+Qwen/Qwen3.5-4B
+synterr-nlp/bea2026-gec-adapters
+melsmm/Spell-Corrector-RU-4B
+```
+
+E дополнительных моделей не требует. G использует уже установленный T-lite через Ollama.
+
+## D/F: параметры
 
 ```text
 D_BASE_MODEL=Qwen/Qwen3.5-4B
@@ -115,40 +126,55 @@ EXPERIMENTAL_DEVICE_MAP=auto
 EXPERIMENTAL_DTYPE=auto
 ```
 
-`auto` позволяет Transformers подобрать устройство. Для CPU можно явно задать `EXPERIMENTAL_DEVICE_MAP=cpu`.
-
-## Установка D/F
-
-```bash
-cd /home/service/llama/server/local
-source venv/bin/activate
-pip install -r requirements-experimental.txt
-```
-
-После этого переключение остаётся тем же:
+Для CPU можно задать:
 
 ```text
-LLM_PRESET=D
+EXPERIMENTAL_DEVICE_MAP=cpu
 ```
 
-или:
+D и F загружаются лениво и исполняются в отдельном worker thread, чтобы не блокировать asyncio event loop FastAPI.
 
-```text
-LLM_PRESET=F
-```
+## Переключение
 
-и затем:
+### A
 
 ```bash
+sed -i 's/^LLM_PRESET=.*/LLM_PRESET=A/' /home/service/llama/server/local/.env
 sudo systemctl restart ai-suggester.service
 journalctl -u ai-suggester.service -n 120 --no-pager
 ```
 
-## Проверка
+### C
 
-A/C должны показывать Ollama model warmup, а D/E/F/G — не должны запускать Ollama warmup как основную модель.
+```bash
+sed -i 's/^LLM_PRESET=.*/LLM_PRESET=C/' /home/service/llama/server/local/.env
+sudo systemctl restart ai-suggester.service
+journalctl -u ai-suggester.service -n 120 --no-pager
+```
 
-Для D ожидается лог вида:
+### D / E / F / G
+
+Меняется только `LLM_PRESET`:
+
+```text
+LLM_PRESET=D
+LLM_PRESET=E
+LLM_PRESET=F
+LLM_PRESET=G
+```
+
+После этого:
+
+```bash
+sudo systemctl restart ai-suggester.service
+journalctl -u ai-suggester.service -n 160 --no-pager
+```
+
+Для D/F первый запрос может быть медленнее из-за загрузки Hugging Face weights; после кэширования веса переиспользуются.
+
+## Логи
+
+D:
 
 ```text
 Preset=D ...
@@ -157,7 +183,7 @@ Experimental[D]: loading adapter=synterr-nlp/bea2026-gec-adapters
 Experimental[D]: model ready
 ```
 
-Для F:
+F:
 
 ```text
 Preset=F ...
@@ -165,24 +191,28 @@ Experimental[F]: loading base=melsmm/Spell-Corrector-RU-4B ...
 Experimental[F]: model ready
 ```
 
-Для E:
+E:
 
 ```text
-Preset=E ... candidates=...
+Preset=E ... Local edit/tagger backend ... candidates=...
 ```
 
-Для G дополнительно должна быть видна работа T-lite verifier.
+G:
+
+```text
+Preset=G ... Local edit/tagger + T-lite verifier ...
+```
 
 ## Ограничения
 
-D и F требуют `torch/transformers/peft` и заметной RAM/CPU или GPU; это нормально для экспериментальных стеков. A/C не требуют этих дополнительных пакетов.
+D и F требуют `torch/transformers/peft` и заметной RAM/CPU или GPU. A/C не требуют этих дополнительных пакетов.
 
-E/G являются рабочими edit-based стеками, но E/G не являются буквальным запуском опубликованного checkpoint `RussianGEC_SeqTagger`: checkpoint автором не опубликован в исходном репозитории. Это различие оставлено явным в архитектуре.
+E/G являются рабочими edit-based стеками, но E/G не являются буквальным запуском опубликованного checkpoint `RussianGEC_SeqTagger`, потому что готового checkpoint в исходном репозитории нет.
 
-## Рекомендуемый порядок тестирования
+## Порядок тестирования
 
 ```text
 A → C → D → E → G → F
 ```
 
-Сначала сравнивайте на одном и том же наборе из ваших реальных абзацев. Основные метрики: recall реальных ошибок, precision правок, false positives, гиперкоррекция, разрушение текста, количество suggestions и latency.
+На одном и том же наборе реальных абзацев считайте precision, recall/F0.5, false positives, гиперкоррекцию, разрушение текста, число suggestions и latency.
