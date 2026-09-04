@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -14,29 +14,6 @@ from decision_engine import EditCandidate
 
 logger = logging.getLogger("ai_suggester.experimental")
 
-
-JSON_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "edits": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "before": {"type": "string"},
-                    "after": {"type": "string"},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "category": {"type": "string"},
-                    "reason": {"type": "string"},
-                },
-                "required": ["before", "after", "confidence", "category", "reason"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["edits"],
-    "additionalProperties": False,
-}
 
 GEC_PROMPT = """Ты — консервативный корректор русского официально-делового текста.
 Найди только реальные ошибки в исходном тексте: орфография, опечатки,
@@ -71,6 +48,10 @@ def _words(text: str) -> list[str]:
     return [m.group(0) for m in _WORD_RE.finditer(text)]
 
 
+def _is_wordless(text: str) -> bool:
+    return bool(text) and not _WORD_RE.search(text)
+
+
 def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[EditCandidate]:
     if not source or not corrected or source == corrected:
         return []
@@ -85,9 +66,18 @@ def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[Ed
             continue
         bw = _words(before)
         aw = _words(after)
-        # Never allow a generated whole-word insertion/deletion through the
-        # experimental path. Punctuation and spelling replacements are okay.
+
+        # Permit punctuation/spacing-only insertions and replacements, but
+        # never allow lexical word insertion/deletion.
         if not bw or not aw:
+            if _is_wordless(before) and _is_wordless(after):
+                result.append(EditCandidate(
+                    before=before,
+                    after=after,
+                    confidence=0.78,
+                    category="punctuation/typography",
+                    reason="safe surface diff",
+                ))
             continue
         if len(bw) != len(aw):
             continue
@@ -110,8 +100,9 @@ def _parse_model_json(text: str) -> list[EditCandidate]:
         return []
     candidates: list[EditCandidate] = []
     blocks = [text.strip()]
-    fenced = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
-    blocks.extend(fenced)
+    blocks.extend(
+        re.findall(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    )
     for block in blocks:
         try:
             payload = json.loads(block)
@@ -158,7 +149,7 @@ class ExperimentalBackend:
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
-        except Exception as exc:  # pragma: no cover - environment dependent
+        except Exception as exc:
             raise RuntimeError(
                 "D/F require transformers, torch, accelerate and peft. "
                 "Install server/local/requirements-experimental.txt"
@@ -167,7 +158,13 @@ class ExperimentalBackend:
         base_model = self.config.base_model or self.config.model
         device_map = os.getenv("EXPERIMENTAL_DEVICE_MAP", "auto")
         dtype = os.getenv("EXPERIMENTAL_DTYPE", "auto")
-        logger.info("Experimental[%s]: loading base=%s device_map=%s dtype=%s", self.config.preset, base_model, device_map, dtype)
+        logger.info(
+            "Experimental[%s]: loading base=%s device_map=%s dtype=%s",
+            self.config.preset,
+            base_model,
+            device_map,
+            dtype,
+        )
         self._tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
         kwargs: dict[str, Any] = {
             "device_map": device_map,
@@ -181,10 +178,14 @@ class ExperimentalBackend:
         if self.config.adapter:
             try:
                 from peft import PeftModel
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:
                 raise RuntimeError("D requires peft; install requirements-experimental.txt") from exc
             logger.info("Experimental[D]: loading adapter=%s", self.config.adapter)
-            self._model = PeftModel.from_pretrained(self._model, self.config.adapter, subfolder="v4_qwen35_4b_lorugec")
+            self._model = PeftModel.from_pretrained(
+                self._model,
+                self.config.adapter,
+                subfolder="v4_qwen35_4b_lorugec",
+            )
         self._model.eval()
         self._loaded = True
         logger.info("Experimental[%s]: model ready", self.config.preset)
@@ -204,8 +205,7 @@ class ExperimentalBackend:
             tokenize=True,
             return_tensors="pt",
         )
-        if hasattr(inputs, "to"):
-            inputs = inputs.to(self._model.device)
+        inputs = inputs.to(self._model.device)
         with torch.inference_mode():
             output = self._model.generate(
                 inputs,
@@ -219,26 +219,20 @@ class ExperimentalBackend:
         return self._tokenizer.decode(generated, skip_special_tokens=True).strip()
 
     def candidates(self, raw_text: str) -> list[EditCandidate]:
-        if self.config.preset in {"D", "F"}:
-            output = self._generate(raw_text)
-            parsed = _parse_model_json(output)
-            if parsed:
-                return parsed
-            # F is a corrected-text model in its public model card; D may also
-            # fall back to text generation when a JSON-constrained generation
-            # was not followed. Both paths go through conservative diffing.
-            return _safe_diff_candidates(raw_text, output, "specialized-gec")
-        return []
+        output = self._generate(raw_text)
+        parsed = _parse_model_json(output)
+        if parsed:
+            return parsed
+        return _safe_diff_candidates(raw_text, output, "specialized-gec")
 
 
 class LocalEditTagger:
-    """Deterministic local tagger: turns MorphDetector findings into edits.
+    """Local token-level candidate generator used by E/G.
 
-    This is the production-safe substitute for the published research code in
-    E/G because the upstream repository publishes training/inference scripts
-    but no ready-to-download checkpoint. It preserves the intended edit-based
-    architecture: candidate detection is local and token-level, never full
-    paragraph generation.
+    The published RussianGEC_SeqTagger repository contains training/inference
+    code but no ready-to-download checkpoint. We therefore keep E/G runnable
+    with the same edit-based architecture using the production MorphDetector
+    as the local tagger rather than pretending a missing checkpoint exists.
     """
 
     def __init__(self, morph_detector) -> None:
@@ -279,9 +273,9 @@ async def verify_with_tlite(raw_text: str, candidates: list[EditCandidate]) -> l
             {
                 "role": "system",
                 "content": (
-                    "Ты валидатор одной или нескольких предложенных правок русского текста. "
-                    "Не исправляй текст сам. Для каждой правки ответь ACCEPT/REJECT. "
-                    "Принимай только очевидную языковую ошибку."
+                    "Ты валидатор предложенных правок русского текста. "
+                    "Не исправляй текст сам. Для каждой правки верни true/false. "
+                    "Принимай только очевидную ошибку, относящуюся к исходному тексту."
                 ),
             },
             {
@@ -322,7 +316,10 @@ async def verify_with_tlite(raw_text: str, candidates: list[EditCandidate]) -> l
             content = response.json().get("message", {}).get("content", "{}")
         data = json.loads(content)
         flags = data.get("accept", [])
-        return [c for i, c in enumerate(candidates[:12]) if i < len(flags) and bool(flags[i])]
+        return [
+            c for i, c in enumerate(candidates[:12])
+            if i < len(flags) and bool(flags[i])
+        ]
     except Exception as exc:
         logger.warning("G verifier unavailable, rejecting local candidates: %s", exc)
         return []
