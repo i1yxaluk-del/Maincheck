@@ -22,7 +22,6 @@ LLM_PRESET = os.getenv("LLM_PRESET", "A").strip().upper()
 if LLM_PRESET not in STACKS:
     raise RuntimeError(f"Unsupported LLM_PRESET={LLM_PRESET!r}; expected A, F or G")
 
-NUM_THREADS = int(os.getenv("NUM_THREADS", "28"))
 MIN_CONFIDENCE = float(os.getenv("DECISION_MIN_CONFIDENCE", "0.60"))
 MAX_CHANGES = int(os.getenv("DECISION_MAX_CHANGES", "12"))
 MAX_BEFORE_CHARS = int(os.getenv("DECISION_MAX_BEFORE_CHARS", "120"))
@@ -98,8 +97,6 @@ async def startup() -> None:
             await router.warmup()
             logger.info("Warmup OK in %d ms", int((time.perf_counter() - started) * 1000))
         except Exception as exc:
-            # A production stack must remain startable when Ollama is down;
-            # the first request will surface the dependency error instead.
             logger.warning("Warmup failed: %s", exc)
 
 
@@ -180,11 +177,10 @@ async def suggest(
     if not raw_text:
         return "ОШИБКА: Пустой текст"
 
-    started = Timer()
+    timer = Timer()
+    timer.__enter__()
     ok = True
     error = ""
-    corrected = raw_text
-    accepted = []
     try:
         candidates = await router.candidates(raw_text, raw_ctx)
         engine = DecisionEngine(
@@ -202,13 +198,15 @@ async def suggest(
             len(raw_ctx),
             len(candidates),
             len(accepted),
-            started.ms,
+            timer.ms if hasattr(timer, "ms") else 0,
         )
     except Exception as exc:
         ok = False
         error = f"{type(exc).__name__}: {exc}"
         logger.exception("Suggestion failed")
         result = f"ОШИБКА_СЕРВЕРА: {error}"
+    finally:
+        timer.__exit__(None, None, None)
 
     if audit is not None:
         audit.record(
@@ -219,7 +217,7 @@ async def suggest(
             text=raw_text,
             context=raw_ctx,
             changes_count=count_changes(result),
-            duration_ms=started.ms,
+            duration_ms=timer.ms,
             ok=ok,
             error=error,
         )
