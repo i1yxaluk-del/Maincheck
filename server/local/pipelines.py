@@ -18,33 +18,42 @@ logger = logging.getLogger("ai_suggester.pipelines")
 A_MODEL = "t-tech/T-lite-it-2.1:q4_K_M"
 F_MODEL = os.getenv("F_MODEL", "melsmm/Spell-Corrector-RU-4B")
 G_MODEL = os.getenv("G_VERIFIER_MODEL", A_MODEL)
-
 WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+(?:[-/][А-Яа-яЁёA-Za-z]+)*")
 
-A_SYSTEM = """Ты — консервативный корректор русского официально-делового текста.
+A_SYSTEM = """Ты — редактор русского официально-делового текста. Твоя задача — находить только реальные ошибки и сообщать только локальные правки.
 
-Исправляй только явные ошибки: орфографию, опечатки, пунктуацию,
-согласование и управление. Не переписывай стиль и не перефразируй текст.
-Не меняй корректные падежи, формы слов, термины, аббревиатуры, имена,
-названия организаций, номера, даты и значения.
-Не исправляй е/ё.
+РАЗРЕШЕНО: явные опечатки и орфография, очевидная пунктуация, явное
+согласование и управление.
 
-Работай только как редактор локальных правок. Не возвращай целиком текст.
-Для каждой правки указывай точный фрагмент BEFORE из исходного текста.
-Если сомневаешься хотя бы немного — правку не предлагай.
-Максимум 12 правок.
+ЗАПРЕЩЕНО: улучшение стиля, перефразирование, сокращение/расширение текста,
+замена терминов, изменение аббревиатур, имён, названий организаций,
+номеров и дат, нормализация е/ё, а также исправление допустимой словоформы
+на другую допустимую словоформу без прямого грамматического основания.
+
+КРИТИЧЕСКОЕ ПРАВИЛО: BEFORE должен быть дословной непрерывной строкой из
+исходного текста. AFTER — только минимальная правка этого фрагмента.
+Не возвращай исправленный абзац целиком. Не создавай новые фрагменты,
+которых нет во входе. При сомнении — edits=[] . Максимум 12 правок.
+
+Примеры НЕ-правок:
+«изучена» → «изучено» — без явной причины запрещено;
+«должностного» → «должностных» — без явной причины запрещено;
+«деятельностей» → «деятельности» — без явной причины запрещено.
 """
 
-G_SYSTEM = """Ты — валидатор предложенных правок русского официально-делового текста.
-Не исправляй текст сам и не предлагай новых правок.
-Для каждой предложенной правки реши только: очевидно ли, что это ошибка.
-Принимай только правки с практически нулевым риском ложного срабатывания.
+G_SYSTEM = """Ты — консервативный валидатор предложенных правок русского официально-делового текста.
+Не исправляй текст сам. Не меняй BEFORE/AFTER. Для каждой правки ответь
+true только тогда, когда ошибка очевидна по самому предложению и существует
+один очевидный вариант исправления. Валидные, но стилистически иные формы
+отклоняй. При сомнении — false.
 """
 
 F_PROMPT = """Исходный текст:
 {TEXT}
 
-Отредактируй исходный текст, исправив ошибки."""
+Отредактируй исходный текст, исправив ошибки.
+Не перестраивай предложения и не меняй формы слов, если это не требуется
+для явной орфографической или пунктуационной ошибки."""
 
 
 @dataclass(frozen=True)
@@ -56,14 +65,14 @@ class StackInfo:
 
 
 STACKS: dict[str, StackInfo] = {
-    "A": StackInfo("A", "production: T-lite + строгий JSON + локальный safety gate", A_MODEL, False),
+    "A": StackInfo("A", "production: T-lite + structured edits + hard safety gates", A_MODEL, False),
     "F": StackInfo("F", "experimental: Spell-Corrector-RU-4B + surface-only gate", F_MODEL, True),
-    "G": StackInfo("G", "experimental: local edit detector + T-lite verifier", G_MODEL, True),
+    "G": StackInfo("G", "experimental: MorphDetector + T-lite verifier", G_MODEL, True),
 }
 
 
 class SurfaceGate:
-    """Reject full-text model edits that alter grammatical word forms."""
+    """Allow only punctuation/orthography-level changes that preserve morphology."""
 
     def __init__(self) -> None:
         try:
@@ -71,7 +80,7 @@ class SurfaceGate:
 
             self.morph = pymorphy3.MorphAnalyzer()
             self.available = True
-        except Exception as exc:  # pragma: no cover - environment specific
+        except Exception as exc:  # pragma: no cover
             self.morph = None
             self.available = False
             logger.warning("SurfaceGate: pymorphy3 unavailable: %s", exc)
@@ -82,8 +91,7 @@ class SurfaceGate:
         parses = self.morph.parse(word)
         if not parses:
             return None
-        p = parses[0]
-        tag = p.tag
+        tag = parses[0].tag
         attrs = (
             "POS", "case", "number", "gender", "tense", "person",
             "voice", "aspect", "mood", "animacy",
@@ -98,45 +106,52 @@ class SurfaceGate:
         if not bw:
             return True
         if not self.available:
-            # Fail closed: a surface model may not alter alphabetic tokens
-            # when we cannot validate their morphology.
             return all(x.casefold() == y.casefold() for x, y in zip(bw, aw))
         return all(self._signature(x) == self._signature(y) for x, y in zip(bw, aw))
 
     def accept(self, before: str, after: str) -> bool:
-        if "\n" in before or "\n" in after:
+        if not before or not after or before == after:
             return False
-        if before == after:
+        if "\n" in before or "\n" in after:
             return False
         return self._tokens_compatible(before, after)
 
 
-def _char_diff_candidates(source: str, corrected: str, category: str) -> list[EditCandidate]:
+def surface_candidates(source: str, corrected: str) -> list[EditCandidate]:
+    """Turn a full-text surface model result into bounded local candidates.
+
+    Paragraph structure is immutable. Insertions/deletions are only admitted
+    with a small context window so the final DecisionEngine still operates on
+    exact source text.
+    """
     if source == corrected or not source or not corrected:
         return []
-    if source.count("\n") != corrected.count("\n"):
+    if source.count("\n") != corrected.count("\n") or source.split("\n\n").__len__() != corrected.split("\n\n").__len__():
         return []
+
     sm = SequenceMatcher(None, source, corrected, autojunk=False)
-    candidates: list[EditCandidate] = []
+    out: list[EditCandidate] = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag != "replace":
-            # insert/delete may be punctuation fixes only; keep them in a
-            # later bounded-window pass instead of allowing paragraph reflow.
+        if tag == "equal":
             continue
-        before = source[i1:i2]
-        after = corrected[j1:j2]
-        if not before.strip() or not after.strip():
+        if tag == "replace":
+            before, after = source[i1:i2], corrected[j1:j2]
+            if not before or not after:
+                continue
+            if len(before) <= 80 and len(after) <= 80 and "\n" not in before and "\n" not in after:
+                out.append(EditCandidate(before, after, 0.80, "surface-model", "bounded surface diff"))
             continue
-        if len(before) > 80 or len(after) > 80:
-            continue
-        candidates.append(EditCandidate(
-            before=before,
-            after=after,
-            confidence=0.80,
-            category=category,
-            reason="bounded diff from specialized surface model",
-        ))
-    return candidates
+
+        # Insert/delete: build a context span around the changed character(s).
+        left = max(0, i1 - 12)
+        right = min(len(source), i2 + 12)
+        left_b = max(0, j1 - 12)
+        right_b = min(len(corrected), j2 + 12)
+        before = source[left:right]
+        after = corrected[left_b:right_b]
+        if len(before) <= 80 and len(after) <= 80 and "\n" not in before and "\n" not in after:
+            out.append(EditCandidate(before, after, 0.78, "surface-model", "punctuation context diff"))
+    return out
 
 
 class TliteClient:
@@ -153,10 +168,7 @@ class TliteClient:
     async def chat_json(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "stream": False,
             "format": schema,
             "think": False,
@@ -180,9 +192,7 @@ class TliteClient:
         return value if isinstance(value, dict) else {}
 
     async def candidates(self, text: str, context: str = "") -> list[EditCandidate]:
-        user = ""
-        if context:
-            user += f"Контекст документа:\n{context}\n\n"
+        user = f"Контекст документа:\n{context}\n\n" if context else ""
         user += f"ТЕКСТ ДЛЯ ПРОВЕРКИ:\n{text}"
         schema = {
             "type": "object",
@@ -207,8 +217,7 @@ class TliteClient:
             "required": ["edits"],
             "additionalProperties": False,
         }
-        data = await self.chat_json(A_SYSTEM, user, schema)
-        return DecisionEngine.parse(data)
+        return DecisionEngine.parse(await self.chat_json(A_SYSTEM, user, schema))
 
     async def verify(self, text: str, candidates: list[EditCandidate]) -> list[EditCandidate]:
         if not candidates:
@@ -220,7 +229,7 @@ class TliteClient:
         schema = {
             "type": "object",
             "properties": {
-                "accept": {"type": "array", "items": {"type": "boolean", "maxItems": 12}}
+                "accept": {"type": "array", "maxItems": 12, "items": {"type": "boolean"}}
             },
             "required": ["accept"],
             "additionalProperties": False,
@@ -243,14 +252,15 @@ class FBackend:
     def _load(self) -> None:
         if self._model is not None:
             return
-        import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         logger.info("Experimental[F]: loading model=%s", self.model_id)
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_id)
-        device_map = os.getenv("EXPERIMENTAL_DEVICE_MAP", "auto")
-        kwargs: dict[str, Any] = {"device_map": device_map, "low_cpu_mem_usage": True}
-        self._model = AutoModelForCausalLM.from_pretrained(self.model_id, **kwargs)
+        self._model = AutoModelForCausalLM.from_pretrained(
+            self.model_id,
+            device_map=os.getenv("EXPERIMENTAL_DEVICE_MAP", "auto"),
+            low_cpu_mem_usage=True,
+        )
         self._model.eval()
         logger.info("Experimental[F]: model ready")
 
@@ -260,9 +270,10 @@ class FBackend:
 
         assert self._tokenizer is not None and self._model is not None
         prompt = F_PROMPT.format(TEXT=text)
-        messages = [{"role": "user", "content": prompt}]
         inputs = self._tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt"
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            return_tensors="pt",
         ).to(self._model.device)
         max_new = min(256, max(64, len(text) // 2 + 32))
         with torch.inference_mode():
@@ -274,11 +285,10 @@ class FBackend:
                 top_p=0.7,
                 repetition_penalty=1.02,
             )
-        generated = self._tokenizer.decode(
-            output[0][inputs.shape[1]:], skip_special_tokens=True
-        ).strip()
-        raw = _char_diff_candidates(text, generated, "surface-model")
+        generated = self._tokenizer.decode(output[0][inputs.shape[1]:], skip_special_tokens=True).strip()
+        raw = surface_candidates(text, generated)
         safe = [c for c in raw if self.surface_gate.accept(c.before, c.after)]
+        logger.info("Experimental[F]: raw_surface_candidates=%d safe_candidates=%d", len(raw), len(safe))
         return safe
 
 
@@ -295,13 +305,7 @@ class LocalEditTagger:
             logger.warning("LocalEditTagger failed: %s", exc)
             return []
         return [
-            EditCandidate(
-                before=e.before,
-                after=e.suggestion,
-                confidence=0.90,
-                category=e.kind,
-                reason=e.explanation,
-            )
+            EditCandidate(e.before, e.suggestion, 0.90, e.kind, e.explanation)
             for e in errors
             if e.before and e.suggestion and e.before != e.suggestion
         ]
@@ -324,7 +328,12 @@ class StackRouter:
             await self.tlite.chat_json(
                 A_SYSTEM,
                 "Контрольный текст без ошибок.",
-                {"type": "object", "properties": {"edits": {"type": "array"}}, "required": ["edits"]},
+                {
+                    "type": "object",
+                    "properties": {"edits": {"type": "array"}},
+                    "required": ["edits"],
+                    "additionalProperties": False,
+                },
             )
 
     async def candidates(self, text: str, context: str = "") -> list[EditCandidate]:
