@@ -50,13 +50,15 @@ def _words(text: str) -> list[str]:
     return [m.group(0) for m in _WORD_RE.finditer(text)]
 
 
-def _is_wordless(text: str) -> bool:
-    return bool(text) and not _WORD_RE.search(text)
-
-
 def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[EditCandidate]:
+    """Convert a whole-output model response into only tiny local edits.
+
+    The fallback is intentionally lexical-only. Whitespace/newline reflow from
+    surface models (especially F) must never become Track Changes.
+    """
     if not source or not corrected or source == corrected:
         return []
+
     sm = SequenceMatcher(None, source, corrected, autojunk=False)
     result: list[EditCandidate] = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -66,35 +68,58 @@ def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[Ed
         after = corrected[j1:j2]
         if not before or not after or before == after:
             continue
+
+        # Never turn paragraph reflow, line wrapping or indentation changes
+        # into edits. Keep candidates on one physical source line.
+        if "\n" in before or "\n" in after or "\r" in before or "\r" in after:
+            continue
+        if before != before.strip() or after != after.strip():
+            continue
+
         bw = _words(before)
         aw = _words(after)
-
-        # Permit punctuation/spacing-only replacements, but never lexical word
-        # insertion/deletion. DecisionEngine intentionally rejects empty BEFORE.
         if not bw or not aw:
-            if _is_wordless(before) and _is_wordless(after):
-                result.append(
-                    EditCandidate(
-                        before=before,
-                        after=after,
-                        confidence=0.78,
-                        category="punctuation/typography",
-                        reason="safe surface diff",
-                    )
-                )
             continue
         if len(bw) != len(aw) or len(bw) > 2:
             continue
+
+        # A recovered edit must stay small enough to be a genuine local
+        # spelling/word-form correction rather than a rewrite.
+        if len(before) > 48 or len(after) > 48:
+            continue
+
         result.append(
             EditCandidate(
                 before=before,
                 after=after,
                 confidence=0.80,
                 category=category,
-                reason="safe diff from specialized model",
+                reason="safe local diff from specialized model",
             )
         )
     return result
+
+
+def _validate_candidates(candidates: list[EditCandidate]) -> list[EditCandidate]:
+    """Apply the same local-safety envelope to explicit model JSON edits."""
+    out: list[EditCandidate] = []
+    for item in candidates:
+        if not item.before or not item.after or item.before == item.after:
+            continue
+        if "\n" in item.before or "\n" in item.after:
+            continue
+        if item.before != item.before.strip() or item.after != item.after.strip():
+            continue
+        bw = _words(item.before)
+        aw = _words(item.after)
+        if not bw or not aw:
+            continue
+        if len(bw) != len(aw) or len(bw) > 2:
+            continue
+        if len(item.before) > 48 or len(item.after) > 48:
+            continue
+        out.append(item)
+    return out
 
 
 def _parse_model_json(text: str) -> list[EditCandidate]:
@@ -134,7 +159,7 @@ def _parse_model_json(text: str) -> list[EditCandidate]:
                 )
             )
         if candidates:
-            return candidates
+            return _validate_candidates(candidates)
     return []
 
 
@@ -153,8 +178,7 @@ class ExperimentalBackend:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except Exception as exc:
             raise RuntimeError(
-                "D/F require transformers, torch, accelerate and peft. "
-                "Install server/local/requirements-experimental.txt"
+                "D/F require the common requirements.txt stack: transformers, torch, accelerate and peft"
             ) from exc
 
         base_model = self.config.base_model or self.config.model
@@ -167,6 +191,7 @@ class ExperimentalBackend:
             device_map,
             dtype,
         )
+
         self._tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
         kwargs: dict[str, Any] = {
             "device_map": device_map,
@@ -178,32 +203,79 @@ class ExperimentalBackend:
         self._model = AutoModelForCausalLM.from_pretrained(base_model, **kwargs)
 
         if self.config.adapter:
-            try:
-                from peft import PeftModel
-            except Exception as exc:
-                raise RuntimeError("D requires peft; install requirements-experimental.txt") from exc
-            logger.info("Experimental[D]: loading adapter=%s", self.config.adapter)
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                self._model = PeftModel.from_pretrained(
-                    self._model,
-                    self.config.adapter,
-                    subfolder=os.getenv("D_ADAPTER_SUBFOLDER", "v4_qwen35_4b_lorugec"),
-                )
-            adapter_warnings = [
-                str(item.message)
-                for item in caught
-                if "missing adapter keys" in str(item.message).lower()
-            ]
-            if adapter_warnings:
-                raise RuntimeError(
-                    "D adapter did not load cleanly: PEFT reported missing adapter keys. "
-                    "Upgrade requirements-experimental.txt (PEFT>=0.19.1, Transformers>=5.5.0) "
-                    "and verify the Qwen3.5-4B adapter subfolder."
-                )
+            self._load_adapter_cleanly()
+
         self._model.eval()
         self._loaded = True
         logger.info("Experimental[%s]: model ready", self.config.preset)
+
+    def _load_adapter_cleanly(self) -> None:
+        assert self._model is not None
+        adapter_repo = self.config.adapter
+        subfolder = os.getenv("D_ADAPTER_SUBFOLDER", "v4_qwen35_4b_lorugec")
+        adapter_name = os.getenv("D_ADAPTER_NAME", "gec")
+        logger.info(
+            "Experimental[D]: loading adapter=%s subfolder=%s",
+            adapter_repo,
+            subfolder,
+        )
+
+        # Prefer Transformers' native PEFT adapter integration. It preserves the
+        # Qwen3.5 module naming used by the released adapter and avoids wrapping
+        # the model in a second model class unnecessarily.
+        if hasattr(self._model, "load_adapter"):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                try:
+                    self._model.load_adapter(
+                        adapter_repo,
+                        adapter_name=adapter_name,
+                        subfolder=subfolder,
+                        is_trainable=False,
+                    )
+                except TypeError:
+                    # Older Transformers releases may not expose subfolder on
+                    # load_adapter; fall back to PEFT's public loader below.
+                    self._load_adapter_with_peft(adapter_repo, subfolder)
+                    caught = []
+            self._raise_on_adapter_warnings(caught)
+            if hasattr(self._model, "set_adapter"):
+                self._model.set_adapter(adapter_name)
+            logger.info("Experimental[D]: adapter loaded via Transformers PEFT integration")
+            return
+
+        self._load_adapter_with_peft(adapter_repo, subfolder)
+        logger.info("Experimental[D]: adapter loaded via PEFT")
+
+    def _load_adapter_with_peft(self, adapter_repo: str, subfolder: str) -> None:
+        assert self._model is not None
+        try:
+            from peft import PeftModel
+        except Exception as exc:
+            raise RuntimeError("D requires peft; install the common requirements.txt stack") from exc
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self._model = PeftModel.from_pretrained(
+                self._model,
+                adapter_repo,
+                subfolder=subfolder,
+                is_trainable=False,
+            )
+        self._raise_on_adapter_warnings(caught)
+
+    @staticmethod
+    def _raise_on_adapter_warnings(caught) -> None:
+        adapter_warnings = [
+            str(item.message)
+            for item in caught
+            if "missing adapter keys" in str(item.message).lower()
+        ]
+        if adapter_warnings:
+            raise RuntimeError(
+                "D adapter did not load cleanly: PEFT reported missing adapter keys. "
+                "The base model, adapter and Transformers/PEFT versions do not match. "
+                "Use the versions from requirements-experimental.txt and re-run the one-time model installer."
+            )
 
     def _prepare_inputs(self, text: str):
         """Return a tensor mapping suitable for model.generate(**inputs)."""
@@ -220,8 +292,6 @@ class ExperimentalBackend:
             "return_dict": True,
         }
         try:
-            # Qwen3.5 supports an explicit non-thinking generation mode. This is
-            # important for a low-latency GEC endpoint and keeps the output in JSON.
             inputs = self._tokenizer.apply_chat_template(
                 enable_thinking=False,
                 **template_kwargs,
@@ -261,12 +331,9 @@ class ExperimentalBackend:
         return self._tokenizer.decode(generated, skip_special_tokens=True).strip()
 
     def warmup(self) -> None:
-        """Load model and optionally run a tiny deterministic generation before serving."""
+        """Load the selected model at service startup; generation warmup is optional."""
         if not self._loaded:
             self._load_transformers()
-        # D is CPU-heavy on the production host. Loading the model is enough to
-        # validate startup; generation warmup is opt-in so :8000 is not blocked
-        # for minutes during a preset switch.
         generation_warmup = os.getenv(
             "EXPERIMENTAL_GENERATION_WARMUP",
             "false" if self.config.preset == "D" else "true",
@@ -275,7 +342,10 @@ class ExperimentalBackend:
             _ = self._generate("Контрольный текст без ошибок.", max_new_tokens=8)
             logger.info("Experimental[%s]: warmup OK", self.config.preset)
         else:
-            logger.info("Experimental[%s]: model load OK (generation warmup disabled)", self.config.preset)
+            logger.info(
+                "Experimental[%s]: model load OK (generation warmup disabled)",
+                self.config.preset,
+            )
 
     def candidates(self, raw_text: str) -> list[EditCandidate]:
         output = self._generate(raw_text)
