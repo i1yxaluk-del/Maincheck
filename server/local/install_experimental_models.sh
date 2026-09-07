@@ -29,9 +29,13 @@ fi
 "$PYTHON_BIN" - <<'PY'
 import peft
 import transformers
+import experimental_backend
 from transformers import Qwen3_5ForCausalLM
+from experimental_backend import ExperimentalRouter
 print(f"HF stack: transformers={transformers.__version__} peft={peft.__version__}")
 print("Qwen3.5 text architecture: OK")
+print(f"Experimental backend import: {experimental_backend.__file__}")
+print(f"ExperimentalRouter: {ExperimentalRouter.__name__}")
 PY
 
 # The systemd service runs as 'service' on the production host. When this
