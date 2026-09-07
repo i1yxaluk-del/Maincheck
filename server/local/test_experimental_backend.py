@@ -23,3 +23,10 @@ def test_safe_diff_keeps_local_spelling_change():
     edits = _safe_diff_candidates(source, corrected, "spelling")
     assert edits
     assert all(isinstance(edit, EditCandidate) for edit in edits)
+
+
+def test_safe_diff_rejects_paragraph_reflow():
+    source = "факты,\nзаступлений на суточное дежурство"
+    corrected = "факты, заступлений на суточное дежурство"
+    edits = _safe_diff_candidates(source, corrected, "surface")
+    assert edits == []
