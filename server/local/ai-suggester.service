@@ -4,13 +4,12 @@ After=network.target ollama.service
 
 [Service]
 Type=simple
-User=YOUR_USERNAME
-WorkingDirectory=/opt/ai-suggester
-ExecStart=/usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
+User=service
+WorkingDirectory=/home/service/llama/server/local
+ExecStart=/home/service/llama/server/local/venv/bin/uvicorn decision_app:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5
-Environment="MODEL_NAME=t-tech/T-lite-it-2.1:q4_K_M"
-Environment="NUM_THREADS=16"
+EnvironmentFile=-/home/service/llama/server/local/.env
 
 [Install]
 WantedBy=multi-user.target
