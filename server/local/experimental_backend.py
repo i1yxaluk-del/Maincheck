@@ -50,15 +50,13 @@ def _words(text: str) -> list[str]:
     return [m.group(0) for m in _WORD_RE.finditer(text)]
 
 
-def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[EditCandidate]:
-    """Convert a whole-output model response into only tiny local edits.
+def _is_wordless(text: str) -> bool:
+    return bool(text) and not _WORD_RE.search(text)
 
-    The fallback is intentionally lexical-only. Whitespace/newline reflow from
-    surface models (especially F) must never become Track Changes.
-    """
+
+def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[EditCandidate]:
     if not source or not corrected or source == corrected:
         return []
-
     sm = SequenceMatcher(None, source, corrected, autojunk=False)
     result: list[EditCandidate] = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -68,26 +66,19 @@ def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[Ed
         after = corrected[j1:j2]
         if not before or not after or before == after:
             continue
-
-        # Never turn paragraph reflow, line wrapping or indentation changes
-        # into edits. Keep candidates on one physical source line.
-        if "\n" in before or "\n" in after or "\r" in before or "\r" in after:
-            continue
-        if before != before.strip() or after != after.strip():
-            continue
-
         bw = _words(before)
         aw = _words(after)
+
+        # Surface models are never allowed to turn paragraph reformatting into
+        # lexical corrections. Ignore whitespace/newline-only changes completely.
         if not bw or not aw:
             continue
+        # Do not accept insertions/deletions or large rewrites from a generated
+        # fallback; only a local 1-2 word substitution is eligible.
         if len(bw) != len(aw) or len(bw) > 2:
             continue
-
-        # A recovered edit must stay small enough to be a genuine local
-        # spelling/word-form correction rather than a rewrite.
-        if len(before) > 48 or len(after) > 48:
+        if "\n" in before or "\n" in after:
             continue
-
         result.append(
             EditCandidate(
                 before=before,
@@ -98,28 +89,6 @@ def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[Ed
             )
         )
     return result
-
-
-def _validate_candidates(candidates: list[EditCandidate]) -> list[EditCandidate]:
-    """Apply the same local-safety envelope to explicit model JSON edits."""
-    out: list[EditCandidate] = []
-    for item in candidates:
-        if not item.before or not item.after or item.before == item.after:
-            continue
-        if "\n" in item.before or "\n" in item.after:
-            continue
-        if item.before != item.before.strip() or item.after != item.after.strip():
-            continue
-        bw = _words(item.before)
-        aw = _words(item.after)
-        if not bw or not aw:
-            continue
-        if len(bw) != len(aw) or len(bw) > 2:
-            continue
-        if len(item.before) > 48 or len(item.after) > 48:
-            continue
-        out.append(item)
-    return out
 
 
 def _parse_model_json(text: str) -> list[EditCandidate]:
@@ -157,10 +126,26 @@ def _parse_model_json(text: str) -> list[EditCandidate]:
                     category=str(item.get("category", "unknown")),
                     reason=str(item.get("reason", "")),
                 )
-            )
         if candidates:
             return _validate_candidates(candidates)
     return []
+
+
+def _validate_candidates(candidates: list[EditCandidate]) -> list[EditCandidate]:
+    out: list[EditCandidate] = []
+    for candidate in candidates:
+        if not candidate.before or not candidate.after or candidate.before == candidate.after:
+            continue
+        # Candidate source fragments must stay local even if the model returns a
+        # syntactically valid JSON object describing a rewrite of a whole phrase.
+        if len(candidate.before) > 80 or len(candidate.before.split()) > 4:
+            continue
+        if len(candidate.after.split()) > 4:
+            continue
+        if "\n" in candidate.before or "\n" in candidate.after:
+            continue
+        out.append(candidate)
+    return out
 
 
 class ExperimentalBackend:
@@ -175,6 +160,7 @@ class ExperimentalBackend:
             return
         try:
             import torch
+            import transformers
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except Exception as exc:
             raise RuntimeError(
@@ -185,12 +171,19 @@ class ExperimentalBackend:
         device_map = os.getenv("EXPERIMENTAL_DEVICE_MAP", "auto")
         dtype = os.getenv("EXPERIMENTAL_DTYPE", "auto")
         logger.info(
-            "Experimental[%s]: loading base=%s device_map=%s dtype=%s",
+            "Experimental[%s]: loading base=%s device_map=%s dtype=%s transformers=%s",
             self.config.preset,
             base_model,
             device_map,
             dtype,
+            transformers.__version__,
         )
+
+        if self.config.preset == "D" and not hasattr(transformers, "Qwen3_5ForCausalLM"):
+            raise RuntimeError(
+                "D requires Transformers with Qwen3_5ForCausalLM support. "
+                f"Installed transformers={transformers.__version__}; run the one-time installer to install 5.16.1."
+            )
 
         self._tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
         kwargs: dict[str, Any] = {
@@ -200,7 +193,15 @@ class ExperimentalBackend:
         }
         if dtype != "auto":
             kwargs["torch_dtype"] = getattr(torch, dtype)
-        self._model = AutoModelForCausalLM.from_pretrained(base_model, **kwargs)
+
+        if self.config.preset == "D":
+            # Qwen documents Qwen3_5ForCausalLM as the text-only architecture.
+            # Using the explicit class avoids AutoModel dispatching through the
+            # multimodal top-level config on older/newer Transformers revisions.
+            model_cls = transformers.Qwen3_5ForCausalLM
+            self._model = model_cls.from_pretrained(base_model, **kwargs)
+        else:
+            self._model = AutoModelForCausalLM.from_pretrained(base_model, **kwargs)
 
         if self.config.adapter:
             self._load_adapter_cleanly()
@@ -234,8 +235,6 @@ class ExperimentalBackend:
                         is_trainable=False,
                     )
                 except TypeError:
-                    # Older Transformers releases may not expose subfolder on
-                    # load_adapter; fall back to PEFT's public loader below.
                     self._load_adapter_with_peft(adapter_repo, subfolder)
                     caught = []
             self._raise_on_adapter_warnings(caught)
@@ -331,7 +330,7 @@ class ExperimentalBackend:
         return self._tokenizer.decode(generated, skip_special_tokens=True).strip()
 
     def warmup(self) -> None:
-        """Load the selected model at service startup; generation warmup is optional."""
+        """Load model and optionally run a tiny deterministic generation before serving."""
         if not self._loaded:
             self._load_transformers()
         generation_warmup = os.getenv(
@@ -342,10 +341,7 @@ class ExperimentalBackend:
             _ = self._generate("Контрольный текст без ошибок.", max_new_tokens=8)
             logger.info("Experimental[%s]: warmup OK", self.config.preset)
         else:
-            logger.info(
-                "Experimental[%s]: model load OK (generation warmup disabled)",
-                self.config.preset,
-            )
+            logger.info("Experimental[%s]: model load OK (generation warmup disabled)", self.config.preset)
 
     def candidates(self, raw_text: str) -> list[EditCandidate]:
         output = self._generate(raw_text)
