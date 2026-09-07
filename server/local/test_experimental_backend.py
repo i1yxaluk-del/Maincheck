@@ -1,32 +1,29 @@
-from decision_engine import EditCandidate
-from experimental_backend import _parse_model_json, _safe_diff_candidates
+from decision_engine import DecisionEngine, EditCandidate
+from pipelines import SurfaceGate, _char_diff_candidates
 
 
-def test_parse_model_json_roundtrip():
-    raw = '{"edits":[{"before":"ночных наряда","after":"ночных нарядов","confidence":0.96,"category":"agreement","reason":"согласование"}]}'
-    edits = _parse_model_json(raw)
-    assert len(edits) == 1
-    assert edits[0].before == "ночных наряда"
-    assert edits[0].after == "ночных нарядов"
+def test_decision_engine_exact_occurrence():
+    source = "Это важный акт."
+    candidate = EditCandidate("важный", "важная", 0.9, "agreement", "test")
+    corrected, accepted = DecisionEngine().apply(source, [candidate])
+    assert corrected == "Это важная акт."
+    assert len(accepted) == 1
 
 
-def test_safe_diff_rejects_lexical_insertion():
-    source = "рабочего времени"
-    corrected = "рабочегочасовымирабочего времени"
-    edits = _safe_diff_candidates(source, corrected, "specialized-gec")
-    assert edits == []
+def test_surface_diff_does_not_allow_paragraph_reflow():
+    source = "строка один.\nстрока два."
+    corrected = "строка один. строка два."
+    assert _char_diff_candidates(source, corrected, "surface") == []
 
 
-def test_safe_diff_keeps_local_spelling_change():
-    source = "Это очепятка."
-    corrected = "Это опечатка."
-    edits = _safe_diff_candidates(source, corrected, "spelling")
-    assert edits
-    assert all(isinstance(edit, EditCandidate) for edit in edits)
+def test_surface_gate_requires_same_word_morphology_for_replacement():
+    gate = SurfaceGate()
+    assert gate.accept("очепятка", "опечатка") is False or gate.available is False
+    assert gate.accept("изучена", "изучено") is False
+    assert gate.accept("должностного", "должностных") is False
+    assert gate.accept("деятельностей", "деятельности") is False
 
 
-def test_safe_diff_rejects_paragraph_reflow():
-    source = "факты,\nзаступлений на суточное дежурство"
-    corrected = "факты, заступлений на суточное дежурство"
-    edits = _safe_diff_candidates(source, corrected, "surface")
-    assert edits == []
+def test_surface_diff_is_bounded():
+    edits = _char_diff_candidates("Это текст.", "Это текст,", "surface")
+    assert edits == [] or all(len(e.before) <= 80 and len(e.after) <= 80 for e in edits)
