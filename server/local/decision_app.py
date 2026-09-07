@@ -1,248 +1,226 @@
 from __future__ import annotations
 
-import json
 import os
-
-# A/C use the existing Ollama production path. D-G use the local
-# experimental backend in this same FastAPI process; no second uvicorn.
-LLM_PRESET = os.getenv("LLM_PRESET", "A").strip().upper()
-PRESETS = {
-    "A": {
-        "model": "t-tech/T-lite-it-2.1:q4_K_M",
-        "description": "T-lite baseline",
-        "secondary": False,
-        "experimental": False,
-    },
-    "C": {
-        "model": "t-tech/T-lite-it-2.1:q4_K_M",
-        "description": "Hybrid T-lite + compact surface GEC",
-        "secondary": True,
-        "experimental": False,
-    },
-    "D": {
-        "model": os.getenv("D_MODEL", "Qwen/Qwen3.5-4B"),
-        "description": "Qwen3.5-4B + SyntErr→LORuGEC LoRA",
-        "secondary": False,
-        "experimental": True,
-    },
-    "E": {
-        "model": "local-edit-tagger",
-        "description": "Local edit/tagger backend (MorphDetector-backed)",
-        "secondary": False,
-        "experimental": True,
-    },
-    "F": {
-        "model": os.getenv("F_MODEL", "melsmm/Spell-Corrector-RU-4B"),
-        "description": "Spell-Corrector-RU-4B surface correction",
-        "secondary": False,
-        "experimental": True,
-    },
-    "G": {
-        "model": "local-edit-tagger + T-lite verifier",
-        "description": "Local edit/tagger + T-lite verifier",
-        "secondary": False,
-        "experimental": True,
-    },
-}
-if LLM_PRESET not in PRESETS:
-    raise RuntimeError(
-        f"Unsupported LLM_PRESET={LLM_PRESET!r}; expected A, C, D, E, F or G"
-    )
-
-STACK = PRESETS[LLM_PRESET]
-if STACK["experimental"]:
-    os.environ["OLLAMA_WARMUP"] = "false"
-
-os.environ["MODEL_NAME"] = STACK["model"]
-os.environ["LLM_PRESET"] = LLM_PRESET
-
-if STACK["secondary"]:
-    os.environ["SECONDARY_GEC_ENABLED"] = "true"
-    os.environ.setdefault(
-        "SECONDARY_GEC_MODEL",
-        "hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0",
-    )
-else:
-    os.environ["SECONDARY_GEC_ENABLED"] = "false"
+import time
+from pathlib import Path
 
 import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Request, UploadFile
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-import main as legacy
 from decision_engine import DecisionEngine
-from secondary_gec import SecondaryGEC, SecondaryEdit
-from experimental_backend import ExperimentalRouter
+from pipelines import STACKS, StackRouter
+from shared.audit import AuditStore, Timer, count_changes
+from shared.logging_setup import setup_logger
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-MODEL_NAME = STACK["model"]
+load_dotenv()
+
+HERE = Path(__file__).resolve().parent
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+LLM_PRESET = os.getenv("LLM_PRESET", "A").strip().upper()
+if LLM_PRESET not in STACKS:
+    raise RuntimeError(f"Unsupported LLM_PRESET={LLM_PRESET!r}; expected A, F or G")
+
 NUM_THREADS = int(os.getenv("NUM_THREADS", "28"))
-NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
-NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "512"))
-TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "300"))
-TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
-KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "24h")
-THINK = os.getenv("OLLAMA_THINK", "false").lower() in ("1", "true", "yes", "on")
-SECONDARY = (
-    SecondaryGEC(
-        model=os.getenv(
-            "SECONDARY_GEC_MODEL",
-            "hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0",
-        ),
-        timeout=float(os.getenv("SECONDARY_GEC_TIMEOUT", "90")),
-        keep_alive=os.getenv("SECONDARY_GEC_KEEP_ALIVE", "5m"),
-        max_edits=int(os.getenv("SECONDARY_GEC_MAX_EDITS", "4")),
-    )
-    if STACK["secondary"]
-    else None
-)
+MIN_CONFIDENCE = float(os.getenv("DECISION_MIN_CONFIDENCE", "0.60"))
+MAX_CHANGES = int(os.getenv("DECISION_MAX_CHANGES", "12"))
+MAX_BEFORE_CHARS = int(os.getenv("DECISION_MAX_BEFORE_CHARS", "120"))
+USER_DICT_ENABLED = os.getenv("USER_DICT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+WARMUP = os.getenv("OLLAMA_WARMUP", "true").lower() in {"1", "true", "yes", "on"}
+AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
-EXPERIMENTAL = (
-    ExperimentalRouter(LLM_PRESET, getattr(legacy, "_morph_detector", None))
-    if STACK["experimental"]
-    else None
-)
+logger = setup_logger("ai_suggester.local")
+audit = AuditStore() if AUDIT_ENABLED else None
 
-SCHEMA = {
-    "type": "object",
-    "properties": {
-        "edits": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "before": {"type": "string"},
-                    "after": {"type": "string"},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "category": {"type": "string"},
-                    "reason": {"type": "string"},
-                },
-                "required": ["before", "after", "confidence", "category", "reason"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["edits"],
-    "additionalProperties": False,
-}
+try:
+    from shared.morph_detector import get_morph_detector
 
-SYSTEM = """Ты — строгий корректор русского официально-делового текста.
-Исправляй только реальные языковые ошибки: орфографию, явные опечатки,
-пунктуацию, согласование и управление. Не переписывай стиль, не улучшай
-формулировки, не меняй допустимые падежи, термины, аббревиатуры, имена,
-названия организаций или юридические обозначения. Не нормализуй ё/е.
+    morph_detector = get_morph_detector() if os.getenv("MORPH_DETECTOR_ENABLED", "true").lower() in {"1", "true", "yes", "on"} else None
+except Exception as exc:
+    logger.warning("MorphDetector unavailable: %s", exc)
+    morph_detector = None
 
-Верни ТОЛЬКО JSON по заданной схеме. Каждая правка должна содержать точный
-фрагмент BEFORE из исходного текста и AFTER. Если сомневаешься — не предлагай
-правку. confidence отражает уверенность именно в необходимости изменения.
-"""
+try:
+    from shared.user_dict import get_user_dict
+
+    user_dict = get_user_dict() if USER_DICT_ENABLED else None
+except Exception as exc:
+    logger.warning("UserDict unavailable: %s", exc)
+    user_dict = None
+
+router = StackRouter(LLM_PRESET, morph_detector)
+
+app = FastAPI(title="AI LibreOffice Suggester", version="2.0")
 
 
-def _extract_text(messages: list[dict]) -> str:
-    for msg in reversed(messages):
-        if msg.get("role") != "user":
-            continue
-        content = str(msg.get("content", ""))
-        marker = "ТЕКСТ ДЛЯ ПРОВЕРКИ:\n"
-        if marker in content:
-            return content.split(marker, 1)[1].strip().removesuffix("\n\n/no_think")
-    return ""
+def normalize_line_breaks(text: str) -> str:
+    if not text:
+        return text
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\u2028", "\n")
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text
 
 
-def _render(corrected: str, accepted, secondary_edits: list[SecondaryEdit]) -> str:
-    lines = [
-        f"{i}. «{c.before}» → «{c.after}»"
-        for i, c in enumerate(accepted, 1)
-    ]
-    start = len(lines) + 1
-    lines.extend(
-        f"{i}. «{e.before}» → «{e.after}»"
-        for i, e in enumerate(secondary_edits, start)
-    )
-    changes = "\n".join(lines) if lines else "Ошибок не найдено."
+def render_result(corrected: str, accepted) -> str:
+    if accepted:
+        changes = "\n".join(
+            f"{i}. «{c.before}» → «{c.after}» | {c.reason or 'явная ошибка'}"
+            for i, c in enumerate(accepted, 1)
+        )
+    else:
+        changes = "1. Ошибок не найдено."
     return f"===CORRECTED===\n{corrected}\n===CHANGES===\n{changes}\n===END==="
 
 
-async def _ollama_candidates(raw_text: str, messages: list) -> list:
-    user_history = [m for m in messages if m.get("role") != "system"]
-    prompt_messages = [{"role": "system", "content": SYSTEM}, *user_history]
-    if not prompt_messages or prompt_messages[-1].get("role") != "user":
-        prompt_messages.append({"role": "user", "content": raw_text})
-    if (
-        prompt_messages
-        and prompt_messages[-1].get("role") == "user"
-        and not prompt_messages[-1].get("content", "").rstrip().endswith("/no_think")
-    ):
-        prompt_messages[-1]["content"] = prompt_messages[-1]["content"].rstrip() + "\n\n/no_think"
+def dict_words() -> set[str]:
+    if user_dict is None:
+        return set()
+    try:
+        return set(user_dict.list_words())
+    except Exception:
+        return set()
 
-    payload = {
-        "model": MODEL_NAME,
-        "messages": prompt_messages,
-        "stream": False,
-        "format": SCHEMA,
-        "think": THINK,
-        "keep_alive": KEEP_ALIVE,
-        "options": {
-            "temperature": TEMPERATURE,
-            "num_ctx": NUM_CTX,
-            "num_predict": NUM_PREDICT,
-            "num_thread": NUM_THREADS,
-            "repeat_penalty": 1.05,
-        },
-    }
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        response = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-        response.raise_for_status()
-        content = response.json().get("message", {}).get("content", "{}").strip()
-    return DecisionEngine.parse(content)
-
-
-async def decision_call_ollama(messages: list) -> str:
-    raw_text = _extract_text(messages)
-    protected: set[str] = set()
-    if getattr(legacy, "_user_dict", None) is not None:
-        try:
-            protected = set(legacy._user_dict.list_words())
-        except Exception:
-            pass
-
-    if STACK["experimental"]:
-        assert EXPERIMENTAL is not None
-        candidates = await EXPERIMENTAL.candidates(raw_text)
-    else:
-        candidates = await _ollama_candidates(raw_text, messages)
-
-    engine = DecisionEngine(
-        min_confidence=float(os.getenv("DECISION_MIN_CONFIDENCE", "0.55")),
-        max_changes=int(os.getenv("DECISION_MAX_CHANGES", "40")),
-        max_before_chars=int(os.getenv("DECISION_MAX_BEFORE_CHARS", "180")),
-        protected_words=protected,
-    )
-    corrected, accepted = engine.apply(raw_text, candidates)
-    secondary_edits: list[SecondaryEdit] = []
-    if SECONDARY is not None:
-        corrected, secondary_edits = await SECONDARY.enrich(corrected)
-
-    logger = getattr(legacy, "logger", None)
-    if logger is not None:
-        logger.info(
-            "Preset=%s (%s) model=%s DecisionEngine: candidates=%d accepted=%d secondary=%d experimental=%s",
-            LLM_PRESET,
-            STACK["description"],
-            MODEL_NAME,
-            len(candidates),
-            len(accepted),
-            len(secondary_edits),
-            STACK["experimental"],
-        )
-    return _render(corrected, accepted, secondary_edits)
-
-
-app = legacy.app
 
 @app.on_event("startup")
-async def _startup_stack() -> None:
-    if SECONDARY is not None:
-        await SECONDARY.check_available()
-    if EXPERIMENTAL is not None:
-        await EXPERIMENTAL.warmup()
+async def startup() -> None:
+    logger.info(
+        "Stack=%s (%s), model=%s, experimental=%s",
+        router.info.name,
+        router.info.description,
+        router.info.model,
+        router.info.experimental,
+    )
+    if WARMUP:
+        started = time.perf_counter()
+        try:
+            await router.warmup()
+            logger.info("Warmup OK in %d ms", int((time.perf_counter() - started) * 1000))
+        except Exception as exc:
+            # A production stack must remain startable when Ollama is down;
+            # the first request will surface the dependency error instead.
+            logger.warning("Warmup failed: %s", exc)
 
-legacy.call_ollama = decision_call_ollama
+
+@app.get("/health", response_class=PlainTextResponse)
+async def health() -> str:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{OLLAMA_URL}/api/tags")
+            response.raise_for_status()
+        return f"OK | stack={router.info.name} | model={router.info.model}"
+    except Exception as exc:
+        return f"DEGRADED | stack={router.info.name} | Ollama error: {exc}"
+
+
+@app.get("/metrics")
+async def metrics(hours: int = 24):
+    return JSONResponse(
+        {
+            "server": "local",
+            "version": "2.0",
+            "stack": router.info.name,
+            "description": router.info.description,
+            "model": router.info.model,
+            "experimental": router.info.experimental,
+            "morph_detector_available": bool(morph_detector and getattr(morph_detector, "available", False)),
+            "user_dict_enabled": user_dict is not None,
+            "user_dict_size": len(dict_words()),
+            "audit": audit.stats(hours=hours) if audit is not None else {"enabled": False},
+        }
+    )
+
+
+@app.get("/dict/list")
+async def dict_list():
+    if user_dict is None:
+        return JSONResponse({"error": "пользовательский словарь отключён"}, status_code=503)
+    return JSONResponse({"words": sorted(dict_words(), key=str.casefold)})
+
+
+@app.post("/dict/add")
+async def dict_add(request: Request):
+    if user_dict is None:
+        return JSONResponse({"error": "пользовательский словарь отключён"}, status_code=503)
+    body = await request.json()
+    word = body.get("word") if isinstance(body, dict) else None
+    if not isinstance(word, str) or not word.strip():
+        return JSONResponse({"error": "ожидается JSON-поле 'word'"}, status_code=400)
+    try:
+        added = user_dict.add(word)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({"added": added, "total": len(dict_words())})
+
+
+@app.post("/dict/remove")
+async def dict_remove(request: Request):
+    if user_dict is None:
+        return JSONResponse({"error": "пользовательский словарь отключён"}, status_code=503)
+    body = await request.json()
+    word = body.get("word") if isinstance(body, dict) else None
+    if not isinstance(word, str) or not word.strip():
+        return JSONResponse({"error": "ожидается JSON-поле 'word'"}, status_code=400)
+    try:
+        removed = user_dict.remove(word)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({"removed": removed, "total": len(dict_words())})
+
+
+@app.post("/suggest", response_class=PlainTextResponse)
+async def suggest(
+    request: Request,
+    text: UploadFile = File(...),
+    context: UploadFile = File(...),
+):
+    raw_text = normalize_line_breaks((await text.read()).decode("utf-8", errors="replace").strip())
+    raw_ctx = normalize_line_breaks((await context.read()).decode("utf-8", errors="replace").strip())
+    if not raw_text:
+        return "ОШИБКА: Пустой текст"
+
+    started = Timer()
+    ok = True
+    error = ""
+    corrected = raw_text
+    accepted = []
+    try:
+        candidates = await router.candidates(raw_text, raw_ctx)
+        engine = DecisionEngine(
+            min_confidence=MIN_CONFIDENCE,
+            max_changes=MAX_CHANGES,
+            max_before_chars=MAX_BEFORE_CHARS,
+            protected_words=dict_words(),
+        )
+        corrected, accepted = engine.apply(raw_text, candidates)
+        result = render_result(corrected, accepted)
+        logger.info(
+            "suggest stack=%s len=%d ctx=%d candidates=%d accepted=%d dur=%dms",
+            router.info.name,
+            len(raw_text),
+            len(raw_ctx),
+            len(candidates),
+            len(accepted),
+            started.ms,
+        )
+    except Exception as exc:
+        ok = False
+        error = f"{type(exc).__name__}: {exc}"
+        logger.exception("Suggestion failed")
+        result = f"ОШИБКА_СЕРВЕРА: {error}"
+
+    if audit is not None:
+        audit.record(
+            client_ip=request.client.host if request.client else "",
+            user_agent=request.headers.get("user-agent", ""),
+            server="local",
+            model=router.info.model,
+            text=raw_text,
+            context=raw_ctx,
+            changes_count=count_changes(result),
+            duration_ms=started.ms,
+            ok=ok,
+            error=error,
+        )
+    return result
