@@ -1,10 +1,10 @@
-# Runtime dependencies used by presets D and F.
-# Installed once into the same production venv.
-# Qwen3.5 requires the current Transformers 5.x runtime.
+# Runtime dependencies used only by experimental stack F.
+# G is fully local/rule-based plus the existing Ollama T-lite verifier.
 transformers==5.16.1
 accelerate>=1.13.0
-peft==0.20.0
 safetensors>=0.7.0
 torch>=2.5.0
 huggingface_hub>=1.10.0
 sentencepiece>=0.2.0
+# Natasha still imports pkg_resources on the current production image.
+setuptools==81.0.0
