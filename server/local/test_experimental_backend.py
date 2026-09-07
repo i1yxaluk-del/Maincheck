@@ -1,5 +1,23 @@
 from decision_engine import DecisionEngine, EditCandidate
-from pipelines import SurfaceGate, _char_diff_candidates
+from pipelines import SurfaceGate, surface_candidates
+
+
+BAD_F_SOURCE = """Изучена
+управленческая роль, должностного
+лиц в организации служебно-боевой
+деятельностей
+и фактическое положение дел
+
+в
+подразделениях Центра."""
+
+BAD_F_OUTPUT = """Изучено
+управленческая роль, должностных лица
+в организации служебно-боевой деятельности
+и фактическое положение дел
+
+в
+подразделениях Центра."""
 
 
 def test_decision_engine_exact_occurrence():
@@ -10,20 +28,26 @@ def test_decision_engine_exact_occurrence():
     assert len(accepted) == 1
 
 
-def test_surface_diff_does_not_allow_paragraph_reflow():
+def test_surface_diff_rejects_paragraph_reflow():
     source = "строка один.\nстрока два."
     corrected = "строка один. строка два."
-    assert _char_diff_candidates(source, corrected, "surface") == []
+    assert surface_candidates(source, corrected) == []
 
 
-def test_surface_gate_requires_same_word_morphology_for_replacement():
+def test_surface_gate_rejects_observed_f_form_changes():
     gate = SurfaceGate()
-    assert gate.accept("очепятка", "опечатка") is False or gate.available is False
     assert gate.accept("изучена", "изучено") is False
     assert gate.accept("должностного", "должностных") is False
     assert gate.accept("деятельностей", "деятельности") is False
 
 
-def test_surface_diff_is_bounded():
-    edits = _char_diff_candidates("Это текст.", "Это текст,", "surface")
-    assert edits == [] or all(len(e.before) <= 80 and len(e.after) <= 80 for e in edits)
+def test_full_observed_f_output_has_no_admissible_surface_edits():
+    gate = SurfaceGate()
+    candidates = surface_candidates(BAD_F_SOURCE, BAD_F_OUTPUT)
+    safe = [c for c in candidates if gate.accept(c.before, c.after)]
+    assert safe == []
+
+
+def test_surface_changes_are_bounded():
+    edits = surface_candidates("Это текст.", "Это текст,")
+    assert all(len(e.before) <= 80 and len(e.after) <= 80 for e in edits)
