@@ -17,10 +17,20 @@ if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN=python3
 fi
 
+# Fail before touching systemd if the Python tree or HF runtime is broken.
+"$PYTHON_BIN" -m py_compile \
+  decision_app.py \
+  decision_engine.py \
+  main.py \
+  experimental_backend.py \
+  experimental_backend/__init__.py \
+  test_experimental_backend.py
+
 "$PYTHON_BIN" - <<'PY'
+import peft
 import transformers
 from transformers import Qwen3_5ForCausalLM
-print(f"Transformers runtime: {transformers.__version__}")
+print(f"HF stack: transformers={transformers.__version__} peft={peft.__version__}")
 print("Qwen3.5 text architecture: OK")
 PY
 
