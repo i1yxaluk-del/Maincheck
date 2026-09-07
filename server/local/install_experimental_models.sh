@@ -17,6 +17,13 @@ if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN=python3
 fi
 
+"$PYTHON_BIN" - <<'PY'
+import transformers
+from transformers import Qwen3_5ForCausalLM
+print(f"Transformers runtime: {transformers.__version__}")
+print("Qwen3.5 text architecture: OK")
+PY
+
 # The systemd service runs as 'service' on the production host. When this
 # installer is invoked with sudo, downloading as root would put the HF cache
 # in /root and the service would download the models again on first startup.
