@@ -17,7 +17,24 @@ if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN=python3
 fi
 
-"$PYTHON_BIN" - <<'PY'
+# The systemd service runs as 'service' on the production host. When this
+# installer is invoked with sudo, downloading as root would put the HF cache
+# in /root and the service would download the models again on first startup.
+SERVICE_USER=${SERVICE_USER:-service}
+SERVICE_HOME=$(getent passwd "$SERVICE_USER" 2>/dev/null | cut -d: -f6 || true)
+if [ -z "$SERVICE_HOME" ]; then
+  SERVICE_USER=$(id -un)
+  SERVICE_HOME=${HOME:-$(pwd)}
+fi
+
+HF_HOME="$SERVICE_HOME/.cache/huggingface"
+mkdir -p "$HF_HOME"
+chown -R "$SERVICE_USER":"$SERVICE_USER" "$HF_HOME" 2>/dev/null || true
+
+echo "Caching Hugging Face models for service user: $SERVICE_USER"
+
+if id "$SERVICE_USER" >/dev/null 2>&1; then
+  su -s /bin/sh "$SERVICE_USER" -c "HF_HOME='$HF_HOME' HUGGINGFACE_HUB_CACHE='$HF_HOME/hub' '$PYTHON_BIN' - <<'PY'
 from huggingface_hub import snapshot_download
 
 print('Downloading D base model: Qwen/Qwen3.5-4B')
@@ -26,5 +43,23 @@ print('Downloading D adapter: synterr-nlp/bea2026-gec-adapters')
 snapshot_download('synterr-nlp/bea2026-gec-adapters')
 print('Downloading F model: melsmm/Spell-Corrector-RU-4B')
 snapshot_download('melsmm/Spell-Corrector-RU-4B')
-print('Experimental models cached. Presets A/C/D/E/F/G can now be switched only via LLM_PRESET + service restart.')
+print('Experimental HF models cached.')
+PY"
+else
+  HF_HOME="$HF_HOME" HUGGINGFACE_HUB_CACHE="$HF_HOME/hub" "$PYTHON_BIN" - <<'PY'
+from huggingface_hub import snapshot_download
+
+snapshot_download('Qwen/Qwen3.5-4B')
+snapshot_download('synterr-nlp/bea2026-gec-adapters')
+snapshot_download('melsmm/Spell-Corrector-RU-4B')
+print('Experimental HF models cached.')
 PY
+fi
+
+# C uses the existing Ollama secondary model. Pull it once when Ollama is
+# available; failure is non-fatal because C's startup check reports it.
+if command -v ollama >/dev/null 2>&1; then
+  ollama pull 'hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0' || true
+fi
+
+echo 'One-time preset setup complete. Switch only LLM_PRESET=A/C/D/E/F/G and restart ai-suggester.service.'
