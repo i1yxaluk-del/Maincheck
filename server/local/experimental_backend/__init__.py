@@ -56,20 +56,29 @@ def _validate_candidates(candidates: list[EditCandidate]) -> list[EditCandidate]
 
 
 def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[EditCandidate]:
+    """Extract only whole-word substitutions from a generated full-text result.
+
+    This intentionally ignores whitespace/reflow and insertions/deletions. It is
+    the safety boundary that prevents F from turning paragraph formatting into
+    LibreOffice Track Changes.
+    """
     if not source or not corrected or source == corrected:
         return []
+
+    src_matches = list(_WORD_RE.finditer(source))
+    dst_matches = list(_WORD_RE.finditer(corrected))
+    src_words = [m.group(0) for m in src_matches]
+    dst_words = [m.group(0) for m in dst_matches]
     result: list[EditCandidate] = []
-    sm = SequenceMatcher(None, source, corrected, autojunk=False)
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, src_words, dst_words, autojunk=False).get_opcodes():
         if tag != "replace":
             continue
-        before = source[i1:i2]
-        after = corrected[j1:j2]
-        if not before or not after or "\n" in before or "\n" in after:
+        if i2 - i1 != j2 - j1 or i2 - i1 > 2:
             continue
-        bw = _words(before)
-        aw = _words(after)
-        if not bw or not aw or len(bw) != len(aw) or len(bw) > 2:
+        before = source[src_matches[i1].start():src_matches[i2 - 1].end()]
+        after = corrected[dst_matches[j1].start():dst_matches[j2 - 1].end()]
+        if "\n" in before or "\n" in after:
             continue
         result.append(
             EditCandidate(
@@ -77,7 +86,7 @@ def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[Ed
                 after=after,
                 confidence=0.80,
                 category=category,
-                reason="safe local diff from specialized model",
+                reason="safe whole-word diff from specialized model",
             )
         )
     return result
