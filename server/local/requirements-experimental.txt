@@ -1,6 +1,7 @@
-# Optional dependencies for presets D/F.
-# Install into the same venv only when these presets are needed.
-transformers>=5.5.0
+# Dependencies for presets D/F. Installed once with the common server requirements.
+# Qwen3.5-4B was released against the 4.57 Transformers API; keep the
+# major version pinned so PEFT adapter module names stay compatible.
+transformers>=4.57.0,<5.0
 accelerate>=1.7.0
 peft>=0.19.1
 safetensors>=0.5.3
