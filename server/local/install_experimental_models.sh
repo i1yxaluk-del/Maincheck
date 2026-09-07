@@ -17,12 +17,13 @@ if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN=python3
 fi
 
-# Fail before touching systemd if the Python tree or HF runtime is broken.
+# The old experimental_backend.py is intentionally superseded by the
+# experimental_backend package. Python resolves the package first, which lets
+# us keep a clean backend implementation without any second server process.
 "$PYTHON_BIN" -m py_compile \
   decision_app.py \
   decision_engine.py \
   main.py \
-  experimental_backend.py \
   experimental_backend/__init__.py \
   test_experimental_backend.py
 
