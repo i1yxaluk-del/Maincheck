@@ -1,9 +1,9 @@
 # Runtime dependencies used by presets D and F.
 # Installed once into the same production venv.
-# Qwen3.5 requires a recent Transformers 5.x runtime.
+# Qwen3.5 requires the current Transformers 5.x runtime.
 transformers==5.16.1
 accelerate>=1.13.0
-peft>=0.19.1
+peft==0.20.0
 safetensors>=0.7.0
 torch>=2.5.0
 huggingface_hub>=1.10.0
