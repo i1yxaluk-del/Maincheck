@@ -28,9 +28,6 @@ F_PROMPT = """Исходный текст:
 {TEXT}
 
 Отредактируй исходный текст, исправив ошибки.
-Исправляй только орфографию, пунктуацию и регистр.
-Не меняй слова и смысл без необходимости.
-Верни только исправленный текст без пояснений.
 """
 
 _WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z0-9]+(?:[-/][А-Яа-яЁёA-Za-z0-9]+)*")
@@ -56,12 +53,7 @@ def _validate_candidates(candidates: list[EditCandidate]) -> list[EditCandidate]
 
 
 def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[EditCandidate]:
-    """Extract only whole-word substitutions from a generated full-text result.
-
-    This intentionally ignores whitespace/reflow and insertions/deletions. It is
-    the safety boundary that prevents F from turning paragraph formatting into
-    LibreOffice Track Changes.
-    """
+    """Extract only whole-word substitutions from a generated full-text result."""
     if not source or not corrected or source == corrected:
         return []
 
@@ -72,9 +64,7 @@ def _safe_diff_candidates(source: str, corrected: str, category: str) -> list[Ed
     result: list[EditCandidate] = []
 
     for tag, i1, i2, j1, j2 in SequenceMatcher(None, src_words, dst_words, autojunk=False).get_opcodes():
-        if tag != "replace":
-            continue
-        if i2 - i1 != j2 - j1 or i2 - i1 > 2:
+        if tag != "replace" or i2 - i1 != j2 - j1 or i2 - i1 > 2:
             continue
         before = source[src_matches[i1].start():src_matches[i2 - 1].end()]
         after = corrected[dst_matches[j1].start():dst_matches[j2 - 1].end()]
@@ -168,7 +158,6 @@ class ExperimentalBackend:
             self.config.model,
             transformers.__version__,
         )
-
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.base_model or self.config.model)
         kwargs: dict[str, Any] = {
             "device_map": os.getenv("EXPERIMENTAL_DEVICE_MAP", "auto"),
@@ -209,59 +198,64 @@ class ExperimentalBackend:
         self._model.eval()
         logger.info("Experimental[D]: adapter loaded")
 
+    def _prepare_inputs(self, text: str):
+        assert self._tokenizer is not None
+        if self.config.preset == "F":
+            message = {"role": "user", "content": F_PROMPT.format(TEXT=text)}
+            return self._tokenizer.apply_chat_template(
+                [message],
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+
+        messages = [
+            {"role": "system", "content": D_PROMPT},
+            {"role": "user", "content": f"ИСХОДНЫЙ ТЕКСТ:\n{text}"},
+        ]
+        try:
+            return self._tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return self._tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+            )
+
     def _generate(self, text: str, max_new_tokens: int = 384) -> str:
         self._load()
         import torch
-        assert self._tokenizer is not None and self._model is not None
-
-        if self.config.preset == "F":
-            prompt = F_PROMPT.format(TEXT=text)
-            inputs = self._tokenizer(prompt, return_tensors="pt")
-        else:
-            messages = [
-                {"role": "system", "content": D_PROMPT},
-                {"role": "user", "content": f"ИСХОДНЫЙ ТЕКСТ:\n{text}"},
-            ]
-            try:
-                inputs = self._tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_tensors="pt",
-                    return_dict=True,
-                    enable_thinking=False,
-                )
-            except TypeError:
-                inputs = self._tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_tensors="pt",
-                    return_dict=True,
-                )
-
+        assert self._model is not None
+        inputs = self._prepare_inputs(text)
         device = self._device()
         if hasattr(inputs, "items"):
             inputs = {k: v.to(device) for k, v in inputs.items() if hasattr(v, "to")}
             input_ids = inputs["input_ids"]
-            with torch.inference_mode():
-                output = self._model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    repetition_penalty=1.03,
-                )
         else:
             inputs = inputs.to(device)
             input_ids = inputs
-            with torch.inference_mode():
-                output = self._model.generate(
-                    input_ids,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    repetition_penalty=1.03,
-                )
 
+        generation_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "repetition_penalty": 1.03,
+        }
+        if self.config.preset == "F":
+            generation_kwargs.update({"do_sample": True, "temperature": 0.1, "top_p": 0.7})
+        else:
+            generation_kwargs.update({"do_sample": False})
+
+        with torch.inference_mode():
+            output = self._model.generate(**inputs, **generation_kwargs) if isinstance(inputs, dict) else self._model.generate(inputs, **generation_kwargs)
         generated = output[0][input_ids.shape[-1]:]
         return self._tokenizer.decode(generated, skip_special_tokens=True).strip()
 
