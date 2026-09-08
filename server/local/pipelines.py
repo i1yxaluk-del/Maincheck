@@ -67,7 +67,18 @@ class StackInfo:
 
 STACKS = {
     "A": StackInfo("A", "production: edit-first T-lite + retrieval + morphology", A_MODEL, False),
-    "F": StackInfo("F", "experimental: Spell-Corrector-RU-4B + bounded surface gate", F_MODEL, True),
+    "F": StackInfo(
+        "F",
+        "experimental, NOT RECOMMENDED as of 2026-09-08: Spell-Corrector-RU-4B "
+        "+ bounded surface gate — on prod regression text the backend model "
+        "returns partial rewrites (322/139 chars vs 143-147 char input) instead "
+        "of minimal edits, so SurfaceGate correctly rejects everything and the "
+        "stack contributes 0 candidates while still costing 12-20s. Keep the "
+        "code for future experiments with a different backend model, but do "
+        "not switch prod to F until the backend is replaced or benchmarked "
+        "positively on your corpus.",
+        F_MODEL, True,
+    ),
     "G": StackInfo("G", "experimental: local edit detector + T-lite verifier", G_MODEL, True),
 }
 
@@ -260,6 +271,14 @@ class TliteClient:
             "required": ["edits"], "additionalProperties": False,
         }
 
+    @staticmethod
+    def verify_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"accept": {"type": "array", "maxItems": 8, "items": {"type": "boolean"}}},
+            "required": ["accept"], "additionalProperties": False,
+        }
+
     async def chat_json(self, messages: list[dict[str, str]], schema: dict[str, Any]) -> dict[str, Any]:
         payload = {
             "model": self.model, "messages": messages, "stream": False, "format": schema,
@@ -292,16 +311,80 @@ class TliteClient:
         return DecisionEngine.parse(await self.chat_json(messages, self.schema()))
 
     async def verify(self, text: str, candidates: list[EditCandidate]) -> list[EditCandidate]:
+        """Просит T-lite подтвердить/отклонить уже найденные детерминированные
+        кандидаты (numeral_noun/adj_noun/MorphologyRescue).
+
+        v2.4.1 FIX (2026-09-08): раньше при ЛЮБОЙ проблеме с ответом Ollama —
+        сетевая ошибка, невалидный JSON, отсутствие/усечение поля `accept` —
+        функция возвращала `[]`, т.е. **отбрасывала абсолютно все** уже
+        провалидированные детерминированные кандидаты, включая
+        высокоуверенные (confidence=0.90-0.96, чистый pymorphy3/natasha
+        сигнал без всякого участия LLM). Это fail-closed поведение, и оно
+        воспроизводимо ломало recall: на тесте
+        «должностного лиц ... служебно-боевой деятельностей» stack A
+        (тот же детерминированный LocalEditTagger, БЕЗ verify-прослойки)
+        находил и принимал «лиц→лица», а stack G на ТОМ ЖЕ тексте
+        возвращал candidates=0 — притом что pymorphy3 детерминирован и
+        обязан был найти тот же кандидат. Единственное объяснение —
+        verify() тихо выкинул его из-за сбоя парсинга JSON от T-lite,
+        а не из-за содержательного «нет».
+        Инфраструктурный сбой связи с LLM — это НЕ вердикт «правка
+        неверна», и не должен трактоваться как отказ. Теперь при любом
+        сбое коммуникации/парсинга функция **fail-open**: возвращает
+        исходные детерминированные кандидаты как есть (как будто
+        verify-шага не было) и громко логирует это как WARNING, чтобы
+        сбой был виден в мониторинге, а не маскировался под «ошибок нет».
+        Единственный путь реально ОТКЛОНИТЬ кандидата — explicit
+        `accept[i] == false` от модели после успешного парсинга JSON.
+        """
         if not candidates:
             return []
-        payload = [{"id": i, "before": c.before, "after": c.after, "category": c.category} for i, c in enumerate(candidates[:8])]
-        schema = {"type": "object", "properties": {"accept": {"type": "array", "maxItems": 8, "items": {"type": "boolean"}}}, "required": ["accept"], "additionalProperties": False}
-        messages = [{"role": "system", "content": G_SYSTEM}, {"role": "user", "content": json.dumps({"text": text, "candidates": payload}, ensure_ascii=False)}]
-        data = await self.chat_json(messages, schema)
+        subset = candidates[:8]
+        payload = [
+            {"id": i, "before": c.before, "after": c.after, "category": c.category}
+            for i, c in enumerate(subset)
+        ]
+        messages = [
+            {"role": "system", "content": G_SYSTEM},
+            {"role": "user", "content": json.dumps({"text": text, "candidates": payload}, ensure_ascii=False)},
+        ]
+        try:
+            data = await self.chat_json(messages, self.verify_schema())
+        except Exception as exc:  # noqa: BLE001 — сеть/таймаут/HTTP-ошибка Ollama
+            logger.warning(
+                "Stack G verify(): вызов T-lite провалился (%s: %s) — fail-open, "
+                "оставляю %d детерминированных кандидатов без LLM-подтверждения "
+                "вместо силового отказа",
+                type(exc).__name__, exc, len(subset),
+            )
+            return subset
+
         flags = data.get("accept") if isinstance(data, dict) else None
-        if not isinstance(flags, list):
-            return []
-        return [c for i, c in enumerate(candidates[:8]) if i < len(flags) and bool(flags[i])]
+        if not isinstance(flags, list) or not flags:
+            logger.warning(
+                "Stack G verify(): T-lite вернул нераспознаваемый JSON (%r) — "
+                "fail-open, оставляю %d детерминированных кандидатов",
+                data, len(subset),
+            )
+            return subset
+
+        accepted: list[EditCandidate] = []
+        for i, c in enumerate(subset):
+            if i >= len(flags):
+                logger.warning(
+                    "Stack G verify(): нет вердикта для кандидата %d («%s»→«%s»), "
+                    "оставляю без подтверждения", i, c.before, c.after,
+                )
+                accepted.append(c)
+                continue
+            if bool(flags[i]):
+                accepted.append(c)
+            else:
+                logger.info(
+                    "Stack G verify(): T-lite явно отклонил «%s»→«%s»",
+                    c.before, c.after,
+                )
+        return accepted
 
 
 class FBackend:
@@ -336,13 +419,28 @@ class FBackend:
         device = self._device()
         inputs = {k: v.to(device) for k, v in encoded.items() if torch.is_tensor(v)}
         input_ids = inputs["input_ids"]
-        max_new = min(192, max(64, len(text) // 2 + 32))
+        # v2.4.1: было min(192, max(64, len(text)//2+32)) — на реальном
+        # прод-тексте (147 chars) это давало потолок ~105 токенов, и модель
+        # обрезалась/уходила в пересказ вместо точечной правки (наблюдалось
+        # 322 и 139 сгенерированных символов на 147/143-символьный вход —
+        # то распухание, то обрыв). Подняли пол и потолок; это НЕ чинит
+        # основную проблему (модель генерирует не точечные правки, а
+        # пересказ — SurfaceGate тогда справедливо режет всё в 0), но
+        # снижает шанс, что сама причина — банальный обрыв генерации.
+        max_new = min(320, max(96, len(text) // 2 + 48))
         with torch.inference_mode():
             output = self._model.generate(**inputs, max_new_tokens=max_new, do_sample=True, temperature=0.1, top_p=0.7, repetition_penalty=1.02)
         generated = self._tokenizer.decode(output[0][input_ids.shape[-1]:], skip_special_tokens=True).strip()
         raw = surface_candidates(text, generated)
         safe = [c for c in raw if self.surface_gate.accept(c.before, c.after)]
-        logger.info("Experimental[F]: generated_chars=%d raw=%d safe=%d", len(generated), len(raw), len(safe))
+        logger.info(
+            "Experimental[F]: input_chars=%d generated_chars=%d raw=%d safe=%d "
+            "(raw=0 обычно значит модель переписала/сократила текст вместо "
+            "точечной правки — SurfaceGate отклоняет диффы длиннее 80 символов "
+            "на сегмент; см. Инструкции/ЖУРНАЛ, стек F помечен как не "
+            "рекомендованный к прод-использованию до замены backend-модели)",
+            len(text), len(generated), len(raw), len(safe),
+        )
         return safe
 
 
