@@ -135,6 +135,19 @@ class MorphologyRescue:
             if any(self._is_participle(a) for a in modifiers) and any(n.tag.case == "ablt" for n in nouns):
                 continue
             source_parse, noun_parse = modifiers[0], nouns[0]
+            # Prefer correcting the modifier when the noun already has a
+            # valid form. This covers groups such as "должностного лиц":
+            # inflecting only the noun would produce "должностного лица"
+            # and hide the number error in the source adjective.
+            if source_parse.tag.number and noun_parse.tag.number and source_parse.tag.case:
+                target = noun_parse.tag.number
+                modifier_form = source_parse.inflect({target, noun_parse.tag.case})
+                if modifier_form and modifier_form.word != modifier:
+                    after = modifier_form.word
+                    if modifier[:1].isupper():
+                        after = after[:1].upper() + after[1:]
+                    out.append(EditCandidate(modifier, after, 0.97, "agreement", "согласование определения с существительным"))
+                    continue
             grammemes = {g for g in (source_parse.tag.number, source_parse.tag.case) if g}
             if not grammemes:
                 continue
