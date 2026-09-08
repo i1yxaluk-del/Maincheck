@@ -1,5 +1,5 @@
 from decision_engine import DecisionEngine, EditCandidate
-from pipelines import SurfaceGate, surface_candidates
+from pipelines import MorphologyRescue, SurfaceGate, surface_candidates
 
 
 BAD_F_SOURCE = """Изучена
@@ -51,3 +51,17 @@ def test_full_observed_f_output_has_no_admissible_surface_edits():
 def test_surface_changes_are_bounded():
     edits = surface_candidates("Это текст.", "Это текст,")
     assert all(len(e.before) <= 80 and len(e.after) <= 80 for e in edits)
+
+
+def test_morphology_rescue_finds_dolzhnostnogo_lits():
+    source = "Изучена управленческая роль, должностного лиц в организации."
+    rescue = MorphologyRescue()
+    candidates = rescue.candidates(source)
+    assert any(c.before == "лиц" and c.after == "лица" for c in candidates)
+
+
+def test_morphology_rescue_does_not_change_valid_forms_from_observed_bad_text():
+    rescue = MorphologyRescue()
+    candidates = rescue.candidates(BAD_F_SOURCE)
+    assert not any(c.before == "изучена" and c.after == "изучено" for c in candidates)
+    assert not any(c.before == "деятельностей" and c.after == "деятельности" for c in candidates)
