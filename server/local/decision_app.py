@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
+
+# server/local and server/shared are sibling directories. Uvicorn is started
+# with WorkingDirectory=server/local, so add the common server root explicitly.
+SERVER_ROOT = Path(__file__).resolve().parents[1]
+if str(SERVER_ROOT) not in sys.path:
+    sys.path.insert(0, str(SERVER_ROOT))
 
 from decision_engine import DecisionEngine
 from pipelines import STACKS, StackRouter
