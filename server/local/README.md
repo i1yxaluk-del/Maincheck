@@ -1,72 +1,86 @@
-# AI LibreOffice Suggester — local v2
+# AI LibreOffice Suggester — local v2.4
 
-Production uses **one** systemd service and **one** Uvicorn process:
+This server is a **local Russian proofreader that applies minimal edits**. It is not a generic text-improvement service.
+
+## Runtime model
+
+Production uses exactly one systemd service and one Uvicorn process:
 
 ```text
+.env
+  ↓
+ai-suggester.service
+  ↓
 uvicorn decision_app:app --host 0.0.0.0 --port 8000
 ```
 
-There is no second inference server and no second Uvicorn launcher.
+No second inference server is used.
 
 ## Three supported stacks
 
 ### A — production
 
 ```text
-LibreOffice
-  ↓ HTTP /suggest
-FastAPI decision_app
+raw selected text
   ↓
-T-lite-it-2.1 via Ollama
-  ↓ structured JSON edits only
+deterministic morphology candidates
+  ↓
+local BM25 + char-trigram retrieval of similar Russian GEC examples
+  ↓
+T-lite structured local-edit proposal
+  ↓
+merge candidates
+  ↓
 DecisionEngine
-  ↓ exact occurrence / confidence / overlap / protected-word gates
-LibreOffice extension
+  ↓
+minimal exact edits
 ```
 
-Model: `t-tech/T-lite-it-2.1:q4_K_M`.
+Model: `t-tech/T-lite-it-2.1:q4_K_M` via Ollama.
 
-A is the only production stack. The LLM is never asked to return a rewritten paragraph; it returns local `before → after` edits. This makes the server apply only exact, bounded changes.
+The LLM is never asked to rewrite the paragraph. Retrieval is local and deterministic; it uses the repository's Russian GEC example bank with hashing embeddings plus BM25 word/trigram fusion, so no embedding model or external service is needed.
 
-### F — experimental surface corrector
-
-Model: `melsmm/Spell-Corrector-RU-4B`.
-
-The model card describes the model as a Russian spelling/punctuation/case corrector and publishes the prompt `Исходный текст: ... Отредактируй исходный текст, исправив ошибки.` with low-temperature sampling. It is a full-text generator, so our adapter is deliberately stricter than the model itself: paragraph structure cannot change and any alphabetic token change must preserve the pymorphy3 morphology signature. See the model card: https://huggingface.co/melsmm/Spell-Corrector-RU-4B
-
-F is an experiment, not production.
-
-### G — experimental conservative detector
+### G — experimental high-precision editor
 
 ```text
-raw text
-  ↓
-MorphDetector / local edit candidates
+MorphDetector + narrow morphology rescue
   ↓
 T-lite verifier
   ↓
 DecisionEngine
-  ↓
-minimal changes
 ```
 
-T-lite is only a verifier. It never rewrites the whole paragraph. G is expected to have lower recall than A but a lower false-positive risk.
+G does not ask the LLM to discover new text changes. The LLM only votes on candidates already produced by deterministic logic. This is the conservative experiment for measuring precision-first correction.
 
-## Why D/E/C were removed
+### F — experimental surface corrector
 
-D (Qwen3.5-4B + SyntErr→LORuGEC LoRA) is academically interesting: the published BEA 2026 adapter card reports 75.3 M2 F0.5 on LORuGEC test for Qwen3.5-4B with SyntErr→LORuGEC. The same card shows the official PEFT loading pattern. https://huggingface.co/synterr-nlp/bea2026-gec-adapters
+```text
+Spell-Corrector-RU-4B
+  ↓
+bounded local diff
+  ↓
+paragraph / line-break guard
+  ↓
+pymorphy3 morphology gate
+  ↓
+DecisionEngine
+```
 
-It is not part of the supported local stack because the current production host produced missing LoRA adapter keys and a real request took about 262 seconds in the observed run. A model that loads incorrectly or exceeds LibreOffice's practical response budget must not be a production dependency.
+F remains isolated because it is a full-text generator and therefore has higher compute cost and a larger risk of changing valid word forms.
 
-E was a local MorphDetector wrapper rather than the published RussianGEC sequence-tagger checkpoint. The public RussianGEC_SeqTagger repository contains training/inference code, but not a ready checkpoint suitable for this deployment. https://github.com/ReginaNasyrova/RussianGEC_SeqTagger
+## Why this architecture
 
-C added another Ollama generation hop. On this host the additional model did not justify the extra latency and complexity compared with keeping one high-quality generator plus deterministic gates.
+2025 Russian GEC research reports strong results from edit-based sequence tagging and shows that selecting similar correction examples with a GECToR-style retriever improves few-shot LLM correction. The LORuGEC paper reports up to 83% F0.5 for its best 5-shot setup and specifically reports gains from GECToR-based example selection. urlBEA 2025 paperhttps://aclanthology.org/2025.bea-1.38/
 
-## Installation
+The 2025 Russian sequence-tagging work also reports state-of-the-art results on RU-Lang8 and GERA for its edit-based architecture. urlRussian sequence tagging paperhttps://aclanthology.org/2025.acl-srw.82/
 
-The runtime configuration source is **only** `server/local/.env`.
+BEA 2026 shows why a single aggregate score is insufficient: synthetic fine-tuning can raise overall F0.5 while sharply degrading individual grammar rules. Our service therefore keeps rule-level regression cases and destructive-edit tests in the repository. urlBEA 2026 diagnostichttps://synterr-nlp.github.io/papers/bea-2026/
 
-Normal production update:
+For our hardware, the practical conclusion is to spend the expensive T-lite generation budget once, on a small edit-oriented prompt, and to move easy high-confidence work into deterministic local components.
+
+## Installation and operation
+
+Normal operation is only:
 
 ```bash
 cd /home/service/llama/server/local
@@ -74,55 +88,31 @@ sudo systemctl restart ai-suggester.service
 journalctl -u ai-suggester.service -n 120 --no-pager
 ```
 
-The service itself reads `/home/service/llama/server/local/.env` through `EnvironmentFile`. Do not maintain a second preset-switching mechanism.
-
-### One-time / after dependency changes
-
-For dependency or model changes:
+After dependency/model changes, run the one-time installer:
 
 ```bash
 cd /home/service/llama/server/local
 bash install_experimental_models.sh
 ```
 
-The installer installs the repository requirements, validates the Python runtime, and caches the Hugging Face model required by F. It does not start a second server.
-
-### Selecting a stack
-
-Edit `.env`:
+Select the stack only by editing `.env`:
 
 ```text
 LLM_PRESET=A
 ```
 
-or:
+or `F` / `G`, then restart the same service.
 
-```text
-LLM_PRESET=F
-```
+There is no preset-switching shell command in the production workflow. `/metrics` is diagnostic only and is not part of startup.
 
-or:
-
-```text
-LLM_PRESET=G
-```
-
-Then restart the existing service:
-
-```bash
-sudo systemctl restart ai-suggester.service
-```
-
-There is no `switch_llm_preset.sh`, no manual `MODEL_NAME` switch, and no second Uvicorn process.
-
-## Main runtime settings
+## Main settings
 
 ```text
 LLM_PRESET=A
 OLLAMA_URL=http://localhost:11434
 NUM_THREADS=28
 OLLAMA_NUM_CTX=2048
-OLLAMA_NUM_PREDICT=384
+OLLAMA_NUM_PREDICT=192
 OLLAMA_TIMEOUT=120
 OLLAMA_WARMUP=true
 OLLAMA_KEEP_ALIVE=24h
@@ -136,30 +126,19 @@ USER_DICT_ENABLED=true
 AUDIT_ENABLED=true
 ```
 
-## Diagnostics
+## Critical regression targets
 
-The canonical operational diagnostic is the systemd journal:
-
-```bash
-journalctl -u ai-suggester.service -n 120 --no-pager
-```
-
-The HTTP health endpoint is available when the service is already running:
-
-```bash
-curl -fsS http://localhost:8000/health
-```
-
-The `/metrics` endpoint is for application telemetry and is not part of the start/restart procedure.
-
-## Regression cases
-
-The test suite explicitly guards against the previously observed destructive F output:
+The production corpus must detect:
 
 ```text
-изучена         → изучено
-должностного    → должностных
-деятельностей   → деятельности
+должностного лиц → должностного лица
 ```
 
-Those changes must never reach `DecisionEngine` from F.
+and must never introduce the previously observed F transformations:
+
+```text
+изучена → изучено
+dолжностного → должностных
+деятельностей → деятельности
+```
+
