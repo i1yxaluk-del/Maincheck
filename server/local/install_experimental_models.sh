@@ -16,6 +16,11 @@ if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN=python3
 fi
 
+# The local package imports the sibling server/shared package. Keep the
+# installer self-contained so it works from server/local without relying on
+# the systemd unit's PYTHONPATH.
+export PYTHONPATH="$ROOT/..${PYTHONPATH:+:$PYTHONPATH}"
+
 "$PYTHON_BIN" -m py_compile \
   decision_app.py \
   decision_engine.py \
@@ -41,7 +46,7 @@ chown -R "$SERVICE_USER":"$SERVICE_USER" "$HF_HOME" 2>/dev/null || true
 # Only F requires Hugging Face weights. A/G use the existing Ollama model
 # and local deterministic components.
 if id "$SERVICE_USER" >/dev/null 2>&1; then
-  su -s /bin/sh "$SERVICE_USER" -c "HF_HOME='$HF_HOME' HUGGINGFACE_HUB_CACHE='$HF_HOME/hub' '$PYTHON_BIN' - <<'PY'
+  su -s /bin/sh "$SERVICE_USER" -c "HF_HOME='$HF_HOME' HUGGINGFACE_HUB_CACHE='$HF_HOME/hub' PYTHONPATH='$ROOT/..${PYTHONPATH:+:$PYTHONPATH}' '$PYTHON_BIN' - <<'PY'
 from huggingface_hub import snapshot_download
 snapshot_download('melsmm/Spell-Corrector-RU-4B')
 print('F model cached.')
