@@ -547,7 +547,10 @@ class StackRouter:
         if self.preset in {"A", "B", "C"}:
             local = self.tagger.candidates(text)
             lt = await asyncio.to_thread(self.language_tool.candidates, text)
-            generated = await self.tlite.candidates(text, context, protected_words)
+            generated = [
+                EditCandidate(c.before, c.after, c.confidence, f"model:{c.category}", c.reason)
+                for c in await self.tlite.candidates(text, context, protected_words)
+            ]
             return local + lt + generated
         if self.preset == "G":
             local = self.tagger.candidates(text)

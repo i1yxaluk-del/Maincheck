@@ -49,6 +49,14 @@ def test_decision_engine_rejects_compound_term_substitution():
     assert accepted == []
 
 
+def test_decision_engine_rejects_unverified_valid_inflection():
+    source = "Общий пробег транспортного средства за сутки, км и Горючее"
+    candidate = EditCandidate("Горючее", "Горючего", 0.99, "model:agreement", "test")
+    corrected, accepted = DecisionEngine().apply(source, [candidate])
+    assert corrected == source
+    assert accepted == []
+
+
 def test_morphology_rescue_finds_real_local_agreement_error():
     rescue = MorphologyRescue()
     candidates = rescue.candidates(BAD_SOURCE)

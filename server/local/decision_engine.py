@@ -62,6 +62,30 @@ class DecisionEngine:
         after_terms = re.findall(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)+", after)
         return bool(before_terms and before_terms != after_terms)
 
+    @staticmethod
+    def _is_unverified_llm_inflection(c: EditCandidate) -> bool:
+        """Reject model-only case/number substitutions of valid words.
+
+        A generative model cannot establish that a heading such as
+        ``Горючее`` must become genitive ``Горючего``. Such edits need a
+        deterministic syntax signal; otherwise they are often stylistic
+        hallucinations rather than corrections.
+        """
+        if not c.category.startswith(("model", "unknown", "languagetool")):
+            return False
+        if not re.fullmatch(r"[А-Яа-яЁё-]+", c.before) or not re.fullmatch(r"[А-Яа-яЁё-]+", c.after):
+            return False
+        try:
+            import pymorphy3
+            morph = pymorphy3.MorphAnalyzer()
+            before = morph.parse(c.before)
+            after = morph.parse(c.after)
+            if not before or not after or not before[0].is_known or not after[0].is_known:
+                return False
+            return before[0].normal == after[0].normal
+        except Exception:
+            return False
+
     def validate(self, text: str, candidates: list[EditCandidate]) -> list[tuple[int, EditCandidate]]:
         accepted: list[tuple[int, EditCandidate]] = []
         occupied: list[tuple[int, int]] = []
@@ -75,6 +99,8 @@ class DecisionEngine:
             if self._protected(c.before):
                 continue
             if self._changes_compound_term(c.before, c.after):
+                continue
+            if self._is_unverified_llm_inflection(c):
                 continue
             # Ambiguous BEFORE text cannot be safely mapped to one occurrence.
             positions = [m.start() for m in re.finditer(re.escape(c.before), text)]
