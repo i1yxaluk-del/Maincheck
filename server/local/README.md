@@ -62,37 +62,58 @@ E was a local MorphDetector wrapper rather than the published RussianGEC sequenc
 
 C added another Ollama generation hop. On this host the additional model did not justify the extra latency and complexity compared with keeping one high-quality generator plus deterministic gates.
 
-## Install
+## Installation
+
+The runtime configuration source is **only** `server/local/.env`.
+
+Normal production update:
 
 ```bash
 cd /home/service/llama/server/local
-source venv/bin/activate
-pip install -r requirements.txt
+sudo systemctl restart ai-suggester.service
+journalctl -u ai-suggester.service -n 120 --no-pager
 ```
 
-For F, cache the Hugging Face model once:
+The service itself reads `/home/service/llama/server/local/.env` through `EnvironmentFile`. Do not maintain a second preset-switching mechanism.
+
+### One-time / after dependency changes
+
+For dependency or model changes:
 
 ```bash
+cd /home/service/llama/server/local
 bash install_experimental_models.sh
 ```
 
-The installer also pins `setuptools==81.0.0` because the current Natasha runtime still imports `pkg_resources`.
+The installer installs the repository requirements, validates the Python runtime, and caches the Hugging Face model required by F. It does not start a second server.
 
-## Switch stacks
+### Selecting a stack
+
+Edit `.env`:
+
+```text
+LLM_PRESET=A
+```
+
+or:
+
+```text
+LLM_PRESET=F
+```
+
+or:
+
+```text
+LLM_PRESET=G
+```
+
+Then restart the existing service:
 
 ```bash
-./scripts/switch_llm_preset.sh A
-./scripts/switch_llm_preset.sh G
-./scripts/switch_llm_preset.sh F
 sudo systemctl restart ai-suggester.service
 ```
 
-Check:
-
-```bash
-curl -s http://localhost:8000/metrics | python3 -m json.tool
-journalctl -u ai-suggester.service -n 120 --no-pager
-```
+There is no `switch_llm_preset.sh`, no manual `MODEL_NAME` switch, and no second Uvicorn process.
 
 ## Main runtime settings
 
@@ -115,6 +136,22 @@ USER_DICT_ENABLED=true
 AUDIT_ENABLED=true
 ```
 
+## Diagnostics
+
+The canonical operational diagnostic is the systemd journal:
+
+```bash
+journalctl -u ai-suggester.service -n 120 --no-pager
+```
+
+The HTTP health endpoint is available when the service is already running:
+
+```bash
+curl -fsS http://localhost:8000/health
+```
+
+The `/metrics` endpoint is for application telemetry and is not part of the start/restart procedure.
+
 ## Regression cases
 
 The test suite explicitly guards against the previously observed destructive F output:
@@ -126,15 +163,3 @@ The test suite explicitly guards against the previously observed destructive F o
 ```
 
 Those changes must never reach `DecisionEngine` from F.
-
-Run locally:
-
-```bash
-pytest -q server/local/test_experimental_backend.py
-```
-
-And the stack smoke preflight:
-
-```bash
-bash server/local/install_experimental_models.sh
-```
