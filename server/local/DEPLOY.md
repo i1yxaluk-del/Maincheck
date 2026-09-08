@@ -10,7 +10,8 @@ bash install_local_stack.sh
 cp -n .env.example .env
 ```
 
-В `.env` выберите модель:
+Единственный шаблон конфигурации для редактирования: `.env.example`. Скопируйте
+его в `.env` и меняйте параметры только в `.env`:
 
 ```env
 LLM_PRESET=A
