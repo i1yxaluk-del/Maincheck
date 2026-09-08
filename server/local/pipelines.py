@@ -241,6 +241,8 @@ class MorphologyRescue:
                 continue
             adjective = left.group(0)
             noun = right.group(0)
+            if any(ch in adjective for ch in "-/0123456789"):
+                continue
             apos = [p for p in self.morph.parse(adjective) if self._is_adj(p) and p.tag.number and p.tag.case]
             npos = [p for p in self.morph.parse(noun) if self._is_noun(p)]
             if not apos or not npos:
