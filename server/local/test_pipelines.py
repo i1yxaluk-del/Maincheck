@@ -57,6 +57,14 @@ def test_decision_engine_rejects_unverified_valid_inflection():
     assert accepted == []
 
 
+def test_decision_engine_rejects_unverified_word_split():
+    source = "предрейсовый медицинский осмотр"
+    candidate = EditCandidate("предрейсовый", "пред рейсовый", 0.99, "model:spelling", "test")
+    corrected, accepted = DecisionEngine().apply(source, [candidate])
+    assert corrected == source
+    assert accepted == []
+
+
 def test_morphology_rescue_finds_real_local_agreement_error():
     rescue = MorphologyRescue()
     candidates = rescue.candidates(BAD_SOURCE)

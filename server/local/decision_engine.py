@@ -71,7 +71,7 @@ class DecisionEngine:
         deterministic syntax signal; otherwise they are often stylistic
         hallucinations rather than corrections.
         """
-        if not c.category.startswith(("model", "unknown", "languagetool")):
+        if not c.category.startswith(("model", "unknown", "languagetool", "surface")):
             return False
         if not re.fullmatch(r"[А-Яа-яЁё-]+", c.before) or not re.fullmatch(r"[А-Яа-яЁё-]+", c.after):
             return False
@@ -85,6 +85,16 @@ class DecisionEngine:
             return before[0].normal == after[0].normal
         except Exception:
             return False
+
+    @staticmethod
+    def _splits_or_merges_word(c: EditCandidate) -> bool:
+        """Reject model edits that change a word boundary without proof."""
+        word = r"[А-Яа-яЁёA-Za-z]+"
+        if re.fullmatch(word, c.before) and re.fullmatch(rf"{word} +{word}", c.after):
+            return c.category.startswith(("model", "unknown", "languagetool", "surface"))
+        if re.fullmatch(rf"{word} +{word}", c.before) and re.fullmatch(word, c.after):
+            return c.category.startswith(("model", "unknown", "languagetool", "surface"))
+        return False
 
     def validate(self, text: str, candidates: list[EditCandidate]) -> list[tuple[int, EditCandidate]]:
         accepted: list[tuple[int, EditCandidate]] = []
@@ -101,6 +111,8 @@ class DecisionEngine:
             if self._changes_compound_term(c.before, c.after):
                 continue
             if self._is_unverified_llm_inflection(c):
+                continue
+            if self._splits_or_merges_word(c):
                 continue
             # Ambiguous BEFORE text cannot be safely mapped to one occurrence.
             positions = [m.start() for m in re.finditer(re.escape(c.before), text)]
