@@ -11,6 +11,8 @@ jobs:
     defaults:
       run:
         working-directory: server/local
+    env:
+      PYTHONPATH: ${{ github.workspace }}/server
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
