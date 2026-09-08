@@ -148,7 +148,7 @@ def test_verify_fail_open_on_unparseable_json():
 
 def test_verify_fail_open_on_empty_accept_list():
     """`accept: []` — формально валидный JSON, но пустой массив
-    (модель ничего не провалидаировала). Тоже fail-open."""
+    (модель ничего не провалила). Тоже fail-open."""
     client = _tlite_with_mocked_chat_json({"accept": []})
     candidates = [EditCandidate("лиц", "лица", 0.96, "agreement", "test")]
     result = asyncio.run(client.verify("текст", candidates))
