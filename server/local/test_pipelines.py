@@ -1,5 +1,6 @@
 from decision_engine import DecisionEngine, EditCandidate
 from pipelines import MorphologyRescue, RetrievalExamples, SurfaceGate, TliteClient, surface_candidates
+from pipelines import STACKS
 
 
 BAD_SOURCE = """Изучена
@@ -34,6 +35,18 @@ def test_decision_engine_exact_occurrence():
     corrected, accepted = DecisionEngine().apply(source, [candidate])
     assert corrected == "Это важная акт."
     assert len(accepted) == 1
+
+
+def test_declared_model_presets_are_supported():
+    assert {"A", "B", "C", "F", "G"}.issubset(STACKS)
+
+
+def test_decision_engine_rejects_compound_term_substitution():
+    source = "в организации служебно-боевой деятельности"
+    candidate = EditCandidate("служебно-боевой", "служебно-бытовой", 0.99, "spelling", "test")
+    corrected, accepted = DecisionEngine().apply(source, [candidate])
+    assert corrected == source
+    assert accepted == []
 
 
 def test_morphology_rescue_finds_real_local_agreement_error():

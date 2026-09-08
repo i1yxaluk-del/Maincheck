@@ -24,7 +24,7 @@ load_dotenv()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 LLM_PRESET = os.getenv("LLM_PRESET", "A").strip().upper()
 if LLM_PRESET not in STACKS:
-    raise RuntimeError(f"Unsupported LLM_PRESET={LLM_PRESET!r}; expected A, F or G")
+    raise RuntimeError(f"Unsupported LLM_PRESET={LLM_PRESET!r}; expected A, B, C, F or G")
 
 MIN_CONFIDENCE = float(os.getenv("DECISION_MIN_CONFIDENCE", "0.60"))
 MAX_CHANGES = int(os.getenv("DECISION_MAX_CHANGES", "12"))

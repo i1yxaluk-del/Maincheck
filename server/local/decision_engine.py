@@ -55,6 +55,13 @@ class DecisionEngine:
         tokens = re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9_-]*", before)
         return any(t.casefold() in self.protected_words for t in tokens)
 
+    @staticmethod
+    def _changes_compound_term(before: str, after: str) -> bool:
+        """Hyphenated domain terms must not be replaced by a different lexeme."""
+        before_terms = re.findall(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)+", before)
+        after_terms = re.findall(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)+", after)
+        return bool(before_terms and before_terms != after_terms)
+
     def validate(self, text: str, candidates: list[EditCandidate]) -> list[tuple[int, EditCandidate]]:
         accepted: list[tuple[int, EditCandidate]] = []
         occupied: list[tuple[int, int]] = []
@@ -66,6 +73,8 @@ class DecisionEngine:
             if c.before.replace("ё", "е").replace("Ё", "Е") == c.after.replace("ё", "е").replace("Ё", "Е"):
                 continue
             if self._protected(c.before):
+                continue
+            if self._changes_compound_term(c.before, c.after):
                 continue
             # Ambiguous BEFORE text cannot be safely mapped to one occurrence.
             positions = [m.start() for m in re.finditer(re.escape(c.before), text)]

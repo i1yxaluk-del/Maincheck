@@ -19,6 +19,8 @@ from shared.rag_store import HashingEmbedder
 logger = logging.getLogger("ai_suggester.pipelines")
 
 A_MODEL = "t-tech/T-lite-it-2.1:q4_K_M"
+B_MODEL = os.getenv("B_MODEL", "hf.co/yandex/YandexGPT-5-Lite-8B-instruct-GGUF:Q4_K_M")
+C_MODEL = os.getenv("C_MODEL", "hf.co/ai-sage/GigaChat-3.1-Lightning-10B-A1.8B-Instruct-GGUF:Q4_K_M")
 F_MODEL = os.getenv("F_MODEL", "melsmm/Spell-Corrector-RU-4B")
 G_MODEL = os.getenv("G_VERIFIER_MODEL", A_MODEL)
 WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+(?:[-/][А-Яа-яЁёA-Za-z]+)*")
@@ -67,6 +69,8 @@ class StackInfo:
 
 STACKS = {
     "A": StackInfo("A", "production: edit-first T-lite + retrieval + morphology", A_MODEL, False),
+    "B": StackInfo("B", "experimental: YandexGPT-5-Lite structured edit pipeline", B_MODEL, True),
+    "C": StackInfo("C", "experimental: GigaChat 3.1 Lightning structured edit pipeline", C_MODEL, True),
     "F": StackInfo(
         "F",
         "experimental, NOT RECOMMENDED as of 2026-09-08: Spell-Corrector-RU-4B "
@@ -258,7 +262,7 @@ def surface_candidates(source: str, corrected: str) -> list[EditCandidate]:
 class TliteClient:
     def __init__(self, retriever: RetrievalExamples) -> None:
         self.base_url = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-        self.model = A_MODEL
+        self.model = os.getenv("LLM_MODEL", A_MODEL)
         self.timeout = float(os.getenv("OLLAMA_TIMEOUT", "120"))
         self.num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
         self.num_predict = int(os.getenv("OLLAMA_NUM_PREDICT", "192"))
@@ -520,11 +524,12 @@ class LanguageToolTagger:
 class StackRouter:
     def __init__(self, preset: str, morph_detector: Any) -> None:
         if preset not in STACKS:
-            raise RuntimeError(f"Unsupported LLM_PRESET={preset!r}; expected A, F or G")
+            raise RuntimeError(f"Unsupported LLM_PRESET={preset!r}; expected A, B, C, F or G")
         self.preset = preset
         self.info = STACKS[preset]
         self.retriever = RetrievalExamples()
         self.tlite = TliteClient(self.retriever)
+        self.tlite.model = self.info.model
         self.tagger = LocalEditTagger(morph_detector)
         self.language_tool = LanguageToolTagger()
         self.f_backend = FBackend() if preset == "F" else None
@@ -539,7 +544,7 @@ class StackRouter:
         )
 
     async def candidates(self, text: str, context: str = "", protected_words: set[str] | None = None) -> list[EditCandidate]:
-        if self.preset == "A":
+        if self.preset in {"A", "B", "C"}:
             local = self.tagger.candidates(text)
             lt = await asyncio.to_thread(self.language_tool.candidates, text)
             generated = await self.tlite.candidates(text, context, protected_words)
