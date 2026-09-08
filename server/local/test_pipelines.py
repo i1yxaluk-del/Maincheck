@@ -55,6 +55,12 @@ def test_morphology_rescue_finds_real_local_agreement_error_single_line():
     assert any(c.before == "лиц" and c.after == "лица" for c in candidates)
 
 
+def test_morphology_rescue_corrects_modifier_number_in_noun_group():
+    rescue = MorphologyRescue()
+    candidates = rescue.candidates(PROD_REGRESSION_TEXT)
+    assert any(c.before == "должностного" and c.after == "должностных" for c in candidates)
+
+
 def test_morphology_rescue_rejects_observed_false_positive_context():
     rescue = MorphologyRescue()
     candidates = rescue.candidates(BAD_SOURCE)
