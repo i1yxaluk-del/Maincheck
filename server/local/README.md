@@ -1,218 +1,165 @@
-# AI LibreOffice Suggester — локальный GEC-сервер
+# AI LibreOffice Suggester — local v2
 
-Production работает через один systemd-сервис `ai-suggester.service` и один `uvicorn decision_app:app` на `:8000`. Дополнительный uvicorn не нужен.
-
-## Пресеты
-
-Переключение полного стека:
+Production uses **one** systemd service and **one** Uvicorn process:
 
 ```text
-LLM_PRESET=A
+uvicorn decision_app:app --host 0.0.0.0 --port 8000
 ```
 
-После изменения `.env`:
+There is no second inference server and no second Uvicorn launcher.
 
-```bash
-sudo systemctl restart ai-suggester.service
-journalctl -u ai-suggester.service -n 120 --no-pager
-```
+## Three supported stacks
 
-### A — T-lite baseline
+### A — production
 
 ```text
-LLM_PRESET=A
+LibreOffice
+  ↓ HTTP /suggest
+FastAPI decision_app
+  ↓
+T-lite-it-2.1 via Ollama
+  ↓ structured JSON edits only
+DecisionEngine
+  ↓ exact occurrence / confidence / overlap / protected-word gates
+LibreOffice extension
 ```
 
-`t-tech/T-lite-it-2.1:q4_K_M` через Ollama. Это текущий production baseline. Используются structured output, DecisionEngine, MorphFilter/MorphDetector, few-shot retrieval и общий postprocess.
+Model: `t-tech/T-lite-it-2.1:q4_K_M`.
 
-### C — T-lite + compact surface GEC
+A is the only production stack. The LLM is never asked to return a rewritten paragraph; it returns local `before → after` edits. This makes the server apply only exact, bounded changes.
 
-```text
-LLM_PRESET=C
-```
+### F — experimental surface corrector
 
-Основной GEC — T-lite. После него идёт `hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0` с консервативным safe-merge.
+Model: `melsmm/Spell-Corrector-RU-4B`.
 
-Однократно на production host:
+The model card describes the model as a Russian spelling/punctuation/case corrector and publishes the prompt `Исходный текст: ... Отредактируй исходный текст, исправив ошибки.` with low-temperature sampling. It is a full-text generator, so our adapter is deliberately stricter than the model itself: paragraph structure cannot change and any alphabetic token change must preserve the pymorphy3 morphology signature. See the model card: https://huggingface.co/melsmm/Spell-Corrector-RU-4B
 
-```bash
-ollama pull hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0
-```
+F is an experiment, not production.
 
-### D — Qwen3.5-4B + SyntErr→LORuGEC LoRA
-
-```text
-LLM_PRESET=D
-```
-
-D загружает базовую `Qwen/Qwen3.5-4B` и PEFT adapter `synterr-nlp/bea2026-gec-adapters`, subfolder `v4_qwen35_4b_lorugec`, прямо внутри того же FastAPI-процесса. Отдельный inference server не нужен.
-
-Опубликованные эксперименты для этого adapter дают 75.3 M2 F0.5 на LORuGEC test для Qwen3.5-4B в режиме SyntErr→LORuGEC. urladapter cardhttps://huggingface.co/synterr-nlp/bea2026-gec-adapters
-
-### E — local edit/tagger
-
-```text
-LLM_PRESET=E
-```
-
-E не генерирует новый абзац. Он использует существующий `MorphDetector` как token-level candidate/tagger и передаёт локальные `before → after` в `DecisionEngine`.
-
-Опубликованный `ReginaNasyrova/RussianGEC_SeqTagger` содержит код обучения и inference, но не готовый checkpoint для скачивания. Поэтому E — рабочий локальный edit-based implementation, а не выдуманный wrapper над отсутствующими весами. urlисходный Russian GEC Sequence Taggerhttps://github.com/ReginaNasyrova/RussianGEC_SeqTagger
-
-### F — Spell-Corrector-RU-4B
-
-```text
-LLM_PRESET=F
-```
-
-F лениво загружает `melsmm/Spell-Corrector-RU-4B` через Transformers. Модель предназначена для русской орфографии, пунктуации и регистра и опубликована как готовая merged-модель. urlmodel cardhttps://huggingface.co/melsmm/Spell-Corrector-RU-4B
-
-### G — local edit/tagger + T-lite verifier
-
-```text
-LLM_PRESET=G
-```
-
-Pipeline:
+### G — experimental conservative detector
 
 ```text
 raw text
   ↓
 MorphDetector / local edit candidates
   ↓
-T-lite verifier (Ollama)
+T-lite verifier
   ↓
 DecisionEngine
   ↓
-минимальные CHANGES
+minimal changes
 ```
 
-G использует T-lite только как проверяющий, а не как генератор полного исправленного абзаца.
+T-lite is only a verifier. It never rewrites the whole paragraph. G is expected to have lower recall than A but a lower false-positive risk.
 
-## Установка экспериментальных моделей
+## Why D/E/C were removed
 
-D и F требуют дополнительные Python-пакеты:
+D (Qwen3.5-4B + SyntErr→LORuGEC LoRA) is academically interesting: the published BEA 2026 adapter card reports 75.3 M2 F0.5 on LORuGEC test for Qwen3.5-4B with SyntErr→LORuGEC. The same card shows the official PEFT loading pattern. https://huggingface.co/synterr-nlp/bea2026-gec-adapters
+
+It is not part of the supported local stack because the current production host produced missing LoRA adapter keys and a real request took about 262 seconds in the observed run. A model that loads incorrectly or exceeds LibreOffice's practical response budget must not be a production dependency.
+
+E was a local MorphDetector wrapper rather than the published RussianGEC sequence-tagger checkpoint. The public RussianGEC_SeqTagger repository contains training/inference code, but not a ready checkpoint suitable for this deployment. https://github.com/ReginaNasyrova/RussianGEC_SeqTagger
+
+C added another Ollama generation hop. On this host the additional model did not justify the extra latency and complexity compared with keeping one high-quality generator plus deterministic gates.
+
+## Installation
+
+The runtime configuration source is **only** `server/local/.env`.
+
+Normal production update:
 
 ```bash
 cd /home/service/llama/server/local
-source venv/bin/activate
-pip install -r requirements-experimental.txt
+sudo systemctl restart ai-suggester.service
+journalctl -u ai-suggester.service -n 120 --no-pager
 ```
 
-Чтобы заранее скачать все HF-веса и не ждать первый запрос:
+The service itself reads `/home/service/llama/server/local/.env` through `EnvironmentFile`. Do not maintain a second preset-switching mechanism.
+
+### One-time / after dependency changes
+
+For dependency or model changes:
 
 ```bash
 cd /home/service/llama/server/local
 bash install_experimental_models.sh
 ```
 
-Скрипт кэширует:
+The installer installs the repository requirements, validates the Python runtime, and caches the Hugging Face model required by F. It does not start a second server.
+
+### Selecting a stack
+
+Edit `.env`:
 
 ```text
-Qwen/Qwen3.5-4B
-synterr-nlp/bea2026-gec-adapters
-melsmm/Spell-Corrector-RU-4B
+LLM_PRESET=A
 ```
 
-E дополнительных моделей не требует. G использует уже установленный T-lite через Ollama.
-
-## D/F: параметры
+or:
 
 ```text
-D_BASE_MODEL=Qwen/Qwen3.5-4B
-D_ADAPTER=synterr-nlp/bea2026-gec-adapters
-F_MODEL=melsmm/Spell-Corrector-RU-4B
-EXPERIMENTAL_DEVICE_MAP=auto
-EXPERIMENTAL_DTYPE=auto
-```
-
-Для CPU можно задать:
-
-```text
-EXPERIMENTAL_DEVICE_MAP=cpu
-```
-
-D и F загружаются лениво и исполняются в отдельном worker thread, чтобы не блокировать asyncio event loop FastAPI.
-
-## Переключение
-
-### A
-
-```bash
-sed -i 's/^LLM_PRESET=.*/LLM_PRESET=A/' /home/service/llama/server/local/.env
-sudo systemctl restart ai-suggester.service
-journalctl -u ai-suggester.service -n 120 --no-pager
-```
-
-### C
-
-```bash
-sed -i 's/^LLM_PRESET=.*/LLM_PRESET=C/' /home/service/llama/server/local/.env
-sudo systemctl restart ai-suggester.service
-journalctl -u ai-suggester.service -n 120 --no-pager
-```
-
-### D / E / F / G
-
-Меняется только `LLM_PRESET`:
-
-```text
-LLM_PRESET=D
-LLM_PRESET=E
 LLM_PRESET=F
+```
+
+or:
+
+```text
 LLM_PRESET=G
 ```
 
-После этого:
+Then restart the existing service:
 
 ```bash
 sudo systemctl restart ai-suggester.service
-journalctl -u ai-suggester.service -n 160 --no-pager
 ```
 
-Для D/F первый запрос может быть медленнее из-за загрузки Hugging Face weights; после кэширования веса переиспользуются.
+There is no `switch_llm_preset.sh`, no manual `MODEL_NAME` switch, and no second Uvicorn process.
 
-## Логи
-
-D:
+## Main runtime settings
 
 ```text
-Preset=D ...
-Experimental[D]: loading base=Qwen/Qwen3.5-4B ...
-Experimental[D]: loading adapter=synterr-nlp/bea2026-gec-adapters
-Experimental[D]: model ready
+LLM_PRESET=A
+OLLAMA_URL=http://localhost:11434
+NUM_THREADS=28
+OLLAMA_NUM_CTX=2048
+OLLAMA_NUM_PREDICT=384
+OLLAMA_TIMEOUT=120
+OLLAMA_WARMUP=true
+OLLAMA_KEEP_ALIVE=24h
+OLLAMA_TEMPERATURE=0
+
+DECISION_MIN_CONFIDENCE=0.60
+DECISION_MAX_CHANGES=12
+DECISION_MAX_BEFORE_CHARS=120
+MORPH_DETECTOR_ENABLED=true
+USER_DICT_ENABLED=true
+AUDIT_ENABLED=true
 ```
 
-F:
+## Diagnostics
+
+The canonical operational diagnostic is the systemd journal:
+
+```bash
+journalctl -u ai-suggester.service -n 120 --no-pager
+```
+
+The HTTP health endpoint is available when the service is already running:
+
+```bash
+curl -fsS http://localhost:8000/health
+```
+
+The `/metrics` endpoint is for application telemetry and is not part of the start/restart procedure.
+
+## Regression cases
+
+The test suite explicitly guards against the previously observed destructive F output:
 
 ```text
-Preset=F ...
-Experimental[F]: loading base=melsmm/Spell-Corrector-RU-4B ...
-Experimental[F]: model ready
+изучена         → изучено
+должностного    → должностных
+деятельностей   → деятельности
 ```
 
-E:
-
-```text
-Preset=E ... Local edit/tagger backend ... candidates=...
-```
-
-G:
-
-```text
-Preset=G ... Local edit/tagger + T-lite verifier ...
-```
-
-## Ограничения
-
-D и F требуют `torch/transformers/peft` и заметной RAM/CPU или GPU. A/C не требуют этих дополнительных пакетов.
-
-E/G являются рабочими edit-based стеками, но E/G не являются буквальным запуском опубликованного checkpoint `RussianGEC_SeqTagger`, потому что готового checkpoint в исходном репозитории нет.
-
-## Порядок тестирования
-
-```text
-A → C → D → E → G → F
-```
-
-На одном и том же наборе реальных абзацев считайте precision, recall/F0.5, false positives, гиперкоррекцию, разрушение текста, число suggestions и latency.
+Those changes must never reach `DecisionEngine` from F.

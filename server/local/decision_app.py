@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -9,6 +10,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+# server/local and server/shared are sibling directories. Uvicorn is started
+# with WorkingDirectory=server/local, so add the common server root explicitly.
+SERVER_ROOT = Path(__file__).resolve().parents[1]
+if str(SERVER_ROOT) not in sys.path:
+    sys.path.insert(0, str(SERVER_ROOT))
+
 from decision_engine import DecisionEngine
 from pipelines import STACKS, StackRouter
 from shared.audit import AuditStore, Timer, count_changes
@@ -16,7 +23,6 @@ from shared.logging_setup import setup_logger
 
 load_dotenv()
 
-HERE = Path(__file__).resolve().parent
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 LLM_PRESET = os.getenv("LLM_PRESET", "A").strip().upper()
 if LLM_PRESET not in STACKS:
@@ -49,7 +55,6 @@ except Exception as exc:
     user_dict = None
 
 router = StackRouter(LLM_PRESET, morph_detector)
-
 app = FastAPI(title="AI LibreOffice Suggester", version="2.0")
 
 
@@ -178,35 +183,36 @@ async def suggest(
         return "ОШИБКА: Пустой текст"
 
     timer = Timer()
-    timer.__enter__()
+    candidates = []
+    accepted = []
     ok = True
     error = ""
     try:
-        candidates = await router.candidates(raw_text, raw_ctx)
-        engine = DecisionEngine(
-            min_confidence=MIN_CONFIDENCE,
-            max_changes=MAX_CHANGES,
-            max_before_chars=MAX_BEFORE_CHARS,
-            protected_words=dict_words(),
-        )
-        corrected, accepted = engine.apply(raw_text, candidates)
-        result = render_result(corrected, accepted)
-        logger.info(
-            "suggest stack=%s len=%d ctx=%d candidates=%d accepted=%d dur=%dms",
-            router.info.name,
-            len(raw_text),
-            len(raw_ctx),
-            len(candidates),
-            len(accepted),
-            timer.ms if hasattr(timer, "ms") else 0,
-        )
+        with timer:
+            candidates = await router.candidates(raw_text, raw_ctx)
+            engine = DecisionEngine(
+                min_confidence=MIN_CONFIDENCE,
+                max_changes=MAX_CHANGES,
+                max_before_chars=MAX_BEFORE_CHARS,
+                protected_words=dict_words(),
+            )
+            corrected, accepted = engine.apply(raw_text, candidates)
+            result = render_result(corrected, accepted)
     except Exception as exc:
         ok = False
         error = f"{type(exc).__name__}: {exc}"
         logger.exception("Suggestion failed")
         result = f"ОШИБКА_СЕРВЕРА: {error}"
-    finally:
-        timer.__exit__(None, None, None)
+
+    logger.info(
+        "suggest stack=%s len=%d ctx=%d candidates=%d accepted=%d dur=%dms",
+        router.info.name,
+        len(raw_text),
+        len(raw_ctx),
+        len(candidates),
+        len(accepted),
+        timer.ms,
+    )
 
     if audit is not None:
         audit.record(

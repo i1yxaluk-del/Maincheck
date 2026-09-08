@@ -6,10 +6,11 @@ After=network.target ollama.service
 Type=simple
 User=service
 WorkingDirectory=/home/service/llama/server/local
+Environment="PYTHONPATH=/home/service/llama/server"
+EnvironmentFile=-/home/service/llama/server/local/.env
 ExecStart=/home/service/llama/server/local/venv/bin/uvicorn decision_app:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=-/home/service/llama/server/local/.env
 
 [Install]
 WantedBy=multi-user.target

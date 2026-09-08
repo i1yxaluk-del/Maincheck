@@ -1,105 +1,90 @@
 # AI LibreOffice Suggester
 
-Расширение для LibreOffice Writer, которое добавляет в редактор одну кнопку
-AI-корректуры для официальной деловой переписки. Сотрудник выделяет фрагмент,
-нажимает кнопку, получает структурированный список правок и применяет их
-**как отслеживаемые изменения** (Track Changes): каждую правку можно принять
-или отклонить штатными средствами LibreOffice.
+Расширение LibreOffice Writer для осторожной коррекции официально-делового русского текста. Пользователь выделяет фрагмент, получает список локальных правок и применяет их через штатный механизм Track Changes.
 
-**Статус:** v1.5 — дефолтная модель T-lite-it-2.1 (в 2× быстрее qwen2.5:14b).
-**Платформы:** Windows 10/11 · Astra Linux (LibreOffice 7.0.4.2 – 7.6).
+## Архитектура v2
 
----
+Локальный production работает в **одном** systemd-сервисе и **одном** Uvicorn-процессе:
 
-## Структура проекта
-
-```
-Module_Libre/
-├── Клиент/                         ← отдаётся сотруднику по почте
-│   ├── AI_Suggester/               исходники расширения (xba-модули, xcu)
-│   └── AI_Suggester.oxt            готовый к установке архив
-│
-├── server/                         ← разворачивается админом
-│   ├── local/                      Ollama (t-tech/T-lite-it-2.1), без интернета
-│   ├── cloud/                      OpenRouter (бесплатные модели, нужен интернет)
-│   └── shared/                     общий код: логи, аудит, очистка, RAG, CLI
-│
-├── Инструкции/                     ← документация
-│   ├── ADMIN_GUIDE.md              админу: сервер + сборка + рассылка
-│   ├── USER_GUIDE.md               сотруднику: ставить и пользоваться
-│   ├── LOCAL_MODEL.md              выбор/установка/отключение локальной модели
-│   ├── RAG_GUIDE.md                обучение на ведомственных документах
-│   ├── LOGGING.md                  логи, аудит, retention, /metrics
-│   └── TROUBLESHOOTING.md          диагностика клиента, серверов, RAG
-│
-├── tests/                          pytest — 36 тестов (клиент + серверы + RAG)
-├── pytest.ini
-├── README.md                       этот файл
-└── .gitignore
+```text
+LibreOffice extension
+        ↓ HTTP
+server/local/decision_app.py
+        ↓
+       A — T-lite (production)
+       F — Spell-Corrector-RU-4B (experimental)
+       G — MorphDetector + T-lite verifier (experimental)
+        ↓
+   DecisionEngine
+        ↓
+  exact local edits
 ```
 
----
+### Поддерживаемые стеки
 
-## Две роли
+| Stack | Назначение | Режим |
+|---|---|---|
+| **A** | T-lite-it-2.1 + structured edit JSON + deterministic gates | production |
+| **G** | MorphDetector candidates + T-lite verifier | experimental |
+| **F** | Spell-Corrector-RU-4B + morphology-preserving surface gate | experimental |
 
-Расширение разработано по модели **«админ ↔ сотрудник»**:
+D/C/E из старых версий удалены из runtime: D не соответствует практическому latency/adapter safety на текущем сервере, C добавлял второй генерационный hop, E не был запуском готового официального checkpoint.
 
-| Роль          | Что делает                                                                                                     |
-|---------------|----------------------------------------------------------------------------------------------------------------|
-| **Админ**     | Поднимает сервер (`server/local` или `server/cloud`), правит один файл `Клиент/AI_Suggester/ai_macro/Settings.xba` с адресом, пересобирает `.oxt`, рассылает сотрудникам по почте. |
-| **Сотрудник** | Получает `AI_Suggester.oxt` по почте → ставит в LibreOffice → жмёт одну кнопку в панели инструментов. Больше ничего делать не надо. |
+## Главный принцип качества
 
-Подробности:
-- Сотруднику — [`Инструкции/USER_GUIDE.md`](Инструкции/USER_GUIDE.md) (одна страница).
-- Админу — [`Инструкции/ADMIN_GUIDE.md`](Инструкции/ADMIN_GUIDE.md) (сервер + сборка + рассылка).
+LLM не имеет права напрямую переписывать пользовательский текст в production. Стек A просит только точечные `before → after` правки в строгом JSON. `DecisionEngine` затем проверяет уверенность, точное вхождение исходного фрагмента, защищённые термины, пересечения правок и лимиты изменений.
 
----
+F — исключение только для эксперимента: модель возвращает полный текст, после чего сервер извлекает локальные diff-кандидаты и пропускает их через морфологический gate. Поэтому изменения типа `изучена → изучено`, `должностного → должностных`, `деятельностей → деятельности` блокируются.
 
-## Быстрый старт для админа
+## Структура
+
+```text
+server/local/
+├── decision_app.py          FastAPI + endpoints + one runtime process
+├── decision_engine.py       final safety merger
+├── pipelines.py             A/F/G stack implementations
+├── requirements.txt         common runtime
+├── requirements-experimental.txt  optional F runtime
+└── test_pipelines.py        regression tests
+
+server/shared/
+├── audit.py                 SQLite request audit
+├── morph_detector.py        deterministic Russian error detector
+├── user_dict.py             protected terminology dictionary
+└── logging_setup.py         service logging
+```
+
+`server/cloud/` остаётся отдельным интернет-зависимым вариантом и не участвует в локальном production path.
+
+## Быстрый запуск локального production
 
 ```bash
-# 1. Поставить Ollama и модель (~5 ГБ)
-curl -fsSL https://ollama.com/install.sh | sh
 ollama pull t-tech/T-lite-it-2.1:q4_K_M
-
-# 2. Поднять локальный сервер
 cd server/local
-cp .env.example .env
+cp .env.presets.example .env
 pip install -r requirements.txt
-./start.sh
-# → http://localhost:8000/health
-
-# 3. Подставить адрес сервера в Settings.xba и пересобрать .oxt
-#    (команда одной строкой — в Инструкции/ADMIN_GUIDE.md)
-
-# 4. Разослать Клиент/AI_Suggester.oxt сотрудникам вместе
-#    с Инструкции/USER_GUIDE.md
+sudo systemctl restart ai-suggester.service
+curl http://localhost:8000/health
 ```
 
----
-
-## Быстрый старт для сотрудника
-
-1. Сохранить полученный `AI_Suggester.oxt`.
-2. **Сервис → Управление расширениями → Добавить → выбрать .oxt → Перезапустить LibreOffice.**
-3. Выделить текст → нажать **«AI: Улучшить текст»** → принять/отклонить правки
-   через **Правка → Отслеживать изменения → Управление**.
-
-Всё.
-
----
-
-## Тесты
+Переключение только между `A`, `F`, `G`:
 
 ```bash
-pip install pytest fastapi 'uvicorn[standard]' httpx python-multipart python-dotenv python-docx
-pytest tests/
+./scripts/switch_llm_preset.sh A
+./scripts/switch_llm_preset.sh G
+./scripts/switch_llm_preset.sh F
 ```
 
-Покрывают: очистку документов Гарант/КонсультантПлюс, RAG-стор (add/list/remove/search), SQLite-аудит, логирование, смоук FastAPI (локальный и облачный) с моками Ollama/OpenRouter, валидацию XML модулей и пересборку `.oxt`.
+## Тестирование
 
----
+```bash
+pytest -q server/local/test_pipelines.py
+```
 
-## Лицензия
+CI компилирует локальный сервер и запускает regression suite для защитных правил.
 
-MIT.
+## Клиент
+
+Исходники LibreOffice-расширения находятся в `Клиент/AI_Suggester`. Адрес сервера и сборка `.oxt` описаны в `Инструкции/ADMIN_GUIDE.md`.
+
+Лицензия: MIT.

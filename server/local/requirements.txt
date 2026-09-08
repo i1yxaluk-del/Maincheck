@@ -4,27 +4,10 @@ httpx>=0.27.0
 python-multipart>=0.0.9
 python-dotenv>=1.0.0
 
-# All presets (A/C/D/E/F/G) use this same environment.
+# All three local stacks share this environment; F adds the optional HF runtime.
 -r requirements-experimental.txt
 
-# Для RAG-очистки документов (опционально, но рекомендуется)
-python-docx>=1.1.0
-pypdf>=4.2.0
-beautifulsoup4>=4.12.0
-
-# v1.7: морфологический фильтр галлюцинированных «улучшений» падежных
-# форм (см. server/shared/morph_filter.py). Без этих пакетов сервер
-# работает, но фильтр будет отключён — закрытый раньше в v1.6.10
-# bypass «Подразделения → Подразделению» снова возможен.
+# Deterministic Russian morphology/syntax components.
 pymorphy3>=2.0.0
 pymorphy3-dicts-ru>=2.4.0
-
-# v1.9: natasha dependency-parser для синтаксического анализа.
-# Заменяет ручные skip-rules v1.8.5 на универсальное правило «attributive
-# relation в UD-дереве» — закрывает классы FP «причастие+агенс», «предлог
-# +местоим+сущ» и т.д. Включается через NATASHA_ENABLED=true.
 natasha>=1.6.0
-
-# v1.8c: sage-95m post-валидатор остаётся optional runtime feature.
-# SAGE_VALIDATOR_ENABLED=true требует только что уже установленный
-# transformers/torch стек; по умолчанию валидатор выключен.
