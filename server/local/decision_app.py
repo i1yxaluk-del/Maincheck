@@ -10,8 +10,6 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-# server/local and server/shared are sibling directories. Uvicorn is started
-# with WorkingDirectory=server/local, so add the common server root explicitly.
 SERVER_ROOT = Path(__file__).resolve().parents[1]
 if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
@@ -55,7 +53,7 @@ except Exception as exc:
     user_dict = None
 
 router = StackRouter(LLM_PRESET, morph_detector)
-app = FastAPI(title="AI LibreOffice Suggester", version="2.0")
+app = FastAPI(title="AI LibreOffice Suggester", version="2.4")
 
 
 def normalize_line_breaks(text: str) -> str:
@@ -90,11 +88,12 @@ def dict_words() -> set[str]:
 @app.on_event("startup")
 async def startup() -> None:
     logger.info(
-        "Stack=%s (%s), model=%s, experimental=%s",
+        "Stack=%s (%s), model=%s, experimental=%s, retrieval=%s",
         router.info.name,
         router.info.description,
         router.info.model,
         router.info.experimental,
+        router.retriever.available,
     )
     if WARMUP:
         started = time.perf_counter()
@@ -118,20 +117,20 @@ async def health() -> str:
 
 @app.get("/metrics")
 async def metrics(hours: int = 24):
-    return JSONResponse(
-        {
-            "server": "local",
-            "version": "2.0",
-            "stack": router.info.name,
-            "description": router.info.description,
-            "model": router.info.model,
-            "experimental": router.info.experimental,
-            "morph_detector_available": bool(morph_detector and getattr(morph_detector, "available", False)),
-            "user_dict_enabled": user_dict is not None,
-            "user_dict_size": len(dict_words()),
-            "audit": audit.stats(hours=hours) if audit is not None else {"enabled": False},
-        }
-    )
+    data = router.metrics()
+    return JSONResponse({
+        "server": "local",
+        "version": "2.4",
+        "stack": router.info.name,
+        "description": router.info.description,
+        "model": router.info.model,
+        "experimental": router.info.experimental,
+        "morph_detector_available": bool(morph_detector and getattr(morph_detector, "available", False)),
+        "user_dict_enabled": user_dict is not None,
+        "user_dict_size": len(dict_words()),
+        "audit": audit.stats(hours=hours) if audit is not None else {"enabled": False},
+        **data,
+    })
 
 
 @app.get("/dict/list")
@@ -172,24 +171,18 @@ async def dict_remove(request: Request):
 
 
 @app.post("/suggest", response_class=PlainTextResponse)
-async def suggest(
-    request: Request,
-    text: UploadFile = File(...),
-    context: UploadFile = File(...),
-):
+async def suggest(request: Request, text: UploadFile = File(...), context: UploadFile = File(...)):
     raw_text = normalize_line_breaks((await text.read()).decode("utf-8", errors="replace").strip())
     raw_ctx = normalize_line_breaks((await context.read()).decode("utf-8", errors="replace").strip())
     if not raw_text:
         return "ОШИБКА: Пустой текст"
 
     timer = Timer()
-    candidates = []
-    accepted = []
-    ok = True
-    error = ""
+    candidates, accepted = [], []
+    ok, error = True, ""
     try:
         with timer:
-            candidates = await router.candidates(raw_text, raw_ctx)
+            candidates = await router.candidates(raw_text, raw_ctx, dict_words())
             engine = DecisionEngine(
                 min_confidence=MIN_CONFIDENCE,
                 max_changes=MAX_CHANGES,
@@ -206,25 +199,14 @@ async def suggest(
 
     logger.info(
         "suggest stack=%s len=%d ctx=%d candidates=%d accepted=%d dur=%dms",
-        router.info.name,
-        len(raw_text),
-        len(raw_ctx),
-        len(candidates),
-        len(accepted),
-        timer.ms,
+        router.info.name, len(raw_text), len(raw_ctx), len(candidates), len(accepted), timer.ms,
     )
 
     if audit is not None:
         audit.record(
             client_ip=request.client.host if request.client else "",
             user_agent=request.headers.get("user-agent", ""),
-            server="local",
-            model=router.info.model,
-            text=raw_text,
-            context=raw_ctx,
-            changes_count=count_changes(result),
-            duration_ms=timer.ms,
-            ok=ok,
-            error=error,
+            server="local", model=router.info.model, text=raw_text, context=raw_ctx,
+            changes_count=count_changes(result), duration_ms=timer.ms, ok=ok, error=error,
         )
     return result
