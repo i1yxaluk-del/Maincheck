@@ -8,6 +8,11 @@ TEXT = (
     "тактико-специальным занятием с элементами командно-штабной тренировки по одна и той же теме);"
 )
 
+SHOOTING_TEXT = (
+    "неправильно определяется оценка за стрельбу при выполнении сотрудником несколького "
+    "упражнений стрельб, из одного или нескольких вида оружия (вооружения)"
+)
+
 
 def test_local_rules_find_all_regression_targets():
     rules = LocalRuleEngine()
@@ -27,6 +32,21 @@ def test_local_rules_apply_without_llm():
     assert "по одной и той же теме" in corrected
     assert "требует корректировки" in corrected
     assert len(accepted) >= 4
+
+
+def test_quantifier_rules_find_shooting_errors():
+    pairs = {(c.before, c.after) for c in LocalRuleEngine().candidates(SHOOTING_TEXT)}
+    assert ("несколького упражнений", "нескольких упражнений") in pairs
+    assert ("вида", "видов") in pairs
+
+
+def test_quantifier_rules_apply_without_llm():
+    corrected, accepted = DecisionEngine(min_confidence=0.55, max_changes=8).apply(
+        SHOOTING_TEXT, LocalRuleEngine().candidates(SHOOTING_TEXT)
+    )
+    assert "нескольких упражнений" in corrected
+    assert "одного или нескольких видов оружия" in corrected
+    assert len(accepted) >= 2
 
 
 def test_local_rules_do_not_rewrite_hyphenated_modifier():
