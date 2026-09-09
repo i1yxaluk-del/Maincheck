@@ -13,7 +13,8 @@ REGRESSION = (
 
 def test_new_preset_contract():
     assert set(STACKS) == {"A", "B", "X", "Y"}
-    assert STACKS["C"].model == "" if "C" in STACKS else True
+    assert STACKS["A"].model == "t-tech/T-lite-it-2.1:q4_K_M"
+    assert STACKS["B"].model == "hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:latest"
 
 
 def test_safe_diff_rejects_paragraph_rewrite():
