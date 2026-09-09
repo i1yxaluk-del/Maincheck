@@ -55,7 +55,7 @@ def dict_words() -> set[str]:
 
 
 router = HybridRouter(LLM_PRESET, dict_words())
-app = FastAPI(title="AI LibreOffice Suggester", version="3.1")
+app = FastAPI(title="AI LibreOffice Suggester", version="4.0")
 
 
 def normalize_line_breaks(text: str) -> str:
@@ -81,12 +81,13 @@ def render_result(corrected: str, accepted) -> str:
 @app.on_event("startup")
 async def startup() -> None:
     logger.info(
-        "Stack=%s (%s), generator=%s, experimental=%s, LanguageTool=%s, rule_engine=%s",
+        "Stack=%s (%s), generator=%s, experimental=%s, SAGE=%s, SAGE_model=%s, rule_engine=%s",
         router.info.name,
         router.info.description,
         router.info.model,
         router.info.experimental,
-        router.lt.enabled,
+        router.sage.available,
+        router.sage.model_id,
         router.rules.available,
     )
     if WARMUP:
@@ -115,55 +116,18 @@ async def health() -> str:
 async def metrics(hours: int = 24):
     return JSONResponse({
         "server": "local",
-        "version": "3.1",
+        "version": "4.0",
         "stack": router.info.name,
         "description": router.info.description,
         "model": router.info.model,
         "experimental": router.info.experimental,
         "rule_engine_available": router.rules.available,
-        "languagetool_verifier": router.lt.enabled,
+        "sage_corrector": router.sage.metrics().__dict__,
         "user_dict_enabled": user_dict is not None,
         "user_dict_size": len(dict_words()),
         "audit": audit.stats(hours=hours) if audit is not None else {"enabled": False},
         **router.metrics(),
     })
-
-
-@app.get("/dict/list")
-async def dict_list():
-    if user_dict is None:
-        return JSONResponse({"error": "пользовательский словарь отключён"}, status_code=503)
-    return JSONResponse({"words": sorted(dict_words(), key=str.casefold)})
-
-
-@app.post("/dict/add")
-async def dict_add(request: Request):
-    if user_dict is None:
-        return JSONResponse({"error": "пользовательский словарь отключён"}, status_code=503)
-    body = await request.json()
-    word = body.get("word") if isinstance(body, dict) else None
-    if not isinstance(word, str) or not word.strip():
-        return JSONResponse({"error": "ожидается JSON-поле 'word'"}, status_code=400)
-    try:
-        added = user_dict.add(word)
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-    return JSONResponse({"added": added, "total": len(dict_words())})
-
-
-@app.post("/dict/remove")
-async def dict_remove(request: Request):
-    if user_dict is None:
-        return JSONResponse({"error": "пользовательский словарь отключён"}, status_code=503)
-    body = await request.json()
-    word = body.get("word") if isinstance(body, dict) else None
-    if not isinstance(word, str) or not word.strip():
-        return JSONResponse({"error": "ожидается JSON-поле 'word'"}, status_code=400)
-    try:
-        removed = user_dict.remove(word)
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-    return JSONResponse({"removed": removed, "total": len(dict_words())})
 
 
 @app.post("/suggest", response_class=PlainTextResponse)
@@ -194,8 +158,8 @@ async def suggest(request: Request, text: UploadFile = File(...), context: Uploa
         result = f"ОШИБКА_СЕРВЕРА: {error}"
 
     logger.info(
-        "suggest v3.1 stack=%s len=%d ctx=%d candidates=%d accepted=%d dur=%dms",
-        router.info.name, len(raw_text), len(raw_ctx), len(candidates), len(accepted), timer.ms,
+        "suggest v4 stack=%s len=%d ctx=%d candidates=%d accepted=%d stages=%s dur=%dms",
+        router.info.name, len(raw_text), len(raw_ctx), len(candidates), len(accepted), router.metrics().get("stage_calls"), timer.ms,
     )
 
     if audit is not None:
