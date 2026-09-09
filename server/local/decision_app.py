@@ -55,7 +55,7 @@ def dict_words() -> set[str]:
 
 
 router = HybridRouter(LLM_PRESET, dict_words())
-app = FastAPI(title="AI LibreOffice Suggester", version="3.1")
+app = FastAPI(title="AI LibreOffice Suggester", version="5.0")
 
 
 def normalize_line_breaks(text: str) -> str:
@@ -81,12 +81,14 @@ def render_result(corrected: str, accepted) -> str:
 @app.on_event("startup")
 async def startup() -> None:
     logger.info(
-        "Stack=%s (%s), generator=%s, experimental=%s, LanguageTool=%s, rule_engine=%s",
+        "Stack=%s (%s), generator=%s, experimental=%s, SAGE=%s, GEC=%s, retrieval=%s, rule_engine=%s",
         router.info.name,
         router.info.description,
         router.info.model,
         router.info.experimental,
-        router.lt.enabled,
+        router.sage.model_id if router.sage.available else "disabled",
+        router.gec.adapter_subfolder if router.gec.available else "disabled",
+        router.retriever.count if router.retriever.available else 0,
         router.rules.available,
     )
     if WARMUP:
@@ -115,13 +117,15 @@ async def health() -> str:
 async def metrics(hours: int = 24):
     return JSONResponse({
         "server": "local",
-        "version": "3.1",
+        "version": "5.0",
         "stack": router.info.name,
         "description": router.info.description,
         "model": router.info.model,
         "experimental": router.info.experimental,
         "rule_engine_available": router.rules.available,
-        "languagetool_verifier": router.lt.enabled,
+        "retrieval_count": router.retriever.count,
+        "russian_gec": router.gec.metrics().__dict__,
+        "sage": router.sage.metrics().__dict__,
         "user_dict_enabled": user_dict is not None,
         "user_dict_size": len(dict_words()),
         "audit": audit.stats(hours=hours) if audit is not None else {"enabled": False},
@@ -194,8 +198,15 @@ async def suggest(request: Request, text: UploadFile = File(...), context: Uploa
         result = f"ОШИБКА_СЕРВЕРА: {error}"
 
     logger.info(
-        "suggest v3.1 stack=%s len=%d ctx=%d candidates=%d accepted=%d dur=%dms",
-        router.info.name, len(raw_text), len(raw_ctx), len(candidates), len(accepted), timer.ms,
+        "suggest v5 stack=%s len=%d ctx=%d candidates=%d accepted=%d stages=%s stage_ms=%s dur=%dms",
+        router.info.name,
+        len(raw_text),
+        len(raw_ctx),
+        len(candidates),
+        len(accepted),
+        router.metrics().get("stage_calls"),
+        router.metrics().get("stage_ms"),
+        timer.ms,
     )
 
     if audit is not None:
