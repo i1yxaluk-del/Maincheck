@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import httpx
 
 
-DEFAULT_MODEL = "qwen3.5-gec"
+DEFAULT_MODEL = "hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0"
 SYSTEM_PROMPT = (
     "Отформатируй текст голосового ввода: расставь пунктуацию и заглавные буквы, "
     "разбей на абзацы, исправь опечатки и орфографические ошибки. Сохрани язык, "
