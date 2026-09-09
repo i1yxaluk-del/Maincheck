@@ -19,9 +19,11 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install lightweight test deps
-        run: python -m pip install --upgrade pip pytest httpx pymorphy3 pymorphy3-dicts-ru
+        run: python -m pip install --upgrade pip pytest httpx pymorphy3 pymorphy3-dicts-ru transformers torch sentencepiece
       - name: Compile application
-        run: python -m py_compile decision_app.py decision_engine.py hybrid_editor.py qwen35_backend.py safe_diff.py syntax_candidates.py local_rules.py
+        run: python -m py_compile decision_app.py decision_engine.py hybrid_editor.py qwen35_backend.py russian_quality_models.py safe_diff.py syntax_candidates.py local_rules.py
+      - name: Run v4 cascade regressions
+        run: pytest -q test_v4_cascade.py
       - name: Run v3.1 deterministic regressions
         run: pytest -q test_v31.py
       - name: Run v3 hybrid regressions
