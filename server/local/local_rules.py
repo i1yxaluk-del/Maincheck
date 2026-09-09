@@ -11,6 +11,9 @@ WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+(?:[-/][А-Яа-яЁёA-Za-z]+)*")
 YEAR_RE = re.compile(r"\b(\d{4})\s+([А-Яа-яЁё-]+)\s+(год(?:а|у|ом|е|ов|ы)?|лет)\b")
 PO_ONE_RE = re.compile(r"\bпо\s+одна\b", re.IGNORECASE)
 REQUIRES_COMMA_RE = re.compile(r"\bтребует,\s+(?P<word>[А-Яа-яЁё]+)")
+SEVERAL_BAD_RE = re.compile(r"\bнесколького\s+(?P<noun>[А-Яа-яЁё-]+)")
+SEVERAL_GEN_RE = re.compile(r"\bнескольких\s+(?P<noun>[А-Яа-яЁё-]+)")
+ONE_OR_SEVERAL_RE = re.compile(r"\bодного\s+или\s+нескольких\s+(?P<noun>[А-Яа-яЁё-]+)")
 
 
 class LocalRuleEngine:
@@ -46,6 +49,65 @@ class LocalRuleEngine:
             return []
         return [p for p in self.morph.parse(word) if p.is_known and self._is_adj(p)]
 
+    def _genitive_plural(self, word: str) -> str | None:
+        """Return a well-supported genitive plural form for a Russian noun."""
+        for parse in self._noun_parses(word)[:5]:
+            form = parse.inflect({"gent", "plur"})
+            if form and form.word:
+                return form.word
+        return None
+
+    def _quantifier_government(self, text: str) -> list[EditCandidate]:
+        """Correct high-confidence quantity phrases to genitive plural.
+
+        Targeted constructions are common in official Russian and are safer to
+        handle deterministically than to ask a small generative model to infer
+        the case from the whole sentence.
+        """
+        if not self.morph:
+            return []
+        out: list[EditCandidate] = []
+
+        for match in SEVERAL_BAD_RE.finditer(text):
+            noun = match.group("noun")
+            form = self._genitive_plural(noun)
+            if not form:
+                continue
+            before = match.group(0)
+            after = f"нескольких {form}"
+            if before != after:
+                out.append(EditCandidate(
+                    before, after, 0.998, "rule-quantifier",
+                    "«несколько» с существительным в родительном множественного числе",
+                ))
+
+        for match in ONE_OR_SEVERAL_RE.finditer(text):
+            noun = match.group("noun")
+            form = self._genitive_plural(noun)
+            if not form or form == noun:
+                # Still safe when the noun is already in the required form.
+                form = noun
+            before = match.group(0)
+            after = f"одного или нескольких {form}"
+            if before != after:
+                out.append(EditCandidate(
+                    before, after, 0.998, "rule-quantifier",
+                    "конструкция «одного или нескольких» требует родительного множественного числа",
+                ))
+
+        # Also catch the shorter form when the noun itself is already preceded
+        # by «нескольких», e.g. «нескольких вида» -> «нескольких видов».
+        for match in SEVERAL_GEN_RE.finditer(text):
+            noun = match.group("noun")
+            form = self._genitive_plural(noun)
+            if not form or form == noun:
+                continue
+            out.append(EditCandidate(
+                noun, form, 0.997, "rule-quantifier",
+                "существительное после «нескольких» в родительном множественного числе",
+            ))
+        return out
+
     def _year_phrase(self, text: str) -> list[EditCandidate]:
         if not self.morph:
             return []
@@ -64,7 +126,6 @@ class LocalRuleEngine:
             year_noun = next((p for p in nouns if p.normal_form == "год"), None)
             if year_noun is None:
                 continue
-            # Normative construction: "2026 учебный год".
             target = {"nomn", "sing", "masc"}
             fixed_adj = None
             for p in adj[:5]:
@@ -164,7 +225,13 @@ class LocalRuleEngine:
     def candidates(self, text: str) -> list[EditCandidate]:
         out: list[EditCandidate] = []
         seen: set[tuple[str, str, str]] = set()
-        for group in (self._year_phrase(text), self._modifier_noun(text), self._po_one(text), self._requires_comma(text)):
+        for group in (
+            self._quantifier_government(text),
+            self._year_phrase(text),
+            self._modifier_noun(text),
+            self._po_one(text),
+            self._requires_comma(text),
+        ):
             for c in group:
                 key = (c.before, c.after, c.category)
                 if key not in seen:
