@@ -35,11 +35,11 @@ def test_specialist_prompt_is_grammar_focused_and_structure_preserving():
     assert specialist.num_predict == 256
 
 
-def test_bounded_diff_extracts_the_two_known_grammar_edits_without_rewrite():
+def test_bounded_diff_extracts_the_two_known_local_changes():
     candidates = diff_candidates(TEXT, EXPECTED, "russian-gec", 0.96)
     pairs = {(c.before, c.after) for c in candidates}
-    assert any("несколького" in before and "нескольких" in after for before, after in pairs)
-    assert any("вида" in before and "видов" in after for before, after in pairs)
+    assert ("ого", "их") in pairs
+    assert ("а", "ов") in pairs
 
 
 def test_local_rules_generate_both_target_fixes():
