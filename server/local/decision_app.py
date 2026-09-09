@@ -31,6 +31,7 @@ MAX_CHANGES = int(os.getenv("DECISION_MAX_CHANGES", "12"))
 MAX_BEFORE_CHARS = int(os.getenv("DECISION_MAX_BEFORE_CHARS", "120"))
 USER_DICT_ENABLED = os.getenv("USER_DICT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 WARMUP = os.getenv("OLLAMA_WARMUP", "true").lower() in {"1", "true", "yes", "on"}
+WARMUP_REQUIRED = os.getenv("OLLAMA_WARMUP_REQUIRED", "true").lower() in {"1", "true", "yes", "on"}
 AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
 logger = setup_logger("ai_suggester.local")
@@ -102,6 +103,8 @@ async def startup() -> None:
             logger.info("Warmup OK in %d ms", int((time.perf_counter() - started) * 1000))
         except Exception as exc:
             logger.warning("Warmup failed: %s", exc)
+            if WARMUP_REQUIRED:
+                raise RuntimeError(f"Ollama warmup failed for model {router.info.model}: {exc}") from exc
 
 
 @app.get("/health", response_class=PlainTextResponse)
