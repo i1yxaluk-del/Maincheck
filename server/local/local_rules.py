@@ -71,26 +71,29 @@ class LocalRuleEngine:
         for match in SEVERAL_BAD_RE.finditer(text):
             noun = match.group("noun")
             form = self._genitive_plural(noun)
-            if not form or form == noun:
+            if not form:
                 continue
             before = match.group(0)
             after = f"нескольких {form}"
-            out.append(EditCandidate(
-                before, after, 0.998, "rule-quantifier",
-                "«несколько» с существительным в родительном множественного числе",
-            ))
+            if before != after:
+                out.append(EditCandidate(
+                    before, after, 0.998, "rule-quantifier",
+                    "«несколько» с существительным в родительном множественного числе",
+                ))
 
         for match in ONE_OR_SEVERAL_RE.finditer(text):
             noun = match.group("noun")
             form = self._genitive_plural(noun)
             if not form or form == noun:
-                continue
+                # Still safe when the noun is already in the required form.
+                form = noun
             before = match.group(0)
             after = f"одного или нескольких {form}"
-            out.append(EditCandidate(
-                before, after, 0.998, "rule-quantifier",
-                "конструкция «одного или нескольких» требует родительного множественного числа",
-            ))
+            if before != after:
+                out.append(EditCandidate(
+                    before, after, 0.998, "rule-quantifier",
+                    "конструкция «одного или нескольких» требует родительного множественного числа",
+                ))
 
         # Also catch the shorter form when the noun itself is already preceded
         # by «нескольких», e.g. «нескольких вида» -> «нескольких видов».
