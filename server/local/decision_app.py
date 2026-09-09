@@ -55,7 +55,7 @@ def dict_words() -> set[str]:
 
 
 router = HybridRouter(LLM_PRESET, dict_words())
-app = FastAPI(title="AI LibreOffice Suggester", version="3.0")
+app = FastAPI(title="AI LibreOffice Suggester", version="3.1")
 
 
 def normalize_line_breaks(text: str) -> str:
@@ -81,13 +81,13 @@ def render_result(corrected: str, accepted) -> str:
 @app.on_event("startup")
 async def startup() -> None:
     logger.info(
-        "Stack=%s (%s), generator=%s, experimental=%s, LanguageTool=%s, local=%s",
+        "Stack=%s (%s), generator=%s, experimental=%s, LanguageTool=%s, rule_engine=%s",
         router.info.name,
         router.info.description,
         router.info.model,
         router.info.experimental,
         router.lt.enabled,
-        router.local.available,
+        router.rules.available,
     )
     if WARMUP:
         started = time.perf_counter()
@@ -115,12 +115,12 @@ async def health() -> str:
 async def metrics(hours: int = 24):
     return JSONResponse({
         "server": "local",
-        "version": "3.0",
+        "version": "3.1",
         "stack": router.info.name,
         "description": router.info.description,
         "model": router.info.model,
         "experimental": router.info.experimental,
-        "local_detector_available": router.local.available,
+        "rule_engine_available": router.rules.available,
         "languagetool_verifier": router.lt.enabled,
         "user_dict_enabled": user_dict is not None,
         "user_dict_size": len(dict_words()),
@@ -194,7 +194,7 @@ async def suggest(request: Request, text: UploadFile = File(...), context: Uploa
         result = f"ОШИБКА_СЕРВЕРА: {error}"
 
     logger.info(
-        "suggest v3 stack=%s len=%d ctx=%d candidates=%d accepted=%d dur=%dms",
+        "suggest v3.1 stack=%s len=%d ctx=%d candidates=%d accepted=%d dur=%dms",
         router.info.name, len(raw_text), len(raw_ctx), len(candidates), len(accepted), timer.ms,
     )
 
