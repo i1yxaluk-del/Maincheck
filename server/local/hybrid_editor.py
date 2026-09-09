@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -140,6 +139,7 @@ class HybridRouter:
         self._calls = 0
         self._stage_calls = {"rules": 0, "sage": 0, "gec": 0, "draft_tlite": 0, "draft_giga": 0}
         self._stage_ms = {key: 0 for key in self._stage_calls}
+        self._degraded = []
 
     def _draft_models(self) -> list[tuple[str, str]]:
         if self.preset == "X":
@@ -201,6 +201,7 @@ class HybridRouter:
         for (stage, _), result in zip(jobs, results):
             if isinstance(result, Exception):
                 logger.warning("%s candidate generator failed: %s", stage, result)
+                self._degraded.append(f"{stage}: {type(result).__name__}: {result}")
                 continue
             draft = str(result or "").strip()
             if not draft or draft == text.strip():
@@ -216,15 +217,29 @@ class HybridRouter:
         return self._rank_candidates(candidates)
 
     async def warmup(self) -> None:
-        tasks = []
+        tasks: list[tuple[str, Any]] = []
         if self.sage.available:
-            tasks.append(self.sage.warmup())
+            tasks.append(("sage", self.sage.warmup()))
         if self.gec.available:
-            tasks.append(self.gec.warmup())
-        for _, model in self._draft_models()[:1]:
-            tasks.append(OllamaDraftClient(model, self.retriever).draft("Проверка запуска.", "", 0.0))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=False)
+            tasks.append(("gec", self.gec.warmup()))
+        for stage, model in self._draft_models()[:1]:
+            tasks.append((stage, OllamaDraftClient(model, self.retriever).draft("Проверка запуска.", "", 0.0)))
+
+        if not tasks:
+            return
+        results = await asyncio.gather(*(task[1] for task in tasks), return_exceptions=True)
+        for (stage, _), result in zip(tasks, results):
+            if isinstance(result, Exception):
+                message = f"{stage}: {type(result).__name__}: {result}"
+                self._degraded.append(message)
+                logger.warning("Warmup degraded: %s", message)
+
+    def ollama_required(self) -> bool:
+        return bool(self._draft_models())
+
+    @property
+    def degraded(self) -> list[str]:
+        return list(dict.fromkeys(self._degraded))
 
     def metrics(self) -> dict[str, Any]:
         return {
@@ -237,4 +252,6 @@ class HybridRouter:
             "russian_gec": self.gec.metrics().__dict__,
             "stage_calls": dict(self._stage_calls),
             "stage_ms": dict(self._stage_ms),
+            "ollama_required": self.ollama_required(),
+            "degraded": self.degraded,
         }
