@@ -42,14 +42,12 @@ JUDGE_SYSTEM = """Ты — независимый редактор-контро�
 Верни только JSON: {\"accept\":[true,false,...]}
 """
 
-
 @dataclass(frozen=True)
 class StackInfo:
     name: str
     description: str
     model: str
     experimental: bool
-
 
 STACKS = {
     "A": StackInfo("A", "production: T-lite draft + GigaChat judge + local/syntax guards", TLITE, False),
@@ -58,10 +56,7 @@ STACKS = {
     "Y": StackInfo("Y", "experimental: Qwen3.5 self-consistency + LanguageTool/syntax adjudication", QWEN35, True),
 }
 
-
 class RetrievalExamples:
-    """Local hybrid retrieval from the existing Russian GEC banks."""
-
     def __init__(self) -> None:
         self.bank = None
         self.available = False
@@ -71,16 +66,13 @@ class RetrievalExamples:
             from shared.rag_store import HashingEmbedder
             root = Path(__file__).resolve().parents[1] / "shared" / "gec_seed"
             configured = os.getenv("GEC_BANK_FILES", "").strip()
-            paths = [Path(p.strip()) for p in configured.split(",") if p.strip()] if configured else [
-                root / "gec_bank_extended.jsonl", root / "lexify_admin.jsonl"
-            ]
+            paths = [Path(p.strip()) for p in configured.split(",") if p.strip()] if configured else [root / "gec_bank_extended.jsonl", root / "lexify_admin.jsonl"]
             existing = [p for p in paths if p.exists()]
             if not existing:
                 return
             self.bank = GecBank(HashingEmbedder(512), bm25_tokenizer="both")
             self.bank.load_jsonl(*existing)
-            cache = Path(os.getenv("GEC_BANK_CACHE", "data/gec_bank_hashing.pkl"))
-            self.bank.build_index(cache)
+            self.bank.build_index(Path(os.getenv("GEC_BANK_CACHE", "data/gec_bank_hashing.pkl")))
             self.count = len(self.bank)
             self.available = self.count > 0
             logger.info("Hybrid retrieval: %d pairs ready", self.count)
@@ -92,19 +84,14 @@ class RetrievalExamples:
             return ""
         try:
             pairs = [pair for _, pair in self.bank.search_hybrid(text, top_k=top_k)]
-            if not pairs:
-                return ""
-            lines = ["ПОХОЖИЕ ПРИМЕРЫ КОРРЕКЦИИ (используй только как ориентир):"]
+            lines = ["ПОХОЖИЕ ПРИМЕРЫ КОРРЕКЦИИ (только как ориентир; не копируй структуру вслепую):"]
             for i, pair in enumerate(pairs, 1):
-                wrong = getattr(pair, "wrong", None) or pair.get("wrong", "")
-                right = getattr(pair, "right", None) or pair.get("right", "")
-                if wrong and right:
-                    lines.append(f"{i}. {wrong} → {right}")
-            return "\n".join(lines)
+                if getattr(pair, "wrong", None) and getattr(pair, "right", None):
+                    lines.append(f"{i}. {pair.wrong} → {pair.right}")
+            return "\n".join(lines) if len(lines) > 1 else ""
         except Exception as exc:
             logger.warning("Hybrid retrieval search failed: %s", exc)
             return ""
-
 
 class OllamaJSON:
     def __init__(self, model: str, retriever: RetrievalExamples | None = None) -> None:
@@ -118,12 +105,8 @@ class OllamaJSON:
         self.retriever = retriever
 
     async def call(self, messages: list[dict[str, str]], schema: dict[str, Any], *, temperature: float = 0.0, think: bool = False) -> dict[str, Any]:
-        payload = {
-            "model": self.model, "messages": messages, "stream": False, "format": schema,
-            "think": think, "keep_alive": self.keep_alive,
-            "options": {"temperature": temperature, "num_ctx": self.ctx, "num_predict": self.predict,
-                         "num_thread": self.threads, "repeat_penalty": 1.02},
-        }
+        payload = {"model": self.model, "messages": messages, "stream": False, "format": schema, "think": think, "keep_alive": self.keep_alive,
+                   "options": {"temperature": temperature, "num_ctx": self.ctx, "num_predict": self.predict, "num_thread": self.threads, "repeat_penalty": 1.02}}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             r = await client.post(f"{self.url}/api/chat", json=payload)
             r.raise_for_status()
@@ -137,23 +120,18 @@ class OllamaJSON:
     async def draft(self, text: str, context: str, temperature: float = 0.0, think: bool = False) -> str:
         retrieval = self.retriever.prompt(text) if self.retriever else ""
         user = f"КОНТЕКСТ:\n{context[-3000:]}\n\n{retrieval}\n\nТЕКСТ:\n{text}".strip()
-        data = await self.call(
-            [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
-            {"type": "object", "properties": {"corrected": {"type": "string"}}, "required": ["corrected"], "additionalProperties": False},
-            temperature=temperature, think=think,
-        )
+        data = await self.call([{ "role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
+                               {"type": "object", "properties": {"corrected": {"type": "string"}}, "required": ["corrected"], "additionalProperties": False},
+                               temperature=temperature, think=think)
         corrected = data.get("corrected") if isinstance(data, dict) else None
         return corrected if isinstance(corrected, str) else text
 
     async def judge(self, text: str, candidates: list[EditCandidate]) -> list[bool]:
         payload = [{"id": i, "before": c.before, "after": c.after, "category": c.category} for i, c in enumerate(candidates)]
-        data = await self.call(
-            [{"role": "system", "content": JUDGE_SYSTEM}, {"role": "user", "content": json.dumps({"text": text, "candidates": payload}, ensure_ascii=False)}],
-            {"type": "object", "properties": {"accept": {"type": "array", "items": {"type": "boolean"}, "maxItems": 16}}, "required": ["accept"], "additionalProperties": False},
-        )
+        data = await self.call([{ "role": "system", "content": JUDGE_SYSTEM}, {"role": "user", "content": json.dumps({"text": text, "candidates": payload}, ensure_ascii=False)}],
+                               {"type": "object", "properties": {"accept": {"type": "array", "items": {"type": "boolean"}, "maxItems": 16}}, "required": ["accept"], "additionalProperties": False})
         flags = data.get("accept") if isinstance(data, dict) else None
         return flags if isinstance(flags, list) else []
-
 
 class LocalContextEngine:
     def __init__(self) -> None:
@@ -163,51 +141,38 @@ class LocalContextEngine:
             self.morph = pymorphy3.MorphAnalyzer()
         except Exception as exc:
             logger.warning("LocalContextEngine: pymorphy3 unavailable: %s", exc)
-
     @property
     def available(self) -> bool:
         return self.morph is not None
-
     def candidates(self, text: str) -> list[EditCandidate]:
         return []
 
-
 class LanguageToolVerifier:
-    """LanguageTool is a verifier only, never the primary candidate generator."""
-
     def __init__(self) -> None:
         self.url = os.getenv("LANGUAGETOOL_URL", "").strip().rstrip("/")
         self.language = os.getenv("LANGUAGETOOL_LANGUAGE", "ru-RU")
-
     @property
     def enabled(self) -> bool:
         return bool(self.url)
-
     async def _matches(self, text: str) -> list[dict[str, Any]]:
         if not self.url:
             return []
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 r = await client.post(f"{self.url}/v2/check", data={"language": self.language, "text": text})
-                r.raise_for_status()
-                data = r.json()
+                r.raise_for_status(); data = r.json()
                 return data.get("matches", []) if isinstance(data, dict) else []
         except Exception as exc:
             logger.warning("LanguageTool verifier unavailable: %s", exc)
             return []
-
     async def supports(self, source: str, corrected: str) -> bool:
         if not self.enabled:
             return True
-        before = await self._matches(source)
-        after = await self._matches(corrected)
-        return len(after) <= len(before)
-
+        return len(await self._matches(corrected)) <= len(await self._matches(source))
 
 def diff_candidates(source: str, corrected: str, category: str, confidence: float = 0.70) -> list[EditCandidate]:
     from safe_diff import diff_candidates as bounded_diff
     return bounded_diff(source, corrected, category, confidence)
-
 
 class HybridRouter:
     def __init__(self, preset: str, protected_words: set[str] | None = None) -> None:
@@ -220,72 +185,48 @@ class HybridRouter:
         self.lt = LanguageToolVerifier()
         self.protected_words = protected_words or set()
         self._calls = 0
-
     def _model_pair(self) -> tuple[str, str]:
-        if self.preset == "A":
-            return TLITE, GIGACHAT
-        if self.preset == "B":
-            return GIGACHAT, TLITE
+        if self.preset == "A": return TLITE, GIGACHAT
+        if self.preset == "B": return GIGACHAT, TLITE
         return QWEN35, GIGACHAT if self.preset == "X" else TLITE
-
     async def _ollama_drafts(self, model: str, text: str, context: str, count: int) -> list[str]:
         client = OllamaJSON(model, self.retriever)
         return [await client.draft(text, context, temperature=t) for t in ([0.0, 0.25][:count])]
-
     async def _qwen_drafts(self, text: str, context: str, count: int) -> list[str]:
         from qwen35_backend import Qwen35Backend
         backend = Qwen35Backend()
         return [await backend.correct(text, context, temperature=t) for t in ([0.7, 0.9][:count])]
-
     async def candidates(self, text: str, context: str = "") -> list[EditCandidate]:
         from syntax_candidates import candidates as syntax_candidates
-
         local = self.local.candidates(text) + syntax_candidates(text)
-        generator, judge = self._model_pair()
-        self._calls += 1
-        if self.preset in {"X", "Y"}:
-            drafts = await self._qwen_drafts(text, context, 2 if self.preset == "Y" else 1)
-        else:
-            drafts = await self._ollama_drafts(generator, text, context, 1)
-
+        generator, judge = self._model_pair(); self._calls += 1
+        drafts = await self._qwen_drafts(text, context, 2 if self.preset == "Y" else 1) if self.preset in {"X", "Y"} else await self._ollama_drafts(generator, text, context, 1)
         generated: list[EditCandidate] = []
         for draft in drafts:
             generated.extend(diff_candidates(text, draft, "model-draft", 0.72 if len(drafts) == 1 else 0.74))
         if self.preset == "Y" and len(drafts) == 2 and drafts[0] == drafts[1]:
             generated.extend(diff_candidates(text, drafts[0], "self-consistent", 0.82))
-
         uniq: dict[tuple[str, str], EditCandidate] = {}
         local_keys = {(c.before, c.after) for c in local}
         for c in local + generated:
-            key = (c.before, c.after)
-            score = c.confidence + (0.10 if key in local_keys and not c.category.startswith("local") else 0.0)
+            key = (c.before, c.after); score = c.confidence + (0.10 if key in local_keys and not c.category.startswith("local") else 0.0)
             uniq[key] = EditCandidate(c.before, c.after, min(0.99, score), c.category, c.reason)
         merged = list(uniq.values())
-
         if merged:
-            try:
-                flags = await OllamaJSON(judge, self.retriever).judge(text, merged[:16])
+            try: flags = await OllamaJSON(judge, self.retriever).judge(text, merged[:16])
             except Exception as exc:
-                logger.warning("Cross-model judge failed: %s; keeping deterministic candidates", exc)
-                flags = []
-            if flags:
-                merged = [c for i, c in enumerate(merged[:16]) if i < len(flags) and flags[i] is True]
-            else:
-                merged = [c for c in merged if c.category.startswith("syntax-")]
-
+                logger.warning("Cross-model judge failed: %s; keeping deterministic candidates", exc); flags = []
+            if flags: merged = [c for i, c in enumerate(merged[:16]) if i < len(flags) and flags[i] is True]
+            else: merged = [c for c in merged if c.category.startswith("syntax-")]
         if merged and self.lt.enabled:
             corrected, _ = DecisionEngine(protected_words=self.protected_words).apply(text, merged)
             if not await self.lt.supports(text, corrected):
                 merged = [c for c in merged if c.category.startswith("syntax-")]
         return merged
-
     async def warmup(self) -> None:
         if self.preset in {"X", "Y"}:
-            from qwen35_backend import Qwen35Backend
-            await Qwen35Backend().warmup()
+            from qwen35_backend import Qwen35Backend; await Qwen35Backend().warmup()
         else:
-            model, _ = self._model_pair()
-            await OllamaJSON(model, self.retriever).draft("Проверка запуска.", "Проверка запуска.")
-
+            model, _ = self._model_pair(); await OllamaJSON(model, self.retriever).draft("Проверка запуска.", "Проверка запуска.")
     def metrics(self) -> dict[str, Any]:
         return {"preset": self.preset, "calls": self._calls, "local_detector": self.local.available, "retrieval": self.retriever.available, "retrieval_count": self.retriever.count, "languagetool_verifier": self.lt.enabled}
