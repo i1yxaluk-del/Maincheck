@@ -1,6 +1,6 @@
-# Runtime dependencies used only by experimental stack F.
-# G is fully local/rule-based plus the existing Ollama T-lite verifier.
+# Runtime dependencies for the local GEC cascade.
 transformers==5.16.1
+peft>=0.18.0
 accelerate>=1.13.0
 safetensors>=0.7.0
 torch>=2.5.0

@@ -19,6 +19,8 @@ from hybrid_editor import STACKS, HybridRouter
 from shared.audit import AuditStore, Timer, count_changes
 from shared.logging_setup import setup_logger
 
+SERVER_VERSION = "5.0"
+
 load_dotenv()
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
@@ -31,7 +33,6 @@ MAX_CHANGES = int(os.getenv("DECISION_MAX_CHANGES", "12"))
 MAX_BEFORE_CHARS = int(os.getenv("DECISION_MAX_BEFORE_CHARS", "120"))
 USER_DICT_ENABLED = os.getenv("USER_DICT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 WARMUP = os.getenv("OLLAMA_WARMUP", "true").lower() in {"1", "true", "yes", "on"}
-WARMUP_REQUIRED = os.getenv("OLLAMA_WARMUP_REQUIRED", "true").lower() in {"1", "true", "yes", "on"}
 AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
 logger = setup_logger("ai_suggester.local")
@@ -55,7 +56,7 @@ def dict_words() -> set[str]:
 
 
 router = HybridRouter(LLM_PRESET, dict_words())
-app = FastAPI(title="AI LibreOffice Suggester", version="3.1")
+app = FastAPI(title="AI LibreOffice Suggester", version=SERVER_VERSION)
 
 
 def normalize_line_breaks(text: str) -> str:
@@ -81,32 +82,37 @@ def render_result(corrected: str, accepted) -> str:
 @app.on_event("startup")
 async def startup() -> None:
     logger.info(
-        "Stack=%s (%s), generator=%s, experimental=%s, LanguageTool=%s, rule_engine=%s",
+        "Stack=%s (%s), generator=%s, experimental=%s, SAGE=%s, GEC=%s, retrieval=%s, rule_engine=%s",
         router.info.name,
         router.info.description,
         router.info.model,
         router.info.experimental,
-        router.lt.enabled,
+        router.sage.model_id if router.sage.available else "disabled",
+        router.gec.adapter_subfolder if router.gec.available else "disabled",
+        router.retriever.count if router.retriever.available else 0,
         router.rules.available,
     )
     if WARMUP:
         started = time.perf_counter()
-        try:
-            await router.warmup()
-            logger.info("Warmup OK in %d ms", int((time.perf_counter() - started) * 1000))
-        except Exception as exc:
-            logger.warning("Warmup failed: %s", exc)
-            if WARMUP_REQUIRED:
-                raise RuntimeError(f"Warmup failed for preset {router.info.name}: {exc}") from exc
+        await router.warmup()
+        elapsed = int((time.perf_counter() - started) * 1000)
+        if router.degraded:
+            logger.warning("Warmup completed degraded in %d ms: %s", elapsed, router.degraded)
+        else:
+            logger.info("Warmup OK in %d ms", elapsed)
 
 
 @app.get("/health", response_class=PlainTextResponse)
 async def health() -> str:
+    if not router.ollama_required():
+        state = "DEGRADED" if router.degraded else "OK"
+        return f"{state} | stack={router.info.name} | fast-local specialist path | degraded={len(router.degraded)}"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{OLLAMA_URL}/api/tags")
             response.raise_for_status()
-        return f"OK | stack={router.info.name} | model={router.info.model}"
+        state = "DEGRADED" if router.degraded else "OK"
+        return f"{state} | stack={router.info.name} | model={router.info.model} | degraded={len(router.degraded)}"
     except Exception as exc:
         return f"DEGRADED | stack={router.info.name} | Ollama error: {exc}"
 
@@ -115,13 +121,15 @@ async def health() -> str:
 async def metrics(hours: int = 24):
     return JSONResponse({
         "server": "local",
-        "version": "3.1",
+        "version": SERVER_VERSION,
         "stack": router.info.name,
         "description": router.info.description,
         "model": router.info.model,
         "experimental": router.info.experimental,
         "rule_engine_available": router.rules.available,
-        "languagetool_verifier": router.lt.enabled,
+        "retrieval_count": router.retriever.count,
+        "russian_gec": router.gec.metrics().__dict__,
+        "sage": router.sage.metrics().__dict__,
         "user_dict_enabled": user_dict is not None,
         "user_dict_size": len(dict_words()),
         "audit": audit.stats(hours=hours) if audit is not None else {"enabled": False},
@@ -194,8 +202,16 @@ async def suggest(request: Request, text: UploadFile = File(...), context: Uploa
         result = f"ОШИБКА_СЕРВЕРА: {error}"
 
     logger.info(
-        "suggest v3.1 stack=%s len=%d ctx=%d candidates=%d accepted=%d dur=%dms",
-        router.info.name, len(raw_text), len(raw_ctx), len(candidates), len(accepted), timer.ms,
+        "suggest v5 stack=%s len=%d ctx=%d candidates=%d accepted=%d stages=%s stage_ms=%s dur=%dms degraded=%d",
+        router.info.name,
+        len(raw_text),
+        len(raw_ctx),
+        len(candidates),
+        len(accepted),
+        router.metrics().get("stage_calls"),
+        router.metrics().get("stage_ms"),
+        timer.ms,
+        len(router.degraded),
     )
 
     if audit is not None:
