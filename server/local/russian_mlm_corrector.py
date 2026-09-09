@@ -27,12 +27,13 @@ class RussianMlmCorrector:
     def __init__(self) -> None:
         self.enabled = os.getenv("RUSSIAN_MLM_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         self.model_id = os.getenv("RUSSIAN_MLM_MODEL", DEFAULT_MODEL)
-        self.top_k = int(os.getenv("RUSSIAN_MLM_TOP_K", "8"))
+        self.top_k = int(os.getenv("RUSSIAN_MLM_TOP_K", "12"))
         self.max_positions = int(os.getenv("RUSSIAN_MLM_MAX_POSITIONS", "40"))
         self.batch_size = int(os.getenv("RUSSIAN_MLM_BATCH", "8"))
-        self.min_margin = float(os.getenv("RUSSIAN_MLM_MIN_MARGIN", "0.25"))
+        self.min_margin = float(os.getenv("RUSSIAN_MLM_MIN_MARGIN", "0.10"))
         self._tokenizer = None
         self._model = None
+        self._morph = None
         self._calls = 0
         self._positions = 0
         self._lock = asyncio.Lock()
@@ -56,6 +57,29 @@ class RussianMlmCorrector:
             torch.set_num_interop_threads(1)
         except RuntimeError:
             pass
+
+    def _morphology_ok(self, source: str, candidate: str) -> bool:
+        if self._morph is None:
+            try:
+                import pymorphy3
+                self._morph = pymorphy3.MorphAnalyzer()
+            except Exception:
+                self._morph = False
+        if self._morph:
+            source_norms = {p.normal_form for p in self._morph.parse(source.lower())[:3] if p.is_known}
+            candidate_norms = {p.normal_form for p in self._morph.parse(candidate.lower())[:3] if p.is_known}
+            if source_norms and candidate_norms and source_norms & candidate_norms:
+                return True
+        a, b = source.lower(), candidate.lower()
+        if abs(len(a) - len(b)) > max(2, int(len(a) * 0.35)):
+            return False
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cur.append(min(cur[-1] + 1, prev[j] + 1, prev[j - 1] + (ca != cb)))
+            prev = cur
+        return prev[-1] <= max(3, int(len(a) * 0.30))
 
     @staticmethod
     def _is_word_token(token: str) -> bool:
@@ -85,14 +109,12 @@ class RussianMlmCorrector:
                 i for i, (start, end) in enumerate(offsets)
                 if start < m.end() and end > m.start() and end > start
             ]
-            # Restrict to one-token words; this avoids inventing multi-token words.
             if len(overlaps) != 1:
                 continue
             pos = overlaps[0]
             if pos <= 0 or pos >= len(tokens) - 1:
                 continue
-            token = tokens[pos]
-            if not self._is_word_token(token):
+            if not self._is_word_token(tokens[pos]):
                 continue
             positions.append((pos, m.group(0), ids[pos]))
             if len(positions) >= self.max_positions:
@@ -109,8 +131,7 @@ class RussianMlmCorrector:
             return []
         self._positions += len(positions)
         base_ids = inputs["input_ids"][0].tolist()
-        vocab = self._tokenizer.get_vocab()
-        id_to_token = {idx: token for token, idx in vocab.items()}
+        id_to_token = {idx: token for token, idx in self._tokenizer.get_vocab().items()}
         out = []
 
         for start in range(0, len(positions), self.batch_size):
@@ -124,8 +145,7 @@ class RussianMlmCorrector:
 
             for row, (pos, source_word, original_id) in enumerate(batch):
                 scores = logits[row, pos]
-                k = min(self.top_k + 4, scores.shape[-1])
-                top_scores, top_ids = torch.topk(scores, k=k)
+                top_scores, top_ids = torch.topk(scores, k=min(self.top_k + 6, scores.shape[-1]))
                 original_score = float(scores[original_id])
                 best = None
                 for score, token_id in zip(top_scores.tolist(), top_ids.tolist()):
@@ -135,13 +155,10 @@ class RussianMlmCorrector:
                     if not self._is_word_token(token):
                         continue
                     candidate = self._normalize(token, source_word)
-                    if candidate.lower() == source_word.lower():
+                    if candidate.lower() == source_word.lower() or not self._morphology_ok(source_word, candidate):
                         continue
                     margin = float(score) - original_score
                     if margin < self.min_margin:
-                        continue
-                    # Keep only candidates plausible for Russian word forms.
-                    if not re.fullmatch(r"[А-Яа-яЁё-]+", candidate):
                         continue
                     if best is None or margin > best[0]:
                         best = (margin, candidate)
