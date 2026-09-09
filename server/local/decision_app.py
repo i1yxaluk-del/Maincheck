@@ -19,7 +19,7 @@ from hybrid_editor import STACKS, HybridRouter
 from shared.audit import AuditStore, Timer, count_changes
 from shared.logging_setup import setup_logger
 
-SERVER_VERSION = "5.0"
+SERVER_VERSION = "6.0"
 
 load_dotenv()
 
@@ -82,13 +82,13 @@ def render_result(corrected: str, accepted) -> str:
 @app.on_event("startup")
 async def startup() -> None:
     logger.info(
-        "Stack=%s (%s), generator=%s, experimental=%s, SAGE=%s, GEC=%s, retrieval=%s, rule_engine=%s",
+        "Stack=%s (%s), generator=%s, experimental=%s, SAGE=%s, MLM=%s, retrieval=%s, rule_engine=%s",
         router.info.name,
         router.info.description,
         router.info.model,
         router.info.experimental,
         router.sage.model_id if router.sage.available else "disabled",
-        router.gec.adapter_subfolder if router.gec.available else "disabled",
+        router.mlm.model_id if router.mlm.available else "disabled",
         router.retriever.count if router.retriever.available else 0,
         router.rules.available,
     )
@@ -104,17 +104,8 @@ async def startup() -> None:
 
 @app.get("/health", response_class=PlainTextResponse)
 async def health() -> str:
-    if not router.ollama_required():
-        state = "DEGRADED" if router.degraded else "OK"
-        return f"{state} | stack={router.info.name} | fast-local specialist path | degraded={len(router.degraded)}"
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{OLLAMA_URL}/api/tags")
-            response.raise_for_status()
-        state = "DEGRADED" if router.degraded else "OK"
-        return f"{state} | stack={router.info.name} | model={router.info.model} | degraded={len(router.degraded)}"
-    except Exception as exc:
-        return f"DEGRADED | stack={router.info.name} | Ollama error: {exc}"
+    state = "DEGRADED" if router.degraded else "OK"
+    return f"{state} | stack={router.info.name} | adaptive local-first path | degraded={len(router.degraded)}"
 
 
 @app.get("/metrics")
@@ -128,8 +119,8 @@ async def metrics(hours: int = 24):
         "experimental": router.info.experimental,
         "rule_engine_available": router.rules.available,
         "retrieval_count": router.retriever.count,
-        "russian_gec": router.gec.metrics().__dict__,
         "sage": router.sage.metrics().__dict__,
+        "russian_mlm": router.mlm.metrics().__dict__,
         "user_dict_enabled": user_dict is not None,
         "user_dict_size": len(dict_words()),
         "audit": audit.stats(hours=hours) if audit is not None else {"enabled": False},
@@ -202,7 +193,7 @@ async def suggest(request: Request, text: UploadFile = File(...), context: Uploa
         result = f"ОШИБКА_СЕРВЕРА: {error}"
 
     logger.info(
-        "suggest v5 stack=%s len=%d ctx=%d candidates=%d accepted=%d stages=%s stage_ms=%s dur=%dms degraded=%d",
+        "suggest v6 stack=%s len=%d ctx=%d candidates=%d accepted=%d stages=%s stage_ms=%s dur=%dms degraded=%d",
         router.info.name,
         len(raw_text),
         len(raw_ctx),
