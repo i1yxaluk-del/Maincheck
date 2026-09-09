@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from decision_engine import EditCandidate
 
 log = logging.getLogger("ai_suggester.syntax_candidates")
+
+UD_TO_PYMORPHY = {
+    "Nom": "nomn", "Gen": "gent", "Dat": "datv", "Acc": "accs",
+    "Ins": "ablt", "Loc": "loct", "Par": "loct", "Voc": "voct",
+    "Sing": "sing", "Plur": "plur",
+    "Masc": "masc", "Fem": "femn", "Neut": "neut",
+}
 
 
 def _is_modifier(pos: str, rel: str) -> bool:
@@ -45,43 +51,36 @@ def candidates(text: str) -> list[EditCandidate]:
         if head_idx < 0 or head_idx >= len(doc.tokens):
             continue
         head = doc.tokens[head_idx]
-        if not _is_noun(head.pos):
-            continue
-        if doc.is_clearly_non_attributive(i, head_idx):
+        if not _is_noun(head.pos) or doc.is_clearly_non_attributive(i, head_idx):
             continue
 
-        src = morph.parse(tok.text)
+        src = [p for p in morph.parse(tok.text) if p.is_known]
         if not src:
             continue
-        src = [p for p in src if p.is_known]
-        if not src:
-            continue
-        p = src[0]
         feats = tok.feats_dict
-        case = feats.get("Case")
-        number = feats.get("Number")
-        gender = feats.get("Gender")
         head_feats = head.feats_dict
-        target_case = head_feats.get("Case") or case
-        target_number = head_feats.get("Number") or number
-        target_gender = head_feats.get("Gender") or gender
+        src_case = feats.get("Case")
+        src_number = feats.get("Number")
+        src_gender = feats.get("Gender")
+        target_case = head_feats.get("Case") or src_case
+        target_number = head_feats.get("Number") or src_number
+        target_gender = head_feats.get("Gender") or src_gender
 
-        mismatch = False
-        if case and target_case and case != target_case:
-            mismatch = True
-        if number and target_number and number != target_number:
-            mismatch = True
-        if gender and target_gender and gender not in {"", target_gender}:
-            mismatch = True
+        mismatch = (
+            bool(src_case and target_case and src_case != target_case)
+            or bool(src_number and target_number and src_number != target_number)
+            or bool(src_gender and target_gender and src_gender != target_gender)
+        )
         if not mismatch:
             continue
 
-        grammemes = set()
-        mapping = {"case": target_case, "number": target_number, "gender": target_gender}
-        for attr in mapping.values():
-            if attr:
-                # pymorphy3 grammeme names are lower-case.
-                grammemes.add(str(attr).lower())
+        grammemes = {
+            UD_TO_PYMORPHY[value]
+            for value in (target_case, target_number, target_gender)
+            if value in UD_TO_PYMORPHY
+        }
+        if not grammemes:
+            continue
         fixed = None
         for parse in src[:3]:
             try:
@@ -100,6 +99,6 @@ def candidates(text: str) -> list[EditCandidate]:
             fixed,
             0.985,
             "syntax-agreement",
-            f"dependency {tok.rel} + морфологическое согласование с `{head.text}`",
+            f"dependency {tok.rel} + согласование с `{head.text}`",
         ))
     return out
