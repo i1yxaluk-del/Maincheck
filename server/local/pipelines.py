@@ -151,7 +151,6 @@ class MorphologyRescue:
                     if modifier[:1].isupper():
                         after = after[:1].upper() + after[1:]
                     out.append(EditCandidate(modifier, after, 0.97, "agreement", "согласование определения с существительным"))
-                    continue
             grammemes = {g for g in (source_parse.tag.number, source_parse.tag.case) if g}
             if not grammemes:
                 continue

@@ -82,7 +82,9 @@ class DecisionEngine:
             after = morph.parse(c.after)
             if not before or not after or not before[0].is_known or not after[0].is_known:
                 return False
-            return before[0].normal == after[0].normal
+            before_forms = {(p.normal_form, str(p.tag).split(",", 1)[0]) for p in before if p.is_known}
+            after_forms = {(p.normal_form, str(p.tag).split(",", 1)[0]) for p in after if p.is_known}
+            return bool(before_forms & after_forms)
         except Exception:
             return False
 
