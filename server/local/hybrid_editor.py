@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -11,52 +12,49 @@ import httpx
 
 from decision_engine import EditCandidate
 from local_rules import LocalRuleEngine
+from russian_quality_models import SageRussianCorrector
 from safe_diff import diff_candidates as bounded_diff
 
 logger = logging.getLogger("ai_suggester.hybrid")
 
 TLITE = "t-tech/T-lite-it-2.1:q4_K_M"
 GIGACHAT = "hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:latest"
-# Text-only Russian GEC specialist. It avoids the Qwen3.5 multimodal processor
-# dependency (PIL/torchvision) that made the previous X/Y presets unable to start.
-GEC_SPECIALIST = os.getenv(
-    "GEC_SPECIALIST_MODEL",
-    "ReginaNasyrova/checkpoint_150_lora_grpo_upd_reward_GECExplanation-4B-sft-stage1-March2026",
-)
 
-DIAG_SYSTEM = """Ты — диагностический модуль корректора русского официально-делового текста.
+DIAG_SYSTEM = """Ты — модуль обнаружения ошибок русского официально-делового текста.
 
-Не переписывай текст целиком. Найди ВСЕ объективные ошибки в данном фрагменте,
-с учётом полного предложения и контекста.
+Твоя задача не переписывать текст, а максимально полно найти реальные ошибки.
+Проверяй весь контекст предложения и различай:
+- орфографию и опечатки;
+- пунктуацию и границы частей предложения;
+- согласование слов и числительных;
+- управление и падежные формы;
+- формы глаголов и причастий;
+- синтаксические ошибки;
+- очевидные повторы, пропуски слов и явные нарушения нормы.
 
-Проверяй отдельно:
-- согласование определения/причастия с существительным, включая удалённые и
-  однородные конструкции;
-- управление падежом и формы после предлогов/глаголов;
-- конструкции с числительными и датами;
-- орфографию и очевидные опечатки;
-- пунктуацию по синтаксической структуре, а не только по соседним словам;
-- лишние запятые между сказуемым и его дополнением;
-- пропущенные запятые между частями сложного предложения.
-
-НЕ меняй стиль, терминологию, имена, даты, номера и допустимые варианты.
-Для каждой ошибки верни минимальную замену exact substring исходного текста.
-Не объединяй несколько независимых ошибок в одну длинную замену.
-При сомнении лучше не предлагай правку.
+Для каждой ошибки верни минимальную точную замену исходной строки. Не исправляй
+стиль без ошибки, термины, номера, названия и допустимые варианты. Не объединяй
+независимые ошибки. При сомнении лучше дать меньше кандидатов.
 
 Верни только JSON:
-{"edits":[{"before":"...","after":"...","confidence":0.0,"category":"grammar|spelling|punctuation|government|agreement","reason":"..."}]}
+{"edits":[{"before":"...","after":"...","confidence":0.0,"category":"grammar|spelling|punctuation|government|agreement|style","reason":"..."}]}
 """
 
-JUDGE_SYSTEM = """Ты — независимый редактор-контролёр русского официально-делового текста.
+DRAFT_SYSTEM = """Ты — специализированный редактор русского официально-делового текста.
 
-Тебе дан исходный текст и локальные кандидаты исправлений.
-Для каждого кандидата заново проверь полное предложение, синтаксическую связь,
-управление, согласование и пунктуационный контекст.
-true только для объективной ошибки с однозначной минимальной заменой.
-false для стилистики, допустимого варианта, термина, даты, номера или сомнения.
-Не создавай новые исправления.
+Исправь ВСЕ объективные орфографические, пунктуационные, грамматические,
+синтаксические и очевидные лексические ошибки в исходном тексте.
+Сохрани смысл, термины, имена собственные, числа и факты. Не переписывай
+предложения ради красоты и не заменяй допустимые варианты. Не добавляй и не
+удаляй информацию. Верни только исправленный текст, без комментариев.
+"""
 
+JUDGE_SYSTEM = """Ты — строгий контролёр русского текста.
+
+Проверь кандидаты исправлений относительно исходного предложения. Прими только
+объективные исправления орфографии, пунктуации, грамматики или синтаксиса.
+Отклоняй стилистическую вкусовщину, допустимые варианты и изменения смысла.
+Не создавай новых исправлений.
 Верни только JSON: {"accept":[true,false,...]}
 """
 
@@ -70,10 +68,10 @@ class StackInfo:
 
 
 STACKS = {
-    "A": StackInfo("A", "production: deterministic Russian rules + T-lite diagnostic + GigaChat judge", TLITE, False),
-    "B": StackInfo("B", "production-candidate: deterministic Russian rules + GigaChat diagnostic + T-lite judge", GIGACHAT, False),
-    "X": StackInfo("X", "experimental: Russian GEC specialist + GigaChat judge", GEC_SPECIALIST, True),
-    "Y": StackInfo("Y", "experimental: two specialist GEC drafts + T-lite judge + optional LanguageTool", GEC_SPECIALIST, True),
+    "A": StackInfo("A", "production: SAGE spell/punctuation + T-lite draft/diagnostic + GigaChat judge", TLITE, False),
+    "B": StackInfo("B", "production-candidate: SAGE spell/punctuation + GigaChat draft/diagnostic + T-lite judge", GIGACHAT, False),
+    "X": StackInfo("X", "experimental: SAGE + GigaChat multi-candidate cascade", GIGACHAT, True),
+    "Y": StackInfo("Y", "experimental: SAGE + two T-lite correction candidates + GigaChat judge", TLITE, True),
 }
 
 
@@ -102,12 +100,12 @@ class RetrievalExamples:
         except Exception as exc:
             logger.warning("Hybrid retrieval unavailable: %s", exc)
 
-    def prompt(self, text: str, top_k: int = 4) -> str:
+    def prompt(self, text: str, top_k: int = 6) -> str:
         if not self.bank or not self.available:
             return ""
         try:
             pairs = [pair for _, pair in self.bank.search_hybrid(text, top_k=top_k)]
-            lines = ["ПОХОЖИЕ ЭТАЛОНЫ (только как ориентир):"]
+            lines = ["ПОХОЖИЕ ЭТАЛОНЫ (только как подсказка):"]
             for i, pair in enumerate(pairs, 1):
                 wrong = getattr(pair, "wrong", "")
                 right = getattr(pair, "right", "")
@@ -127,17 +125,16 @@ class OllamaJSON:
         self.model = model
         self.timeout = float(os.getenv("HYBRID_LLM_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", "300")))
         self.ctx = int(os.getenv("HYBRID_NUM_CTX", "4096"))
-        self.predict = int(os.getenv("HYBRID_NUM_PREDICT", "512"))
+        self.predict = int(os.getenv("HYBRID_NUM_PREDICT", "768"))
         self.threads = int(os.getenv("NUM_THREADS", "16"))
         self.keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
         self.retriever = retriever
 
-    async def call(self, messages: list[dict[str, str]], schema: dict[str, Any], *, temperature: float = 0.0, think: bool = False) -> dict[str, Any]:
-        payload = {
+    async def call(self, messages: list[dict[str, str]], schema: dict[str, Any] | None = None, *, temperature: float = 0.0, think: bool = False) -> dict[str, Any] | str:
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "format": schema,
             "think": think,
             "keep_alive": self.keep_alive,
             "options": {
@@ -148,62 +145,69 @@ class OllamaJSON:
                 "repeat_penalty": 1.02,
             },
         }
+        if schema is not None:
+            payload["format"] = schema
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(f"{self.url}/api/chat", json=payload)
             response.raise_for_status()
-            content = response.json().get("message", {}).get("content", "{}")
+            content = response.json().get("message", {}).get("content", "")
+        if schema is None:
+            return str(content)
         try:
             data = json.loads(content)
         except Exception:
             return {}
         return data if isinstance(data, dict) else {}
 
-    async def diagnose(self, text: str, context: str, temperature: float = 0.0, think: bool = False) -> list[EditCandidate]:
+    def _user_prompt(self, text: str, context: str) -> str:
         retrieval = self.retriever.prompt(text) if self.retriever else ""
-        user = (
-            f"КОНТЕКСТ ДОКУМЕНТА:\n{context[-3500:]}\n\n"
-            f"{retrieval}\n\nИСПРАВЛЯЕМЫЙ ФРАГМЕНТ:\n{text}"
-        )
+        return f"КОНТЕКСТ ДОКУМЕНТА:\n{context[-4500:]}\n\n{retrieval}\n\nИСХОДНЫЙ ФРАГМЕНТ:\n{text}"
+
+    async def diagnose(self, text: str, context: str, temperature: float = 0.0) -> list[EditCandidate]:
         schema = {
             "type": "object",
             "properties": {
-                "edits": {
-                    "type": "array", "maxItems": 12,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "before": {"type": "string"},
-                            "after": {"type": "string"},
-                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                            "category": {"type": "string"},
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["before", "after", "confidence", "category", "reason"],
-                        "additionalProperties": False,
+                "edits": {"type": "array", "maxItems": 16, "items": {
+                    "type": "object",
+                    "properties": {
+                        "before": {"type": "string"},
+                        "after": {"type": "string"},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "category": {"type": "string"},
+                        "reason": {"type": "string"},
                     },
-                }
+                    "required": ["before", "after", "confidence", "category", "reason"],
+                    "additionalProperties": False,
+                }},
             },
             "required": ["edits"],
             "additionalProperties": False,
         }
         data = await self.call(
-            [{"role": "system", "content": DIAG_SYSTEM}, {"role": "user", "content": user}],
+            [{"role": "system", "content": DIAG_SYSTEM}, {"role": "user", "content": self._user_prompt(text, context)}],
             schema,
             temperature=temperature,
-            think=think,
         )
         raw = data.get("edits", []) if isinstance(data, dict) else []
-        return [
-            EditCandidate(
-                str(item.get("before", "")),
-                str(item.get("after", "")),
-                float(item.get("confidence", 0.0)),
-                str(item.get("category", "model-diagnostic")),
-                str(item.get("reason", "")),
-            )
-            for item in raw
-            if isinstance(item, dict) and item.get("before") and item.get("after")
-        ]
+        out: list[EditCandidate] = []
+        for item in raw:
+            if isinstance(item, dict) and item.get("before") and item.get("after"):
+                try:
+                    out.append(EditCandidate(
+                        str(item["before"]), str(item["after"]), float(item.get("confidence", 0.0)),
+                        str(item.get("category", "model-diagnostic")), str(item.get("reason", "")),
+                    ))
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    async def draft(self, text: str, context: str, temperature: float = 0.0) -> str:
+        result = await self.call(
+            [{"role": "system", "content": DRAFT_SYSTEM}, {"role": "user", "content": self._user_prompt(text, context)}],
+            None,
+            temperature=temperature,
+        )
+        return str(result or "").strip()
 
     async def judge(self, text: str, candidates: list[EditCandidate]) -> list[bool]:
         payload = [
@@ -212,7 +216,7 @@ class OllamaJSON:
         ]
         schema = {
             "type": "object",
-            "properties": {"accept": {"type": "array", "items": {"type": "boolean"}, "maxItems": 16}},
+            "properties": {"accept": {"type": "array", "items": {"type": "boolean"}, "maxItems": 32}},
             "required": ["accept"],
             "additionalProperties": False,
         }
@@ -224,36 +228,6 @@ class OllamaJSON:
         return flags if isinstance(flags, list) else []
 
 
-class LanguageToolVerifier:
-    def __init__(self) -> None:
-        self.url = os.getenv("LANGUAGETOOL_URL", "").strip().rstrip("/")
-        self.language = os.getenv("LANGUAGETOOL_LANGUAGE", "ru-RU")
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self.url)
-
-    async def _matches(self, text: str) -> list[dict[str, Any]]:
-        if not self.url:
-            return []
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                response = await client.post(f"{self.url}/v2/check", data={"language": self.language, "text": text})
-                response.raise_for_status()
-                data = response.json()
-                return data.get("matches", []) if isinstance(data, dict) else []
-        except Exception as exc:
-            logger.warning("LanguageTool verifier unavailable: %s", exc)
-            return []
-
-    async def supports(self, source: str, corrected: str) -> bool:
-        if not self.enabled:
-            return True
-        before = await self._matches(source)
-        after = await self._matches(corrected)
-        return len(after) <= len(before)
-
-
 class HybridRouter:
     def __init__(self, preset: str, protected_words: set[str] | None = None) -> None:
         self.preset = preset.upper()
@@ -262,86 +236,99 @@ class HybridRouter:
         self.info = STACKS[self.preset]
         self.rules = LocalRuleEngine()
         self.retriever = RetrievalExamples()
-        self.lt = LanguageToolVerifier()
+        self.sage = SageRussianCorrector()
         self.protected_words = protected_words or set()
         self._calls = 0
+        self._stage_calls = {"sage": 0, "draft": 0, "diagnostic": 0, "judge": 0}
 
-    def _model_pair(self) -> tuple[str, str]:
-        if self.preset == "A":
-            return TLITE, GIGACHAT
-        if self.preset == "B":
-            return GIGACHAT, TLITE
-        return GEC_SPECIALIST, GIGACHAT if self.preset == "X" else TLITE
+    def _primary_model(self) -> str:
+        if self.preset in {"A", "X"}:
+            return TLITE if self.preset == "A" else GIGACHAT
+        return GIGACHAT if self.preset == "B" else TLITE
 
-    async def _ollama_diagnostics(self, model: str, text: str, context: str) -> list[EditCandidate]:
-        client = OllamaJSON(model, self.retriever)
-        return await client.diagnose(text, context, temperature=0.0, think=False)
+    def _judge_model(self) -> str:
+        if self.preset in {"A", "X"}:
+            return GIGACHAT
+        return TLITE
 
-    async def _specialist_drafts(self, text: str, context: str, count: int) -> list[str]:
-        from qwen35_backend import Qwen35Backend
-        backend = Qwen35Backend()
-        return [await backend.correct(text, context, temperature=t) for t in ([0.10, 0.25][:count])]
+    async def _ollama(self) -> OllamaJSON:
+        return OllamaJSON(self._primary_model(), self.retriever)
+
+    async def _generate_model_candidates(self, text: str, context: str) -> list[EditCandidate]:
+        model = await self._ollama()
+        draft_count = 2 if self.preset == "Y" else 1
+        temps = [0.0, 0.18][:draft_count]
+        self._stage_calls["draft"] += draft_count
+        self._stage_calls["diagnostic"] += 1
+        drafts_task = asyncio.gather(*(model.draft(text, context, t) for t in temps), return_exceptions=True)
+        diag_task = model.diagnose(text, context, temperature=0.0)
+        draft_results, diag_results = await asyncio.gather(drafts_task, diag_task)
+
+        candidates: list[EditCandidate] = list(diag_results)
+        for i, draft in enumerate(draft_results):
+            if isinstance(draft, Exception) or not draft:
+                logger.warning("Draft generation failed: %s", draft)
+                continue
+            source_tag = "draft-primary" if i == 0 else "draft-secondary"
+            candidates.extend(bounded_diff(text, draft, source_tag, 0.74 if i == 0 else 0.77))
+        return candidates
 
     async def candidates(self, text: str, context: str = "") -> list[EditCandidate]:
         self._calls += 1
         deterministic = self.rules.candidates(text)
-        generator, judge = self._model_pair()
 
-        if self.preset in {"X", "Y"}:
-            drafts = await self._specialist_drafts(text, context, 2 if self.preset == "Y" else 1)
-            model_candidates: list[EditCandidate] = []
-            for draft in drafts:
-                model_candidates.extend(bounded_diff(text, draft, "specialist-draft", 0.76 if len(drafts) == 1 else 0.78))
-            if len(drafts) == 2 and drafts[0] == drafts[1]:
-                model_candidates.extend(bounded_diff(text, drafts[0], "specialist-consensus", 0.88))
-        else:
-            model_candidates = await self._ollama_diagnostics(generator, text, context)
-
-        # Deterministic candidates are an independent high-confidence source;
-        # an LLM judge is forbidden from deleting them just because it is uncertain.
-        judged: list[EditCandidate] = []
-        if model_candidates:
+        specialist_candidates: list[EditCandidate] = []
+        if self.sage.available:
             try:
-                flags = await OllamaJSON(judge, self.retriever).judge(text, model_candidates[:16])
+                self._stage_calls["sage"] += 1
+                sage_draft = await self.sage.correct(text)
+                specialist_candidates.extend(bounded_diff(text, sage_draft, "sage-spell-punc", 0.82))
+            except Exception as exc:
+                logger.warning("SAGE candidate generation failed: %s", exc)
+
+        model_candidates = await self._generate_model_candidates(text, context)
+
+        judge_client = OllamaJSON(self._judge_model(), self.retriever)
+        self._stage_calls["judge"] += 1
+        to_judge = specialist_candidates + model_candidates
+        judged: list[EditCandidate] = []
+        if to_judge:
+            try:
+                flags = await judge_client.judge(text, to_judge[:32])
             except Exception as exc:
                 logger.warning("Cross-model judge failed: %s", exc)
                 flags = []
             if flags:
-                judged = [c for i, c in enumerate(model_candidates[:16]) if i < len(flags) and flags[i] is True]
+                judged = [c for i, c in enumerate(to_judge[:32]) if i < len(flags) and flags[i] is True]
             else:
-                # Transport/schema failure is not a semantic rejection.
-                judged = model_candidates[:16]
+                judged = to_judge[:32]
 
         unique: dict[tuple[str, str], EditCandidate] = {}
+        # Local rule candidates are kept independently; the model judge cannot veto them.
         for c in deterministic + judged:
             key = (c.before, c.after)
             existing = unique.get(key)
             if existing is None or c.confidence > existing.confidence:
                 unique[key] = c
-
-        merged = list(unique.values())
-        if merged and self.lt.enabled:
-            # Optional LT is a quality signal after candidate generation, never the source.
-            from decision_engine import DecisionEngine
-            candidate_text, _ = DecisionEngine(protected_words=self.protected_words).apply(text, merged)
-            if not await self.lt.supports(text, candidate_text):
-                merged = [c for c in merged if c.category.startswith("rule-")]
-        return merged
+        return list(unique.values())
 
     async def warmup(self) -> None:
-        if self.preset in {"X", "Y"}:
-            from qwen35_backend import Qwen35Backend
-            await Qwen35Backend().warmup()
-        else:
-            model, _ = self._model_pair()
-            await OllamaJSON(model, self.retriever).diagnose("Проверка запуска.", "Проверка запуска.")
+        if self.sage.available:
+            await self.sage.warmup()
+        model = OllamaJSON(self._primary_model(), self.retriever)
+        await model.diagnose("Проверка запуска.", "Проверка запуска.")
 
     def metrics(self) -> dict[str, Any]:
+        sage_stats = self.sage.metrics()
         return {
             "preset": self.preset,
             "calls": self._calls,
             "rule_engine": self.rules.available,
             "retrieval": self.retriever.available,
             "retrieval_count": self.retriever.count,
-            "languagetool_verifier": self.lt.enabled,
+            "sage_corrector_enabled": sage_stats.enabled,
+            "sage_corrector_loaded": sage_stats.loaded,
+            "sage_corrector_model": sage_stats.model,
+            "sage_corrector_calls": sage_stats.calls,
+            "stage_calls": dict(self._stage_calls),
         }
