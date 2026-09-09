@@ -7,22 +7,31 @@ import os
 class Qwen35Backend:
     """Lazy Transformers backend for official Qwen3.5-4B.
 
-    It is experimental only. The model is loaded inside the existing uvicorn
-    process; no second HTTP/uvicorn service is started.
+    The singleton-like class cache prevents reloading 4B weights for every
+    request while keeping everything inside the existing uvicorn process.
     """
 
     MODEL_ID = os.getenv("QWEN35_MODEL", "Qwen/Qwen3.5-4B")
+    _shared_instance: "Qwen35Backend | None" = None
+
+    def __new__(cls):
+        if cls._shared_instance is None:
+            cls._shared_instance = super().__new__(cls)
+            cls._shared_instance._initialized = False
+        return cls._shared_instance
 
     def __init__(self) -> None:
+        if self._initialized:
+            return
         self._processor = None
         self._model = None
         self._device = None
         self.max_new = int(os.getenv("QWEN35_MAX_NEW_TOKENS", "768"))
+        self._initialized = True
 
     def _load(self) -> None:
         if self._model is not None:
             return
-        import torch
         from transformers import AutoProcessor, AutoModelForImageTextToText
         self._processor = AutoProcessor.from_pretrained(self.MODEL_ID)
         self._model = AutoModelForImageTextToText.from_pretrained(
