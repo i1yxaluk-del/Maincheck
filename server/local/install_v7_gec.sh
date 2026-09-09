@@ -15,7 +15,10 @@ mkdir -p "$HF_HOME"
 SAGE_MODEL=${SAGE_CORRECTOR_MODEL:-ai-forever/sage-fredt5-distilled-95m}
 GEC_MODEL=${OLLAMA_GEC_MODEL:-hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0}
 
-[ -x "$ROOT/venv/bin/pip" ] && "$ROOT/venv/bin/pip" install -r requirements.txt || true
+if [ -x "$ROOT/venv/bin/pip" ]; then
+  "$ROOT/venv/bin/pip" install -r requirements.txt
+fi
+
 export PYTHONPATH="$ROOT/..${PYTHONPATH:+:$PYTHONPATH}"
 "$PYTHON_BIN" -m py_compile decision_app.py hybrid_editor.py ollama_gec.py russian_quality_models.py safe_diff.py
 
@@ -25,7 +28,12 @@ else
   HF_HOME="$HF_HOME" "$PYTHON_BIN" -c "from huggingface_hub import snapshot_download; snapshot_download('$SAGE_MODEL')"
 fi
 
-command -v ollama >/dev/null 2>&1 || { echo "ERROR: ollama executable not found" >&2; exit 1; }
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "ERROR: ollama executable not found" >&2
+  exit 1
+fi
+
 echo "Pulling $GEC_MODEL"
 ollama pull "$GEC_MODEL"
+
 echo "v7 install complete: SAGE=$SAGE_MODEL GEC=$GEC_MODEL"
