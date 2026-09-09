@@ -6,6 +6,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -58,8 +59,55 @@ STACKS = {
 }
 
 
+class RetrievalExamples:
+    """Local hybrid retrieval from the existing Russian GEC banks."""
+
+    def __init__(self) -> None:
+        self.bank = None
+        self.available = False
+        self.count = 0
+        try:
+            from shared.gec_bank import GecBank
+            from shared.rag_store import HashingEmbedder
+            root = Path(__file__).resolve().parents[1] / "shared" / "gec_seed"
+            configured = os.getenv("GEC_BANK_FILES", "").strip()
+            paths = [Path(p.strip()) for p in configured.split(",") if p.strip()] if configured else [
+                root / "gec_bank_extended.jsonl", root / "lexify_admin.jsonl"
+            ]
+            existing = [p for p in paths if p.exists()]
+            if not existing:
+                return
+            self.bank = GecBank(HashingEmbedder(512), bm25_tokenizer="both")
+            self.bank.load_jsonl(*existing)
+            cache = Path(os.getenv("GEC_BANK_CACHE", "data/gec_bank_hashing.pkl"))
+            self.bank.build_index(cache)
+            self.count = len(self.bank)
+            self.available = self.count > 0
+            logger.info("Hybrid retrieval: %d pairs ready", self.count)
+        except Exception as exc:
+            logger.warning("Hybrid retrieval unavailable: %s", exc)
+
+    def prompt(self, text: str, top_k: int = 2) -> str:
+        if not self.bank or not self.available:
+            return ""
+        try:
+            pairs = [pair for _, pair in self.bank.search_hybrid(text, top_k=top_k)]
+            if not pairs:
+                return ""
+            lines = ["ПОХОЖИЕ ПРИМЕРЫ КОРРЕКЦИИ (используй только как ориентир):"]
+            for i, pair in enumerate(pairs, 1):
+                wrong = getattr(pair, "wrong", None) or pair.get("wrong", "")
+                right = getattr(pair, "right", None) or pair.get("right", "")
+                if wrong and right:
+                    lines.append(f"{i}. {wrong} → {right}")
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.warning("Hybrid retrieval search failed: %s", exc)
+            return ""
+
+
 class OllamaJSON:
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, retriever: RetrievalExamples | None = None) -> None:
         self.url = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
         self.model = model
         self.timeout = float(os.getenv("HYBRID_LLM_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", "300")))
@@ -67,6 +115,7 @@ class OllamaJSON:
         self.predict = int(os.getenv("HYBRID_NUM_PREDICT", "512"))
         self.threads = int(os.getenv("NUM_THREADS", "16"))
         self.keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+        self.retriever = retriever
 
     async def call(self, messages: list[dict[str, str]], schema: dict[str, Any], *, temperature: float = 0.0, think: bool = False) -> dict[str, Any]:
         payload = {
@@ -86,7 +135,8 @@ class OllamaJSON:
         return data if isinstance(data, dict) else {}
 
     async def draft(self, text: str, context: str, temperature: float = 0.0, think: bool = False) -> str:
-        user = f"КОНТЕКСТ:\n{context[-3000:]}\n\nТЕКСТ:\n{text}"
+        retrieval = self.retriever.prompt(text) if self.retriever else ""
+        user = f"КОНТЕКСТ:\n{context[-3000:]}\n\n{retrieval}\n\nТЕКСТ:\n{text}".strip()
         data = await self.call(
             [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
             {"type": "object", "properties": {"corrected": {"type": "string"}}, "required": ["corrected"], "additionalProperties": False},
@@ -166,6 +216,7 @@ class HybridRouter:
             raise RuntimeError(f"Unsupported LLM_PRESET={self.preset!r}; expected A, B, X or Y")
         self.info = STACKS[self.preset]
         self.local = LocalContextEngine()
+        self.retriever = RetrievalExamples()
         self.lt = LanguageToolVerifier()
         self.protected_words = protected_words or set()
         self._calls = 0
@@ -178,7 +229,7 @@ class HybridRouter:
         return QWEN35, GIGACHAT if self.preset == "X" else TLITE
 
     async def _ollama_drafts(self, model: str, text: str, context: str, count: int) -> list[str]:
-        client = OllamaJSON(model)
+        client = OllamaJSON(model, self.retriever)
         return [await client.draft(text, context, temperature=t) for t in ([0.0, 0.25][:count])]
 
     async def _qwen_drafts(self, text: str, context: str, count: int) -> list[str]:
@@ -213,14 +264,13 @@ class HybridRouter:
 
         if merged:
             try:
-                flags = await OllamaJSON(judge).judge(text, merged[:16])
+                flags = await OllamaJSON(judge, self.retriever).judge(text, merged[:16])
             except Exception as exc:
                 logger.warning("Cross-model judge failed: %s; keeping deterministic candidates", exc)
                 flags = []
             if flags:
                 merged = [c for i, c in enumerate(merged[:16]) if i < len(flags) and flags[i] is True]
             else:
-                # Infrastructure failure is not a semantic rejection.
                 merged = [c for c in merged if c.category.startswith("syntax-")]
 
         if merged and self.lt.enabled:
@@ -235,7 +285,7 @@ class HybridRouter:
             await Qwen35Backend().warmup()
         else:
             model, _ = self._model_pair()
-            await OllamaJSON(model).draft("Проверка запуска.", "Проверка запуска.")
+            await OllamaJSON(model, self.retriever).draft("Проверка запуска.", "Проверка запуска.")
 
     def metrics(self) -> dict[str, Any]:
-        return {"preset": self.preset, "calls": self._calls, "local_detector": self.local.available, "languagetool_verifier": self.lt.enabled}
+        return {"preset": self.preset, "calls": self._calls, "local_detector": self.local.available, "retrieval": self.retriever.available, "retrieval_count": self.retriever.count, "languagetool_verifier": self.lt.enabled}
