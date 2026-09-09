@@ -12,7 +12,7 @@ import httpx
 
 from decision_engine import EditCandidate
 from local_rules import LocalRuleEngine
-from russian_mlm_corrector import RussianMlmCorrector
+from ollama_gec import OllamaGecSpecialist
 from russian_quality_models import SageRussianCorrector
 from safe_diff import diff_candidates as bounded_diff
 
@@ -31,10 +31,10 @@ class StackInfo:
 
 
 STACKS = {
-    "A": StackInfo("A", "production: deterministic rules + SAGE + Russian MLM + adaptive T-lite rescue", TLITE, False),
-    "B": StackInfo("B", "production-candidate: deterministic rules + SAGE + Russian MLM + adaptive GigaChat rescue", GIGACHAT, False),
-    "X": StackInfo("X", "experimental-fast: deterministic rules + SAGE + Russian MLM", "ruBert-base+SAGE", True),
-    "Y": StackInfo("Y", "experimental-max: deterministic rules + SAGE + Russian MLM + both Ollama rescues", "ruBert-base+SAGE+Ollama", True),
+    "A": StackInfo("A", "production: deterministic rules + SAGE + Qwen3.5 GEC + adaptive T-lite rescue", TLITE, False),
+    "B": StackInfo("B", "production-candidate: deterministic rules + SAGE + Qwen3.5 GEC + adaptive GigaChat rescue", GIGACHAT, False),
+    "X": StackInfo("X", "experimental-fast: deterministic rules + SAGE + Qwen3.5 GEC", "qwen3.5-gec+SAGE", True),
+    "Y": StackInfo("Y", "experimental-max: deterministic rules + SAGE + Qwen3.5 GEC + both Ollama rescues", "qwen3.5-gec+SAGE+Ollama", True),
 }
 
 
@@ -132,10 +132,10 @@ class HybridRouter:
         self.rules = LocalRuleEngine()
         self.retriever = RetrievalExamples()
         self.sage = SageRussianCorrector()
-        self.mlm = RussianMlmCorrector()
+        self.gec = OllamaGecSpecialist()
         self.protected_words = protected_words or set()
         self._calls = 0
-        self._stage_calls = {"rules": 0, "sage": 0, "mlm": 0, "draft_tlite": 0, "draft_giga": 0}
+        self._stage_calls = {"rules": 0, "sage": 0, "gec": 0, "draft_tlite": 0, "draft_giga": 0}
         self._stage_ms = {key: 0 for key in self._stage_calls}
         self._degraded: list[str] = []
 
@@ -152,8 +152,8 @@ class HybridRouter:
     def _candidate_weight(candidate: EditCandidate) -> float:
         if candidate.category.startswith("rule-"):
             return 1.00
-        if candidate.category == "russian-mlm":
-            return 0.94
+        if candidate.category == "russian-gec":
+            return 0.96
         if candidate.category == "sage-spell-punc":
             return 0.92
         if candidate.category.startswith("draft-"):
@@ -161,9 +161,14 @@ class HybridRouter:
         return candidate.confidence
 
     @staticmethod
-    def _has_sufficient_local_signal(candidates: list[EditCandidate]) -> bool:
-        high = [c for c in candidates if c.category.startswith("rule-") or c.category in {"russian-mlm", "sage-spell-punc"}]
-        return len(high) >= int(os.getenv("LOCAL_RESCUE_MIN_CANDIDATES", "2"))
+    def _needs_rescue(candidates: list[EditCandidate]) -> bool:
+        if not candidates:
+            return True
+        strong = [c for c in candidates if c.category in {"russian-gec", "sage-spell-punc"} or c.category.startswith("rule-")]
+        # A large number of low-value punctuation/spelling edits must not suppress
+        # a second grammar-oriented pass.
+        grammar = [c for c in strong if c.category == "russian-gec" or c.category.startswith("rule-")]
+        return len(grammar) < int(os.getenv("LOCAL_RESCUE_MIN_GRAMMAR_CANDIDATES", "1"))
 
     def _rank_candidates(self, candidates: list[EditCandidate]) -> list[EditCandidate]:
         unique: dict[tuple[str, str], EditCandidate] = {}
@@ -190,9 +195,9 @@ class HybridRouter:
         if self.sage.available:
             self._stage_calls["sage"] += 1
             jobs.append(("sage", self._timed("sage", self.sage.correct(text))))
-        if self.mlm.available:
-            self._stage_calls["mlm"] += 1
-            jobs.append(("mlm", self._timed("mlm", self.mlm.candidates(text))))
+        if self.gec.available:
+            self._stage_calls["gec"] += 1
+            jobs.append(("gec", self._timed("gec", self.gec.correct(text))))
         results = await asyncio.gather(*(job[1] for job in jobs), return_exceptions=True)
         candidates: list[EditCandidate] = list(deterministic)
         for (stage, _), result in zip(jobs, results):
@@ -201,18 +206,17 @@ class HybridRouter:
                 self._degraded.append(message)
                 logger.warning("%s candidate generator failed: %s", stage, result)
                 continue
+            draft = str(result or "").strip()
             if stage == "sage":
-                candidates.extend(bounded_diff(text, str(result or ""), "sage-spell-punc", 0.90))
-            else:
-                candidates.extend(result or [])
+                candidates.extend(bounded_diff(text, draft, "sage-spell-punc", 0.90))
+            elif stage == "gec":
+                candidates.extend(bounded_diff(text, draft, "russian-gec", 0.96))
         return self._rank_candidates(candidates)
 
     async def _rescue_candidates(self, text: str, context: str) -> list[EditCandidate]:
         models = self._rescue_models()
         if not models:
             return []
-        # The expensive generative channel is a rescue path only. It is not allowed
-        # to overwrite or veto high-confidence local/specialist candidates.
         jobs = []
         for stage, model in models:
             self._stage_calls[stage] += 1
@@ -225,25 +229,27 @@ class HybridRouter:
                 self._degraded.append(message)
                 logger.warning("%s rescue failed: %s", stage, result)
                 continue
-            if result:
-                candidates.extend(bounded_diff(text, str(result), stage, 0.70))
+            draft = str(result or "").strip()
+            if draft:
+                candidates.extend(bounded_diff(text, draft, stage, 0.70))
         return candidates
 
     async def candidates(self, text: str, context: str = "") -> list[EditCandidate]:
         self._calls += 1
         local = await self._local_candidates(text)
-        if self._has_sufficient_local_signal(local):
-            return local
-        rescue = await self._rescue_candidates(text, context)
-        return self._rank_candidates(local + rescue)
+        # The specialist GEC pass is mandatory for A/B/X/Y. Generic Ollama is a
+        # second opinion only when grammar coverage is still weak.
+        if self._needs_rescue(local):
+            rescue = await self._rescue_candidates(text, context)
+            return self._rank_candidates(local + rescue)
+        return local
 
     async def warmup(self) -> None:
         tasks: list[tuple[str, Any]] = []
         if self.sage.available:
             tasks.append(("sage", self.sage.warmup()))
-        if self.mlm.available:
-            tasks.append(("mlm", self.mlm.warmup()))
-        # Do not warm up expensive rescue models: they are loaded only when needed.
+        if self.gec.available:
+            tasks.append(("gec", self.gec.warmup()))
         results = await asyncio.gather(*(task[1] for task in tasks), return_exceptions=True)
         for (stage, _), result in zip(tasks, results):
             if isinstance(result, Exception):
@@ -252,7 +258,7 @@ class HybridRouter:
                 logger.warning("Warmup degraded: %s", message)
 
     def ollama_required(self) -> bool:
-        return False
+        return True
 
     @property
     def degraded(self) -> list[str]:
@@ -266,9 +272,9 @@ class HybridRouter:
             "retrieval": self.retriever.available,
             "retrieval_count": self.retriever.count,
             "sage": self.sage.metrics().__dict__,
-            "russian_mlm": self.mlm.metrics().__dict__,
+            "russian_gec": self.gec.metrics().__dict__,
             "stage_calls": dict(self._stage_calls),
             "stage_ms": dict(self._stage_ms),
-            "ollama_required": False,
+            "ollama_required": True,
             "degraded": self.degraded,
         }
