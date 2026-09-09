@@ -33,38 +33,16 @@ from hybrid_editor import STACKS
 print("v3.1 stacks:", ", ".join(sorted(STACKS)))
 PY
 
-SERVICE_USER=${SERVICE_USER:-service}
-SERVICE_HOME=$(getent passwd "$SERVICE_USER" 2>/dev/null | cut -d: -f6 || true)
-if [ -z "$SERVICE_HOME" ]; then
-  SERVICE_USER=$(id -un)
-  SERVICE_HOME=${HOME:-$(pwd)}
-fi
-
-HF_HOME="$SERVICE_HOME/.cache/huggingface"
-mkdir -p "$HF_HOME"
-chown -R "$SERVICE_USER":"$SERVICE_USER" "$HF_HOME" 2>/dev/null || true
-
-# X/Y use a text-only Russian GEC specialist. This deliberately avoids the
-# previous Qwen3.5 multimodal processor and its Pillow/Torchvision dependency.
+# X/Y now use the compact GGUF specialist through the same Ollama daemon as A/B.
+# Do not download the old 4B Transformers checkpoint into the FastAPI host.
 PRESET=${LLM_PRESET:-A}
+MODEL_ID=${GEC_SPECIALIST_MODEL:-hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0}
 if [ "$PRESET" = "X" ] || [ "$PRESET" = "Y" ]; then
-  MODEL_ID=${GEC_SPECIALIST_MODEL:-ReginaNasyrova/checkpoint_150_lora_grpo_upd_reward_GECExplanation-4B-sft-stage1-March2026}
-  if id "$SERVICE_USER" >/dev/null 2>&1; then
-    su -s /bin/sh "$SERVICE_USER" -c "HF_HOME='$HF_HOME' HUGGINGFACE_HUB_CACHE='$HF_HOME/hub' PYTHONPATH='$ROOT/..${PYTHONPATH:+:$PYTHONPATH}' GEC_SPECIALIST_MODEL='$MODEL_ID' '$PYTHON_BIN' - <<'PY'
-import os
-from huggingface_hub import snapshot_download
-model = os.environ['GEC_SPECIALIST_MODEL']
-snapshot_download(model)
-print(f'GEC specialist cached: {model}')
-PY"
+  if command -v ollama >/dev/null 2>&1; then
+    echo "Pulling compact X/Y specialist into Ollama: $MODEL_ID"
+    ollama pull "$MODEL_ID"
   else
-    HF_HOME="$HF_HOME" HUGGINGFACE_HUB_CACHE="$HF_HOME/hub" GEC_SPECIALIST_MODEL="$MODEL_ID" "$PYTHON_BIN" - <<'PY'
-import os
-from huggingface_hub import snapshot_download
-model = os.environ['GEC_SPECIALIST_MODEL']
-snapshot_download(model)
-print(f'GEC specialist cached: {model}')
-PY
+    echo "WARNING: ollama CLI not found; X/Y will pull the specialist lazily through OLLAMA_URL." >&2
   fi
 fi
 
