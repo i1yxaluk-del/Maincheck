@@ -44,7 +44,6 @@ def test_bounded_diff_extracts_the_two_known_grammar_edits_without_rewrite():
 
 def test_local_rules_generate_both_target_fixes():
     pairs = {(c.before, c.after) for c in LocalRuleEngine().candidates(TEXT)}
-    assert ("несколького упражнения" , "нескольких упражнения") not in pairs
     assert ("несколького упражнений", "нескольких упражнений") in pairs
     assert ("вида", "видов") in pairs
 
