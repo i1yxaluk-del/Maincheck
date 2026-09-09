@@ -24,11 +24,13 @@ export PYTHONPATH="$ROOT/..${PYTHONPATH:+:$PYTHONPATH}"
   qwen35_backend.py \
   syntax_candidates.py \
   safe_diff.py \
-  test_hybrid_editor.py
+  local_rules.py \
+  test_hybrid_editor.py \
+  test_v31.py
 
 "$PYTHON_BIN" - <<'PY'
 from hybrid_editor import STACKS
-print("v3 stacks:", ", ".join(sorted(STACKS)))
+print("v3.1 stacks:", ", ".join(sorted(STACKS)))
 PY
 
 SERVICE_USER=${SERVICE_USER:-service}
@@ -42,23 +44,28 @@ HF_HOME="$SERVICE_HOME/.cache/huggingface"
 mkdir -p "$HF_HOME"
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$HF_HOME" 2>/dev/null || true
 
-# X/Y are the only presets requiring the official Qwen3.5-4B weights.
-# A/B use the already deployed Ollama models and do not download anything.
+# X/Y use a text-only Russian GEC specialist. This deliberately avoids the
+# previous Qwen3.5 multimodal processor and its Pillow/Torchvision dependency.
 PRESET=${LLM_PRESET:-A}
 if [ "$PRESET" = "X" ] || [ "$PRESET" = "Y" ]; then
+  MODEL_ID=${GEC_SPECIALIST_MODEL:-ReginaNasyrova/checkpoint_150_lora_grpo_upd_reward_GECExplanation-4B-sft-stage1-March2026}
   if id "$SERVICE_USER" >/dev/null 2>&1; then
-    su -s /bin/sh "$SERVICE_USER" -c "HF_HOME='$HF_HOME' HUGGINGFACE_HUB_CACHE='$HF_HOME/hub' PYTHONPATH='$ROOT/..${PYTHONPATH:+:$PYTHONPATH}' '$PYTHON_BIN' - <<'PY'
+    su -s /bin/sh "$SERVICE_USER" -c "HF_HOME='$HF_HOME' HUGGINGFACE_HUB_CACHE='$HF_HOME/hub' PYTHONPATH='$ROOT/..${PYTHONPATH:+:$PYTHONPATH}' GEC_SPECIALIST_MODEL='$MODEL_ID' '$PYTHON_BIN' - <<'PY'
+import os
 from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen3.5-4B')
-print('Qwen3.5-4B cached.')
+model = os.environ['GEC_SPECIALIST_MODEL']
+snapshot_download(model)
+print(f'GEC specialist cached: {model}')
 PY"
   else
-    HF_HOME="$HF_HOME" HUGGINGFACE_HUB_CACHE="$HF_HOME/hub" "$PYTHON_BIN" - <<'PY'
+    HF_HOME="$HF_HOME" HUGGINGFACE_HUB_CACHE="$HF_HOME/hub" GEC_SPECIALIST_MODEL="$MODEL_ID" "$PYTHON_BIN" - <<'PY'
+import os
 from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen3.5-4B')
-print('Qwen3.5-4B cached.')
+model = os.environ['GEC_SPECIALIST_MODEL']
+snapshot_download(model)
+print(f'GEC specialist cached: {model}')
 PY
   fi
 fi
 
-echo "Setup complete. v3 presets: A (production), B (production-candidate), X/Y (experimental)."
+echo "Setup complete. v3.1 presets: A (production), B (production-candidate), X/Y (experimental)."
