@@ -1,8 +1,27 @@
 from __future__ import annotations
 
 import difflib
+import re
 
 from decision_engine import EditCandidate
+
+
+WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+")
+
+
+def _global_rewrite(source: str, corrected: str) -> bool:
+    """Reject drafts that alter the sentence globally instead of locally.
+
+    Local GEC may change several words, but a draft that substantially changes
+    character volume or word count is more likely a rewrite/paraphrase.
+    """
+    source_words = len(WORD_RE.findall(source))
+    corrected_words = len(WORD_RE.findall(corrected))
+    if source_words and abs(corrected_words - source_words) > 1:
+        return True
+    baseline = max(1, min(len(source), len(corrected)))
+    ratio = abs(len(corrected) - len(source)) / baseline
+    return ratio > 0.20
 
 
 def diff_candidates(source: str, corrected: str, category: str, confidence: float = 0.70) -> list[EditCandidate]:
@@ -12,6 +31,9 @@ def diff_candidates(source: str, corrected: str, category: str, confidence: floa
         return []
     if len(source.split("\n\n")) != len(corrected.split("\n\n")):
         return []
+    if _global_rewrite(source, corrected):
+        return []
+
     out: list[EditCandidate] = []
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, source, corrected, autojunk=False).get_opcodes():
         if tag == "equal":
@@ -21,10 +43,6 @@ def diff_candidates(source: str, corrected: str, category: str, confidence: floa
         if tag == "replace" and source[i1:i2] and corrected[j1:j2]:
             before, after = source[i1:i2], corrected[j1:j2]
         elif tag in {"insert", "delete"}:
-            # Convert insertion/deletion into a small anchored replacement so
-            # DecisionEngine can map it to one exact occurrence. This is how
-            # punctuation such as `требует корректировки` ->
-            # `требует, корректировки` survives without permitting empty-BEFORE edits.
             left_s, left_c = max(0, i1 - 12), max(0, j1 - 12)
             right_s, right_c = min(len(source), i2 + 12), min(len(corrected), j2 + 12)
             before, after = source[left_s:right_s], corrected[left_c:right_c]
