@@ -22,28 +22,51 @@ export PYTHONPATH="$ROOT/..${PYTHONPATH:+:$PYTHONPATH}"
   decision_engine.py \
   hybrid_editor.py \
   qwen35_backend.py \
+  russian_quality_models.py \
   syntax_candidates.py \
   safe_diff.py \
   local_rules.py \
   test_hybrid_editor.py \
-  test_v31.py
+  test_v31.py \
+  test_v4_cascade.py
 
 "$PYTHON_BIN" - <<'PY'
 from hybrid_editor import STACKS
-print("v3.1 stacks:", ", ".join(sorted(STACKS)))
+print("v4 stacks:", ", ".join(sorted(STACKS)))
 PY
 
-# X/Y now use the compact GGUF specialist through the same Ollama daemon as A/B.
-# Do not download the old 4B Transformers checkpoint into the FastAPI host.
-PRESET=${LLM_PRESET:-A}
-MODEL_ID=${GEC_SPECIALIST_MODEL:-hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0}
-if [ "$PRESET" = "X" ] || [ "$PRESET" = "Y" ]; then
-  if command -v ollama >/dev/null 2>&1; then
-    echo "Pulling compact X/Y specialist into Ollama: $MODEL_ID"
-    ollama pull "$MODEL_ID"
+SERVICE_USER=${SERVICE_USER:-service}
+SERVICE_HOME=$(getent passwd "$SERVICE_USER" 2>/dev/null | cut -d: -f6 || true)
+if [ -z "$SERVICE_HOME" ]; then
+  SERVICE_USER=$(id -un)
+  SERVICE_HOME=${HOME:-$(pwd)}
+fi
+
+HF_HOME="$SERVICE_HOME/.cache/huggingface"
+mkdir -p "$HF_HOME"
+chown -R "$SERVICE_USER":"$SERVICE_USER" "$HF_HOME" 2>/dev/null || true
+
+# SAGE is the fast dedicated Russian spelling/punctuation candidate generator used
+# by every preset. Cache it once instead of downloading on the first request.
+SAGE_MODEL=${SAGE_CORRECTOR_MODEL:-ai-forever/sage-fredt5-distilled-95m}
+if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  if id "$SERVICE_USER" >/dev/null 2>&1; then
+    su -s /bin/sh "$SERVICE_USER" -c "HF_HOME='$HF_HOME' HUGGINGFACE_HUB_CACHE='$HF_HOME/hub' '$PYTHON_BIN' - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+model = os.environ['SAGE_MODEL']
+snapshot_download(model)
+print(f'SAGE cached: {model}')
+PY" SAGE_MODEL="$SAGE_MODEL"
   else
-    echo "WARNING: ollama CLI not found; X/Y will pull the specialist lazily through OLLAMA_URL." >&2
+    HF_HOME="$HF_HOME" HUGGINGFACE_HUB_CACHE="$HF_HOME/hub" SAGE_MODEL="$SAGE_MODEL" "$PYTHON_BIN" - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+model = os.environ['SAGE_MODEL']
+snapshot_download(model)
+print(f'SAGE cached: {model}')
+PY
   fi
 fi
 
-echo "Setup complete. v3.1 presets: A (production), B (production-candidate), X/Y (experimental)."
+echo "Setup complete. v4 is a multi-candidate proofreading cascade: SAGE + Ollama draft/diagnostic + bounded diff + judge."
