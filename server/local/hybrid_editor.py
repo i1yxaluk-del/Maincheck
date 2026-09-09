@@ -12,7 +12,7 @@ import httpx
 
 from decision_engine import EditCandidate
 from local_rules import LocalRuleEngine
-from russian_gec_backend import RussianGecSpecialist
+from russian_mlm_corrector import RussianMlmCorrector
 from russian_quality_models import SageRussianCorrector
 from safe_diff import diff_candidates as bounded_diff
 
@@ -31,10 +31,10 @@ class StackInfo:
 
 
 STACKS = {
-    "A": StackInfo("A", "production: SAGE + SyntErr Qwen3.5-0.8B GEC + T-lite full draft", TLITE, False),
-    "B": StackInfo("B", "production-candidate: SAGE + SyntErr Qwen3.5-0.8B GEC + GigaChat full draft", GIGACHAT, False),
-    "X": StackInfo("X", "experimental-fast: SAGE + SyntErr Qwen3.5-0.8B GEC", "Qwen3.5-0.8B+SyntErr", True),
-    "Y": StackInfo("Y", "experimental-max: SAGE + SyntErr GEC + T-lite + GigaChat drafts", "T-lite+GigaChat", True),
+    "A": StackInfo("A", "production: deterministic rules + SAGE + Russian MLM + adaptive T-lite rescue", TLITE, False),
+    "B": StackInfo("B", "production-candidate: deterministic rules + SAGE + Russian MLM + adaptive GigaChat rescue", GIGACHAT, False),
+    "X": StackInfo("X", "experimental-fast: deterministic rules + SAGE + Russian MLM", "ruBert-base+SAGE", True),
+    "Y": StackInfo("Y", "experimental-max: deterministic rules + SAGE + Russian MLM + both Ollama rescues", "ruBert-base+SAGE+Ollama", True),
 }
 
 
@@ -46,12 +46,10 @@ class RetrievalExamples:
         try:
             from shared.gec_bank import GecBank
             from shared.rag_store import HashingEmbedder
-
             root = Path(__file__).resolve().parents[1] / "shared" / "gec_seed"
             configured = os.getenv("GEC_BANK_FILES", "").strip()
             paths = [Path(p.strip()) for p in configured.split(",") if p.strip()] if configured else [
-                root / "gec_bank_extended.jsonl",
-                root / "lexify_admin.jsonl",
+                root / "gec_bank_extended.jsonl", root / "lexify_admin.jsonl"
             ]
             existing = [p for p in paths if p.exists()]
             if not existing:
@@ -88,9 +86,9 @@ class OllamaDraftClient:
     def __init__(self, model: str, retriever: RetrievalExamples | None = None) -> None:
         self.url = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
         self.model = model
-        self.timeout = float(os.getenv("HYBRID_LLM_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", "180")))
-        self.ctx = int(os.getenv("HYBRID_NUM_CTX", "4096"))
-        self.predict = int(os.getenv("HYBRID_NUM_PREDICT", "512"))
+        self.timeout = float(os.getenv("HYBRID_LLM_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", "30")))
+        self.ctx = int(os.getenv("HYBRID_NUM_CTX", "3072"))
+        self.predict = int(os.getenv("HYBRID_NUM_PREDICT", "384"))
         self.threads = int(os.getenv("NUM_THREADS", "16"))
         self.keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
         self.retriever = retriever
@@ -98,12 +96,12 @@ class OllamaDraftClient:
     async def draft(self, text: str, context: str, temperature: float = 0.0) -> str:
         retrieval = self.retriever.prompt(text) if self.retriever else ""
         system = (
-            "Ты — корректор русского официально-делового текста. Исправь все объективные "
-            "ошибки орфографии, пунктуации, грамматики, согласования, управления и синтаксиса. "
-            "Сохрани смысл, термины, имена, числа и структуру. Не переписывай текст ради стиля. "
-            "Верни только исправленный текст."
+            "Ты — строгий корректор русского официально-делового текста. Исправляй только "
+            "объективные ошибки орфографии, пунктуации, грамматики, согласования, управления "
+            "и синтаксиса. Сохраняй порядок слов, смысл, термины, числа и структуру. "
+            "Не переписывай, не переставляй части предложения и не меняй стиль. Верни только текст."
         )
-        user = f"Контекст документа:\n{context[-3000:]}\n\n{retrieval}\n\nТекст:\n{text}"
+        user = f"Контекст:\n{context[-2200:]}\n\n{retrieval}\n\nТекст:\n{text}"
         payload = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -115,7 +113,7 @@ class OllamaDraftClient:
                 "num_ctx": self.ctx,
                 "num_predict": self.predict,
                 "num_thread": self.threads,
-                "repeat_penalty": 1.02,
+                "repeat_penalty": 1.05,
             },
         }
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -134,14 +132,14 @@ class HybridRouter:
         self.rules = LocalRuleEngine()
         self.retriever = RetrievalExamples()
         self.sage = SageRussianCorrector()
-        self.gec = RussianGecSpecialist()
+        self.mlm = RussianMlmCorrector()
         self.protected_words = protected_words or set()
         self._calls = 0
-        self._stage_calls = {"rules": 0, "sage": 0, "gec": 0, "draft_tlite": 0, "draft_giga": 0}
+        self._stage_calls = {"rules": 0, "sage": 0, "mlm": 0, "draft_tlite": 0, "draft_giga": 0}
         self._stage_ms = {key: 0 for key in self._stage_calls}
-        self._degraded = []
+        self._degraded: list[str] = []
 
-    def _draft_models(self) -> list[tuple[str, str]]:
+    def _rescue_models(self) -> list[tuple[str, str]]:
         if self.preset == "X":
             return []
         if self.preset == "Y":
@@ -154,13 +152,18 @@ class HybridRouter:
     def _candidate_weight(candidate: EditCandidate) -> float:
         if candidate.category.startswith("rule-"):
             return 1.00
-        if candidate.category == "russian-gec":
-            return 0.93
+        if candidate.category == "russian-mlm":
+            return 0.94
         if candidate.category == "sage-spell-punc":
-            return 0.90
+            return 0.92
         if candidate.category.startswith("draft-"):
-            return 0.80
+            return 0.70
         return candidate.confidence
+
+    @staticmethod
+    def _has_sufficient_local_signal(candidates: list[EditCandidate]) -> bool:
+        high = [c for c in candidates if c.category.startswith("rule-") or c.category in {"russian-mlm", "sage-spell-punc"}]
+        return len(high) >= int(os.getenv("LOCAL_RESCUE_MIN_CANDIDATES", "2"))
 
     def _rank_candidates(self, candidates: list[EditCandidate]) -> list[EditCandidate]:
         unique: dict[tuple[str, str], EditCandidate] = {}
@@ -180,53 +183,67 @@ class HybridRouter:
         finally:
             self._stage_ms[key] += int((time.perf_counter() - started) * 1000)
 
-    async def candidates(self, text: str, context: str = "") -> list[EditCandidate]:
-        self._calls += 1
+    async def _local_candidates(self, text: str) -> list[EditCandidate]:
         deterministic = self.rules.candidates(text)
         self._stage_calls["rules"] += 1
-
         jobs: list[tuple[str, Any]] = []
         if self.sage.available:
             self._stage_calls["sage"] += 1
             jobs.append(("sage", self._timed("sage", self.sage.correct(text))))
-        if self.gec.available:
-            self._stage_calls["gec"] += 1
-            jobs.append(("gec", self._timed("gec", self.gec.correct(text))))
-        for stage, model in self._draft_models():
-            self._stage_calls[stage] += 1
-            jobs.append((stage, self._timed(stage, OllamaDraftClient(model, self.retriever).draft(text, context, 0.0))))
-
+        if self.mlm.available:
+            self._stage_calls["mlm"] += 1
+            jobs.append(("mlm", self._timed("mlm", self.mlm.candidates(text))))
         results = await asyncio.gather(*(job[1] for job in jobs), return_exceptions=True)
         candidates: list[EditCandidate] = list(deterministic)
         for (stage, _), result in zip(jobs, results):
             if isinstance(result, Exception):
+                message = f"{stage}: {type(result).__name__}: {result}"
+                self._degraded.append(message)
                 logger.warning("%s candidate generator failed: %s", stage, result)
-                self._degraded.append(f"{stage}: {type(result).__name__}: {result}")
-                continue
-            draft = str(result or "").strip()
-            if not draft or draft == text.strip():
                 continue
             if stage == "sage":
-                candidates.extend(bounded_diff(text, draft, "sage-spell-punc", 0.90))
-            elif stage == "gec":
-                candidates.extend(bounded_diff(text, draft, "russian-gec", 0.93))
-            elif stage == "draft_tlite":
-                candidates.extend(bounded_diff(text, draft, "draft-tlite", 0.80))
-            elif stage == "draft_giga":
-                candidates.extend(bounded_diff(text, draft, "draft-giga", 0.80))
+                candidates.extend(bounded_diff(text, str(result or ""), "sage-spell-punc", 0.90))
+            else:
+                candidates.extend(result or [])
         return self._rank_candidates(candidates)
+
+    async def _rescue_candidates(self, text: str, context: str) -> list[EditCandidate]:
+        models = self._rescue_models()
+        if not models:
+            return []
+        # The expensive generative channel is a rescue path only. It is not allowed
+        # to overwrite or veto high-confidence local/specialist candidates.
+        jobs = []
+        for stage, model in models:
+            self._stage_calls[stage] += 1
+            jobs.append((stage, self._timed(stage, OllamaDraftClient(model, self.retriever).draft(text, context, 0.0))))
+        results = await asyncio.gather(*(job[1] for job in jobs), return_exceptions=True)
+        candidates: list[EditCandidate] = []
+        for (stage, _), result in zip(jobs, results):
+            if isinstance(result, Exception):
+                message = f"{stage}: {type(result).__name__}: {result}"
+                self._degraded.append(message)
+                logger.warning("%s rescue failed: %s", stage, result)
+                continue
+            if result:
+                candidates.extend(bounded_diff(text, str(result), stage, 0.70))
+        return candidates
+
+    async def candidates(self, text: str, context: str = "") -> list[EditCandidate]:
+        self._calls += 1
+        local = await self._local_candidates(text)
+        if self._has_sufficient_local_signal(local):
+            return local
+        rescue = await self._rescue_candidates(text, context)
+        return self._rank_candidates(local + rescue)
 
     async def warmup(self) -> None:
         tasks: list[tuple[str, Any]] = []
         if self.sage.available:
             tasks.append(("sage", self.sage.warmup()))
-        if self.gec.available:
-            tasks.append(("gec", self.gec.warmup()))
-        for stage, model in self._draft_models()[:1]:
-            tasks.append((stage, OllamaDraftClient(model, self.retriever).draft("Проверка запуска.", "", 0.0)))
-
-        if not tasks:
-            return
+        if self.mlm.available:
+            tasks.append(("mlm", self.mlm.warmup()))
+        # Do not warm up expensive rescue models: they are loaded only when needed.
         results = await asyncio.gather(*(task[1] for task in tasks), return_exceptions=True)
         for (stage, _), result in zip(tasks, results):
             if isinstance(result, Exception):
@@ -235,7 +252,7 @@ class HybridRouter:
                 logger.warning("Warmup degraded: %s", message)
 
     def ollama_required(self) -> bool:
-        return bool(self._draft_models())
+        return False
 
     @property
     def degraded(self) -> list[str]:
@@ -249,9 +266,9 @@ class HybridRouter:
             "retrieval": self.retriever.available,
             "retrieval_count": self.retriever.count,
             "sage": self.sage.metrics().__dict__,
-            "russian_gec": self.gec.metrics().__dict__,
+            "russian_mlm": self.mlm.metrics().__dict__,
             "stage_calls": dict(self._stage_calls),
             "stage_ms": dict(self._stage_ms),
-            "ollama_required": self.ollama_required(),
+            "ollama_required": False,
             "degraded": self.degraded,
         }
