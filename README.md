@@ -61,7 +61,7 @@ server/shared/
 ```bash
 ollama pull t-tech/T-lite-it-2.1:q4_K_M
 cd server/local
-cp .env.presets.example .env
+cp .env.example .env
 pip install -r requirements.txt
 sudo systemctl restart ai-suggester.service
 curl http://localhost:8000/health

@@ -55,6 +55,49 @@ class DecisionEngine:
         tokens = re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9_-]*", before)
         return any(t.casefold() in self.protected_words for t in tokens)
 
+    @staticmethod
+    def _changes_compound_term(before: str, after: str) -> bool:
+        """Hyphenated domain terms must not be replaced by a different lexeme."""
+        before_terms = re.findall(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)+", before)
+        after_terms = re.findall(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)+", after)
+        return bool(before_terms and before_terms != after_terms)
+
+    @staticmethod
+    def _is_unverified_llm_inflection(c: EditCandidate) -> bool:
+        """Reject model-only case/number substitutions of valid words.
+
+        A generative model cannot establish that a heading such as
+        ``Горючее`` must become genitive ``Горючего``. Such edits need a
+        deterministic syntax signal; otherwise they are often stylistic
+        hallucinations rather than corrections.
+        """
+        if not c.category.startswith(("model", "unknown", "languagetool", "surface")):
+            return False
+        if not re.fullmatch(r"[А-Яа-яЁё-]+", c.before) or not re.fullmatch(r"[А-Яа-яЁё-]+", c.after):
+            return False
+        try:
+            import pymorphy3
+            morph = pymorphy3.MorphAnalyzer()
+            before = morph.parse(c.before)
+            after = morph.parse(c.after)
+            if not before or not after or not before[0].is_known or not after[0].is_known:
+                return False
+            before_forms = {(p.normal_form, str(p.tag).split(",", 1)[0]) for p in before if p.is_known}
+            after_forms = {(p.normal_form, str(p.tag).split(",", 1)[0]) for p in after if p.is_known}
+            return bool(before_forms & after_forms)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _splits_or_merges_word(c: EditCandidate) -> bool:
+        """Reject model edits that change a word boundary without proof."""
+        word = r"[А-Яа-яЁёA-Za-z]+"
+        if re.fullmatch(word, c.before) and re.fullmatch(rf"{word} +{word}", c.after):
+            return c.category.startswith(("model", "unknown", "languagetool", "surface"))
+        if re.fullmatch(rf"{word} +{word}", c.before) and re.fullmatch(word, c.after):
+            return c.category.startswith(("model", "unknown", "languagetool", "surface"))
+        return False
+
     def validate(self, text: str, candidates: list[EditCandidate]) -> list[tuple[int, EditCandidate]]:
         accepted: list[tuple[int, EditCandidate]] = []
         occupied: list[tuple[int, int]] = []
@@ -66,6 +109,12 @@ class DecisionEngine:
             if c.before.replace("ё", "е").replace("Ё", "Е") == c.after.replace("ё", "е").replace("Ё", "Е"):
                 continue
             if self._protected(c.before):
+                continue
+            if self._changes_compound_term(c.before, c.after):
+                continue
+            if self._is_unverified_llm_inflection(c):
+                continue
+            if self._splits_or_merges_word(c):
                 continue
             # Ambiguous BEFORE text cannot be safely mapped to one occurrence.
             positions = [m.start() for m in re.finditer(re.escape(c.before), text)]

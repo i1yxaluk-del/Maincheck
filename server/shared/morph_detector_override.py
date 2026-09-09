@@ -120,7 +120,7 @@ def _install() -> None:
 
 
 # Allow a controlled opt-out for emergency rollback.
-if os.getenv("MORPH_DETECTOR_STRICT_AGREEMENT", "true").lower() in (
+if os.getenv("MORPH_DETECTOR_STRICT_AGREEMENT", "false").lower() in (
     "1", "true", "yes", "on",
 ):
     _install()

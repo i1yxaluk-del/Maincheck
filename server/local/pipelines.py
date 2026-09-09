@@ -19,6 +19,8 @@ from shared.rag_store import HashingEmbedder
 logger = logging.getLogger("ai_suggester.pipelines")
 
 A_MODEL = "t-tech/T-lite-it-2.1:q4_K_M"
+B_MODEL = os.getenv("B_MODEL", "hf.co/yandex/YandexGPT-5-Lite-8B-instruct-GGUF:Q4_K_M")
+C_MODEL = os.getenv("C_MODEL", "hf.co/ai-sage/GigaChat-3.1-Lightning-10B-A1.8B-Instruct-GGUF:Q4_K_M")
 F_MODEL = os.getenv("F_MODEL", "melsmm/Spell-Corrector-RU-4B")
 G_MODEL = os.getenv("G_VERIFIER_MODEL", A_MODEL)
 WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+(?:[-/][А-Яа-яЁёA-Za-z]+)*")
@@ -67,6 +69,8 @@ class StackInfo:
 
 STACKS = {
     "A": StackInfo("A", "production: edit-first T-lite + retrieval + morphology", A_MODEL, False),
+    "B": StackInfo("B", "experimental: YandexGPT-5-Lite structured edit pipeline", B_MODEL, True),
+    "C": StackInfo("C", "experimental: GigaChat 3.1 Lightning structured edit pipeline", C_MODEL, True),
     "F": StackInfo(
         "F",
         "experimental, NOT RECOMMENDED as of 2026-09-08: Spell-Corrector-RU-4B "
@@ -147,7 +151,6 @@ class MorphologyRescue:
                     if modifier[:1].isupper():
                         after = after[:1].upper() + after[1:]
                     out.append(EditCandidate(modifier, after, 0.97, "agreement", "согласование определения с существительным"))
-                    continue
             grammemes = {g for g in (source_parse.tag.number, source_parse.tag.case) if g}
             if not grammemes:
                 continue
@@ -258,7 +261,7 @@ def surface_candidates(source: str, corrected: str) -> list[EditCandidate]:
 class TliteClient:
     def __init__(self, retriever: RetrievalExamples) -> None:
         self.base_url = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-        self.model = A_MODEL
+        self.model = os.getenv("LLM_MODEL", A_MODEL)
         self.timeout = float(os.getenv("OLLAMA_TIMEOUT", "120"))
         self.num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
         self.num_predict = int(os.getenv("OLLAMA_NUM_PREDICT", "192"))
@@ -478,15 +481,56 @@ class LocalEditTagger:
         return list(unique.values())
 
 
+class LanguageToolTagger:
+    """Converts a local LanguageTool server response into safe candidates."""
+
+    def __init__(self) -> None:
+        self.client = None
+        if os.getenv("LANGUAGETOOL_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}:
+            return
+        try:
+            from shared.languagetool_client import LanguageToolClient, _parse_csv_env
+
+            self.client = LanguageToolClient(
+                url=os.getenv("LANGUAGETOOL_URL", "http://localhost:8081"),
+                language=os.getenv("LANGUAGETOOL_LANGUAGE", "ru-RU"),
+                enabled_categories=_parse_csv_env(os.getenv("LANGUAGETOOL_ENABLED_CATEGORIES")),
+                disabled_categories=_parse_csv_env(os.getenv("LANGUAGETOOL_DISABLED_CATEGORIES")),
+                disabled_rules=_parse_csv_env(os.getenv("LANGUAGETOOL_DISABLED_RULES")),
+                timeout=float(os.getenv("LANGUAGETOOL_TIMEOUT", "10")),
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.warning("LanguageTool unavailable: %s", exc)
+
+    @property
+    def available(self) -> bool:
+        return bool(self.client and self.client.available)
+
+    def candidates(self, text: str) -> list[EditCandidate]:
+        if not self.client:
+            return []
+        try:
+            return [
+                EditCandidate(m.before, m.suggestion, 0.88, f"languagetool:{m.category_id}", m.message)
+                for m in self.client.check(text)
+                if m.before and m.suggestion and m.before != m.suggestion
+            ]
+        except Exception as exc:  # pragma: no cover
+            logger.warning("LanguageTool candidate generation failed: %s", exc)
+            return []
+
+
 class StackRouter:
     def __init__(self, preset: str, morph_detector: Any) -> None:
         if preset not in STACKS:
-            raise RuntimeError(f"Unsupported LLM_PRESET={preset!r}; expected A, F or G")
+            raise RuntimeError(f"Unsupported LLM_PRESET={preset!r}; expected A, B, C, F or G")
         self.preset = preset
         self.info = STACKS[preset]
         self.retriever = RetrievalExamples()
         self.tlite = TliteClient(self.retriever)
+        self.tlite.model = self.info.model
         self.tagger = LocalEditTagger(morph_detector)
+        self.language_tool = LanguageToolTagger()
         self.f_backend = FBackend() if preset == "F" else None
 
     async def warmup(self) -> None:
@@ -499,12 +543,17 @@ class StackRouter:
         )
 
     async def candidates(self, text: str, context: str = "", protected_words: set[str] | None = None) -> list[EditCandidate]:
-        if self.preset == "A":
+        if self.preset in {"A", "B", "C"}:
             local = self.tagger.candidates(text)
-            generated = await self.tlite.candidates(text, context, protected_words)
-            return local + generated
+            lt = await asyncio.to_thread(self.language_tool.candidates, text)
+            generated = [
+                EditCandidate(c.before, c.after, c.confidence, f"model:{c.category}", c.reason)
+                for c in await self.tlite.candidates(text, context, protected_words)
+            ]
+            return local + lt + generated
         if self.preset == "G":
             local = self.tagger.candidates(text)
+            local.extend(await asyncio.to_thread(self.language_tool.candidates, text))
             return await self.tlite.verify(text, local)
         return await asyncio.to_thread(self.f_backend.correct, text)  # type: ignore[union-attr]
 
@@ -513,4 +562,6 @@ class StackRouter:
             "retrieval_enabled": self.retriever.available,
             "retrieval_pairs": self.retriever.count,
             "morphology_rescue_enabled": self.tagger.rescue.available,
+            "languagetool_enabled": self.language_tool.client is not None,
+            "languagetool_available": self.language_tool.available,
         }
