@@ -11,6 +11,8 @@ WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+(?:[-/][А-Яа-яЁёA-Za-z]+)*")
 YEAR_RE = re.compile(r"\b(\d{4})\s+([А-Яа-яЁё-]+)\s+(год(?:а|у|ом|е|ов|ы)?|лет)\b")
 PO_ONE_RE = re.compile(r"\bпо\s+одна\b", re.IGNORECASE)
 REQUIRES_COMMA_RE = re.compile(r"\bтребует,\s+(?P<word>[А-Яа-яЁё]+)")
+SEVERAL_BAD_RE = re.compile(r"\bнесколького\s+(?P<word>[А-Яа-яЁё-]+)", re.IGNORECASE)
+SEVERAL_SING_RE = re.compile(r"\bнескольких\s+(?P<word>[А-Яа-яЁё-]+)\b", re.IGNORECASE)
 
 
 class LocalRuleEngine:
@@ -64,7 +66,6 @@ class LocalRuleEngine:
             year_noun = next((p for p in nouns if p.normal_form == "год"), None)
             if year_noun is None:
                 continue
-            # Normative construction: "2026 учебный год".
             target = {"nomn", "sing", "masc"}
             fixed_adj = None
             for p in adj[:5]:
@@ -142,6 +143,49 @@ class LocalRuleEngine:
                 out.append(EditCandidate(word, fixed, 0.985, "rule-agreement", f"согласование с существительным «{noun}»"))
         return out
 
+    def _quantifier_noun(self, text: str) -> list[EditCandidate]:
+        """High-precision numeral/quantifier + noun agreement corrections."""
+        if not self.morph:
+            return []
+        out: list[EditCandidate] = []
+
+        # The form «несколького» is non-normative; before a noun it must be
+        # «нескольких» / «нескольким» / etc. Here we only target the clear
+        # genitive-plural construction (e.g. «несколького упражнений»).
+        for match in SEVERAL_BAD_RE.finditer(text):
+            word = match.group("word")
+            if any(
+                p.is_known and self._is_noun(p)
+                and p.tag.case == "gent" and p.tag.number == "plur"
+                for p in self.morph.parse(word)
+            ):
+                before = match.group(0)
+                after = re.sub(r"^несколького", "нескольких", before, flags=re.IGNORECASE)
+                out.append(EditCandidate(before, after, 0.995, "rule-quantifier", "форма количественного определительного местоимения"))
+
+        # «нескольких вида» / «нескольких отдела» etc. requires plural
+        # genitive on the noun: «нескольких видов / отделов».
+        for match in SEVERAL_SING_RE.finditer(text):
+            word = match.group("word")
+            parses = [
+                p for p in self.morph.parse(word)
+                if p.is_known and self._is_noun(p)
+                and p.tag.case == "gent" and p.tag.number == "sing"
+            ]
+            if not parses:
+                continue
+            fixed = None
+            for p in parses[:5]:
+                candidate = p.inflect({"gent", "plur"})
+                if candidate and candidate.word != word:
+                    fixed = candidate.word
+                    break
+            if fixed:
+                if word[:1].isupper():
+                    fixed = fixed[:1].upper() + fixed[1:]
+                out.append(EditCandidate(word, fixed, 0.99, "rule-quantifier", "согласование количественной группы с существительным"))
+        return out
+
     @staticmethod
     def _po_one(text: str) -> list[EditCandidate]:
         out = []
@@ -164,7 +208,13 @@ class LocalRuleEngine:
     def candidates(self, text: str) -> list[EditCandidate]:
         out: list[EditCandidate] = []
         seen: set[tuple[str, str, str]] = set()
-        for group in (self._year_phrase(text), self._modifier_noun(text), self._po_one(text), self._requires_comma(text)):
+        for group in (
+            self._year_phrase(text),
+            self._modifier_noun(text),
+            self._quantifier_noun(text),
+            self._po_one(text),
+            self._requires_comma(text),
+        ):
             for c in group:
                 key = (c.before, c.after, c.category)
                 if key not in seen:
