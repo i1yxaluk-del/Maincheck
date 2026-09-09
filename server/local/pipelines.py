@@ -20,14 +20,18 @@ logger = logging.getLogger("ai_suggester.pipelines")
 
 A_MODEL = "t-tech/T-lite-it-2.1:q4_K_M"
 B_MODEL = os.getenv("B_MODEL", "hf.co/yandex/YandexGPT-5-Lite-8B-instruct-GGUF:Q4_K_M")
-C_MODEL = os.getenv("C_MODEL", "hf.co/ai-sage/GigaChat-3.1-Lightning-10B-A1.8B-Instruct-GGUF:Q4_K_M")
+# This is the model ID available on the deployment Ollama registry. Do not
+# silently fall back to the similarly named, non-existent Lightning tag.
+C_MODEL = os.getenv("C_MODEL", "hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:latest")
 F_MODEL = os.getenv("F_MODEL", "melsmm/Spell-Corrector-RU-4B")
 G_MODEL = os.getenv("G_VERIFIER_MODEL", A_MODEL)
 WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+(?:[-/][А-Яа-яЁёA-Za-z]+)*")
 
-A_SYSTEM = """Ты — редактор русского официально-делового текста.
+A_SYSTEM = """Ты — корректор русского официально-делового текста, а не автор.
 
-Ищи только реальные локальные ошибки и возвращай только минимальные before -> after edits.
+Сначала молча проверь каждое предложение по контексту: синтаксическую связь,
+управление, согласование, орфографию и пунктуацию. Возвращай только реальные
+обязательные локальные edits; допустимую форму, заголовок или термин не меняй.
 
 РАЗРЕШЕНО:
 - явные опечатки и орфография;
@@ -43,6 +47,10 @@ A_SYSTEM = """Ты — редактор русского официально-д
 
 Каждый BEFORE обязан быть точной непрерывной подстрокой исходного текста.
 AFTER — только минимальная замена. Не возвращай исправленный текст целиком.
+Для согласования/управления BEFORE и AFTER должны включать минимальную
+контекстную группу (например, «на 2026 учебных год»), а не произвольную
+замену одной словоформы. Для пунктуации меняй только знак и ближайший пробел.
+Не исправляй стиль, семантически близкие термины или формы без доказательства.
 При сомнении верни пустой edits. Максимум 8 правок.
 """
 
