@@ -19,7 +19,7 @@ from hybrid_editor import STACKS, HybridRouter
 from shared.audit import AuditStore, Timer, count_changes
 from shared.logging_setup import setup_logger
 
-SERVER_VERSION = "7.0"
+SERVER_VERSION = "8.0"
 
 load_dotenv()
 
@@ -199,7 +199,7 @@ async def suggest(request: Request, text: UploadFile = File(...), context: Uploa
         result = f"ОШИБКА_СЕРВЕРА: {error}"
 
     logger.info(
-        "suggest v7 stack=%s len=%d ctx=%d candidates=%d accepted=%d stages=%s stage_ms=%s dur=%dms degraded=%d",
+        "suggest v8 stack=%s len=%d ctx=%d candidates=%d accepted=%d stages=%s stage_ms=%s dur=%dms degraded=%d",
         router.info.name,
         len(raw_text),
         len(raw_ctx),
