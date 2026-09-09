@@ -106,8 +106,6 @@ class OllamaJSON:
 
 
 class LocalContextEngine:
-    """Cheap local candidate source; dependency-aware detector is added separately."""
-
     def __init__(self) -> None:
         self.morph = None
         try:
@@ -157,27 +155,8 @@ class LanguageToolVerifier:
 
 
 def diff_candidates(source: str, corrected: str, category: str, confidence: float = 0.70) -> list[EditCandidate]:
-    if not source or not corrected or source == corrected:
-        return []
-    if source.count("\n") != corrected.count("\n"):
-        return []
-    if len(source.split("\n\n")) != len(corrected.split("\n\n")):
-        return []
-    out: list[EditCandidate] = []
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, source, corrected, autojunk=False).get_opcodes():
-        if tag == "equal":
-            continue
-        before, after = source[i1:i2], corrected[j1:j2]
-        if "\n" in before or "\n" in after:
-            return []
-        if len(before) > 90 or len(after) > 90:
-            return []
-        if not before and not after:
-            continue
-        if before.strip() == after.strip():
-            continue
-        out.append(EditCandidate(before, after, confidence, category, "локальный diff исходного и исправленного текста"))
-    return out
+    from safe_diff import diff_candidates as bounded_diff
+    return bounded_diff(source, corrected, category, confidence)
 
 
 class HybridRouter:
