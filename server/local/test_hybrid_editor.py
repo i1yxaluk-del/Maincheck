@@ -1,6 +1,6 @@
 from decision_engine import DecisionEngine
-from hybrid_editor import STACKS, diff_candidates
-from safe_diff import diff_candidates as safe_diff_candidates
+from hybrid_editor import STACKS
+from safe_diff import diff_candidates
 
 
 REGRESSION = (
@@ -18,11 +18,11 @@ def test_new_preset_contract():
 
 
 def test_safe_diff_rejects_paragraph_rewrite():
-    assert safe_diff_candidates("одна строка.\nвторая строка.", "одна строка. вторая строка.", "model-draft") == []
+    assert diff_candidates("одна строка.\nвторая строка.", "одна строка. вторая строка.", "model-draft") == []
 
 
 def test_safe_diff_represents_punctuation_insertion_as_bounded_edit():
-    edits = safe_diff_candidates("требует корректировки", "требует, корректировки", "model-draft")
+    edits = diff_candidates("требует корректировки", "требует, корректировки", "model-draft")
     assert edits
     engine = DecisionEngine(min_confidence=0.5, max_changes=4)
     corrected, accepted = engine.apply("требует корректировки", edits)
@@ -38,6 +38,6 @@ def test_model_wholesale_rewrite_is_rejected():
 
 def test_source_text_regression_has_no_structure_change():
     corrected = REGRESSION.replace("служебная", "служебной").replace("учебных год", "учебный год").replace("по одна и той", "по одной и той")
-    edits = safe_diff_candidates(REGRESSION, corrected, "model-draft")
+    edits = diff_candidates(REGRESSION, corrected, "model-draft")
     assert edits
     assert all("\n" not in c.before and "\n" not in c.after for c in edits)
