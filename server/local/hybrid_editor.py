@@ -31,10 +31,10 @@ class StackInfo:
 
 
 STACKS = {
-    "A": StackInfo("A", "production: deterministic rules + SAGE + Qwen3.5 GEC + adaptive T-lite rescue", TLITE, False),
-    "B": StackInfo("B", "production-candidate: deterministic rules + SAGE + Qwen3.5 GEC + adaptive GigaChat rescue", GIGACHAT, False),
-    "X": StackInfo("X", "experimental-fast: deterministic rules + SAGE + Qwen3.5 GEC", "qwen3.5-gec+SAGE", True),
-    "Y": StackInfo("Y", "experimental-max: deterministic rules + SAGE + Qwen3.5 GEC + both Ollama rescues", "qwen3.5-gec+SAGE+Ollama", True),
+    "A": StackInfo("A", "production: deterministic grammar-first + SAGE + gated Qwen3.5 GEC + adaptive T-lite rescue", TLITE, False),
+    "B": StackInfo("B", "production-candidate: deterministic grammar-first + SAGE + gated Qwen3.5 GEC + adaptive GigaChat rescue", GIGACHAT, False),
+    "X": StackInfo("X", "experimental-fast: deterministic grammar-first + SAGE + gated Qwen3.5 GEC", "qwen3.5-gec+SAGE", True),
+    "Y": StackInfo("Y", "experimental-max: deterministic grammar-first + SAGE + gated Qwen3.5 GEC + both Ollama rescues", "qwen3.5-gec+SAGE+Ollama", True),
 }
 
 
@@ -96,10 +96,14 @@ class OllamaDraftClient:
     async def draft(self, text: str, context: str, temperature: float = 0.0) -> str:
         retrieval = self.retriever.prompt(text) if self.retriever else ""
         system = (
-            "Ты — строгий корректор русского официально-делового текста. Исправляй только "
-            "объективные ошибки орфографии, пунктуации, грамматики, согласования, управления "
-            "и синтаксиса. Сохраняй порядок слов, смысл, термины, числа и структуру. "
-            "Не переписывай, не переставляй части предложения и не меняй стиль. Верни только текст."
+            "Ты — специализированный корректор русского официально-делового текста. "
+            "Ищи только объективные ошибки орфографии, пунктуации, грамматики, "
+            "согласования, управления и синтаксиса. Особенно проверяй падеж, число "
+            "и управление числительных/местоимений и существительных. "
+            "Сохраняй все слова, порядок слов, смысл, термины, числа, переносы строк и структуру. "
+            "Не перефразируй и не форматируй текст. Ничего не добавляй и не удаляй, "
+            "кроме символов и слов, необходимых для исправления объективной ошибки. "
+            "Верни только исправленный текст целиком."
         )
         user = f"Контекст:\n{context[-2200:]}\n\n{retrieval}\n\nТекст:\n{text}"
         payload = {
@@ -161,12 +165,25 @@ class HybridRouter:
         return candidate.confidence
 
     @staticmethod
+    def _grammar_gate_enabled() -> bool:
+        return os.getenv("LOCAL_GRAMMAR_GATE", "true").lower() in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _grammar_gate_hit(cls, candidates: list[EditCandidate]) -> bool:
+        if not cls._grammar_gate_enabled():
+            return False
+        configured = os.getenv(
+            "LOCAL_GRAMMAR_GATE_CATEGORIES",
+            "rule-quantifier,rule-government,rule-agreement",
+        )
+        categories = {item.strip() for item in configured.split(",") if item.strip()}
+        return any(candidate.category in categories for candidate in candidates)
+
+    @staticmethod
     def _needs_rescue(candidates: list[EditCandidate]) -> bool:
         if not candidates:
             return True
         strong = [c for c in candidates if c.category in {"russian-gec", "sage-spell-punc"} or c.category.startswith("rule-")]
-        # A large number of low-value punctuation/spelling edits must not suppress
-        # a second grammar-oriented pass.
         grammar = [c for c in strong if c.category == "russian-gec" or c.category.startswith("rule-")]
         return len(grammar) < int(os.getenv("LOCAL_RESCUE_MIN_GRAMMAR_CANDIDATES", "1"))
 
@@ -191,13 +208,18 @@ class HybridRouter:
     async def _local_candidates(self, text: str) -> list[EditCandidate]:
         deterministic = self.rules.candidates(text)
         self._stage_calls["rules"] += 1
+        gate_hit = self._grammar_gate_hit(deterministic)
+        if gate_hit:
+            logger.info("Grammar gate hit: skipping expensive GEC specialist for this text")
+
         jobs: list[tuple[str, Any]] = []
         if self.sage.available:
             self._stage_calls["sage"] += 1
             jobs.append(("sage", self._timed("sage", self.sage.correct(text))))
-        if self.gec.available:
+        if self.gec.available and not gate_hit:
             self._stage_calls["gec"] += 1
             jobs.append(("gec", self._timed("gec", self.gec.correct(text))))
+
         results = await asyncio.gather(*(job[1] for job in jobs), return_exceptions=True)
         candidates: list[EditCandidate] = list(deterministic)
         for (stage, _), result in zip(jobs, results):
@@ -237,8 +259,8 @@ class HybridRouter:
     async def candidates(self, text: str, context: str = "") -> list[EditCandidate]:
         self._calls += 1
         local = await self._local_candidates(text)
-        # The specialist GEC pass is mandatory for A/B/X/Y. Generic Ollama is a
-        # second opinion only when grammar coverage is still weak.
+        if self._grammar_gate_hit(local):
+            return local
         if self._needs_rescue(local):
             rescue = await self._rescue_candidates(text, context)
             return self._rank_candidates(local + rescue)
