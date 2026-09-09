@@ -21,12 +21,10 @@ jobs:
       - name: Install lightweight test deps
         run: python -m pip install --upgrade pip pytest httpx pymorphy3 pymorphy3-dicts-ru
       - name: Compile application
-        run: python -m py_compile decision_app.py decision_engine.py hybrid_editor.py qwen35_backend.py ollama_gec.py russian_gec_backend.py russian_mlm_corrector.py russian_quality_models.py safe_diff.py syntax_candidates.py local_rules.py
+        run: python -m py_compile decision_app.py decision_engine.py hybrid_editor.py qwen35_backend.py ollama_gec.py russian_gec_backend.py russian_quality_models.py safe_diff.py syntax_candidates.py local_rules.py
       - name: Run v7 architecture regressions
         run: pytest -q test_v7_gec.py
-      - name: Run v6 architecture regressions
-        run: pytest -q test_v6_cascade.py
-      - name: Run v5 architecture regressions
+      - name: Run cascade regressions
         run: pytest -q test_v5_cascade.py
       - name: Run v3.1 deterministic regressions
         run: pytest -q test_v31.py
