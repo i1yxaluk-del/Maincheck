@@ -6,7 +6,7 @@ from safe_diff import diff_candidates
 TEXT = "неправильно определяется оценка за стрельбу при выполнении сотрудником несколького упражнений стрельб, из одного или нескольких вида оружия"
 
 
-def test_v7_stack_contract_is_preserved_for_compatibility():
+def test_v8_stack_contract_is_preserved_for_compatibility():
     assert set(STACKS) == {"A", "B", "X", "Y"}
     assert "SAGE" in STACKS["A"].description
     assert "Qwen3.5 GEC" in STACKS["A"].description
@@ -14,12 +14,12 @@ def test_v7_stack_contract_is_preserved_for_compatibility():
     assert STACKS["B"].model == "hf.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF:latest"
 
 
-def test_bounded_diff_extracts_multiple_error_sites():
+def test_bounded_diff_extracts_multiple_local_changes():
     corrected = TEXT.replace("несколького", "нескольких").replace("вида оружия", "видов оружия")
     candidates = diff_candidates(TEXT, corrected, "russian-gec", 0.93)
     pairs = {(c.before, c.after) for c in candidates}
-    assert any("несколького" in before and "нескольких" in after for before, after in pairs)
-    assert any("вида" in before and "видов" in after for before, after in pairs)
+    assert ("ого", "их") in pairs
+    assert ("а", "ов") in pairs
 
 
 def test_router_ranks_specialists_above_generic_draft():
