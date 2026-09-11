@@ -34,11 +34,40 @@ jobs:
         run: >-
           pytest -q test_reasoning_cascade.py test_rupunct_stage.py
           test_punctuation_pipeline.py test_structural_punctuation.py
-          test_v15_regressions.py
       - name: Validate punctuation corpus
         run: pytest -q test_punctuation_corpus.py
       - name: Run remaining local regressions
         run: pytest -q test_v31.py test_hybrid_editor.py test_pipelines.py
+
+  v15-format-protocol:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server/local
+    env:
+      PYTHONPATH: ${{ github.workspace }}/server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
+      - run: pytest -q test_v15_regressions.py -k 'punctuation_deletion or non_deletion'
+
+  v15-language-rules:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server/local
+    env:
+      PYTHONPATH: ${{ github.workspace }}/server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
+      - run: pytest -q test_v15_regressions.py -k 'not punctuation_deletion and not non_deletion'
 
   quality-gate:
     runs-on: ubuntu-latest
