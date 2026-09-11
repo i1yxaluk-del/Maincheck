@@ -8,25 +8,15 @@ Type=simple
 User=service
 WorkingDirectory=/home/service/llama/server/local
 Environment="PYTHONPATH=/home/service/llama/server"
-# Сервер двухсокетный (2 × Xeon E5-2690 v4, NUMA node0 = CPU 0-15,
-# node1 = CPU 16-31). Python/torch держим на одном узле, чтобы не платить
-# за межсокетные обращения к памяти: для мелких CPU-моделей это основной
-# источник разброса latency. Ollama при этом остаётся на node1
-# (см. Инструкции/PERFORMANCE_TUNING.md).
 AllowedCPUs=0-15
-# Глибц по умолчанию открывает арену на поток; при 16 потоках torch это
-# десятки лишних сегментов и рост RSS без выигрыша.
 Environment="MALLOC_ARENA_MAX=2"
 Environment="OMP_NUM_THREADS=8"
 Environment="MKL_NUM_THREADS=8"
 Environment="OPENBLAS_NUM_THREADS=8"
 Environment="TOKENIZERS_PARALLELISM=false"
-# Модели загружаются офлайн из локального кэша HuggingFace; сетевых
-# обращений при старте быть не должно.
 Environment="HF_HUB_DISABLE_TELEMETRY=1"
 EnvironmentFile=-/home/service/llama/server/local/.env
-ExecStart=/home/service/llama/server/local/venv/bin/uvicorn decision_app:app --host 0.0.0.0 --port 8000
-# Прогрев SAGE + GEC на холодном старте занимает 25-30 с.
+ExecStart=/home/service/llama/server/local/venv/bin/uvicorn decision_app_v10:app --host 0.0.0.0 --port 8000
 TimeoutStartSec=180
 Restart=on-failure
 RestartSec=5
