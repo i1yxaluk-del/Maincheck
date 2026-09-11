@@ -26,11 +26,7 @@ class V15RuleExtension:
 
     @staticmethod
     def _instrumental_plural_surface(suffix: str, head: str) -> str | None:
-        """Correct -ым/-им before a noun ending in plural instrumental -ами/-ями.
-
-        These endings encode the number/case relation directly and remain usable
-        for official compounds that are absent from OpenCorpora.
-        """
+        """Correct -ым/-им before a noun ending in plural instrumental -ами/-ями."""
         if not head.casefold().endswith(("ами", "ями")):
             return None
         lower = suffix.casefold()
@@ -49,26 +45,34 @@ class V15RuleExtension:
 
             surface = self._instrumental_plural_surface(suffix, head)
             if surface:
-                produced = {prefix + "-" + surface}
+                produced_suffixes = {surface}
             else:
                 head_parses = self.morph.noun_parses(head)
                 suffix_parses = self.morph.attributive_parses(suffix)
                 if not head_parses or not suffix_parses or self.morph.pair_agrees(suffix, head):
                     continue
-                produced: set[str] = set()
+                produced_suffixes: set[str] = set()
                 for head_parse in head_parses[:8]:
                     fixed_suffix = self.morph.inflect_modifier(suffix, head_parse)
                     if fixed_suffix:
-                        produced.add(prefix + "-" + fixed_suffix)
+                        produced_suffixes.add(fixed_suffix)
 
-            produced = {p for p in produced if p.casefold() != modifier.casefold()}
-            if len(produced) != 1:
+            produced_suffixes = {
+                p for p in produced_suffixes if p.casefold() != suffix.casefold()
+            }
+            if len(produced_suffixes) != 1:
                 continue
-            fixed = preserve_capitalization(modifier, preserve_yo(modifier, produced.pop()))
+            fixed_suffix = preserve_capitalization(
+                suffix, preserve_yo(suffix, produced_suffixes.pop())
+            )
+            # Change only the final component. Apart from preserving Writer
+            # formatting, this intentionally keeps the protected compound-term
+            # guard active against lexical replacement of the whole compound.
+            suffix_start = match.start("modifier") + len(prefix) + 1
             out.append(EditCandidate(
-                modifier, fixed, 0.988, "rule-compound-agreement",
+                suffix, fixed_suffix, 0.988, "rule-compound-agreement",
                 f"согласование составного определения с существительным «{head}»",
-                start=match.start("modifier"),
+                start=suffix_start,
             ))
         return out
 
