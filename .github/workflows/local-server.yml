@@ -22,17 +22,19 @@ jobs:
         run: python -m pip install --upgrade pip pytest httpx pymorphy3 pymorphy3-dicts-ru
       - name: Compile application
         run: >-
-          python -m py_compile decision_app.py decision_app_v10.py decision_engine.py hybrid_editor.py
-          morphology.py np_agreement.py spellcheck.py verification.py segmentation.py
-          llm_text.py languagetool_stage.py ollama_gec.py russian_quality_models.py
-          safe_diff.py syntax_candidates.py local_rules.py v10_rules.py qwen35_backend.py
-          russian_gec_backend.py
+          python -m py_compile decision_app.py decision_app_v10.py decision_app_v11.py
+          decision_engine.py hybrid_editor.py morphology.py np_agreement.py spellcheck.py
+          verification.py segmentation.py llm_text.py languagetool_stage.py ollama_gec.py
+          russian_quality_models.py safe_diff.py syntax_candidates.py local_rules.py v10_rules.py
+          reasoning_cascade.py qwen35_backend.py russian_gec_backend.py
       - name: Run v9 agreement regressions
         run: pytest -q test_v9_agreement.py
       - name: Run v9 pipeline regressions
         run: pytest -q test_v9_pipeline.py
       - name: Run v10 production regressions
         run: pytest -q test_v10_regressions.py
+      - name: Run reasoner cascade regressions
+        run: pytest -q test_reasoning_cascade.py
       - name: Run deterministic regressions
         run: pytest -q test_v31.py
       - name: Run bounded diff regressions

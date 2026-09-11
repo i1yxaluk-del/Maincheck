@@ -16,8 +16,8 @@ Environment="OPENBLAS_NUM_THREADS=8"
 Environment="TOKENIZERS_PARALLELISM=false"
 Environment="HF_HUB_DISABLE_TELEMETRY=1"
 EnvironmentFile=-/home/service/llama/server/local/.env
-ExecStart=/home/service/llama/server/local/venv/bin/uvicorn decision_app_v10:app --host 0.0.0.0 --port 8000
-TimeoutStartSec=180
+ExecStart=/home/service/llama/server/local/venv/bin/uvicorn decision_app_v11:app --host 0.0.0.0 --port 8000
+TimeoutStartSec=240
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=8192
