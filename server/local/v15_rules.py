@@ -26,13 +26,7 @@ class V15RuleExtension:
 
     @staticmethod
     def _instrumental_plural_surface(suffix: str, head_parses) -> str | None:
-        """Safe fallback for compound words absent from dictionaries.
-
-        Russian full adjectives ending in -ым/-им are singular instrumental or
-        plural dative, never plural instrumental. A noun unambiguously parsed as
-        instrumental plural requires -ыми/-ими. The transformation is therefore
-        grammatical rather than lexical.
-        """
+        """Correct -ым/-им before an instrumental-plural noun to -ыми/-ими."""
         has_ablt_plural = any(
             p.tag.case == "ablt" and p.tag.number == "plur" for p in head_parses
         )
@@ -55,17 +49,23 @@ class V15RuleExtension:
             head_parses = self.morph.noun_parses(head)
             if not suffix_parses or not head_parses:
                 continue
-            if self.morph.pair_agrees(suffix, head):
-                continue
 
-            produced: set[str] = set()
+            # This surface relation is unambiguous and must be evaluated before
+            # pair_agrees(): pymorphy may expose rare homonymous readings that
+            # otherwise protect an objectively impossible -ым/-им + -ами/-ями
+            # combination.
             surface = self._instrumental_plural_surface(suffix, head_parses)
             if surface:
-                produced.add(prefix + "-" + surface)
-            for head_parse in head_parses[:8]:
-                fixed_suffix = self.morph.inflect_modifier(suffix, head_parse)
-                if fixed_suffix:
-                    produced.add(prefix + "-" + fixed_suffix)
+                produced = {prefix + "-" + surface}
+            else:
+                if self.morph.pair_agrees(suffix, head):
+                    continue
+                produced: set[str] = set()
+                for head_parse in head_parses[:8]:
+                    fixed_suffix = self.morph.inflect_modifier(suffix, head_parse)
+                    if fixed_suffix:
+                        produced.add(prefix + "-" + fixed_suffix)
+
             produced = {p for p in produced if p.casefold() != modifier.casefold()}
             if len(produced) != 1:
                 continue
@@ -80,9 +80,7 @@ class V15RuleExtension:
     def _coordinated_modifier_comma(self, text: str) -> list[EditCandidate]:
         out: list[EditCandidate] = []
         for match in COORDINATED_MODIFIERS_RE.finditer(text):
-            first, second, head = (
-                match.group("first"), match.group("second"), match.group("head")
-            )
+            first, second, head = match.group("first"), match.group("second"), match.group("head")
             first_parses = self.morph.attributive_parses(first)
             second_parses = self.morph.attributive_parses(second)
             head_parses = self.morph.noun_parses(head)
