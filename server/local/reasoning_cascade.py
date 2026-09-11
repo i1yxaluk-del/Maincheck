@@ -7,7 +7,10 @@ from dataclasses import dataclass
 
 import httpx
 
+from decision_engine import EditCandidate
 from llm_text import sanitize
+from safe_diff import diff_candidates
+from segmentation import split_sentences, strip_enumeration
 
 DEFAULT_REASONER = "deepseek-r1:7b-qwen-distill-q4_K_M"
 DEFAULT_EXTRACTOR = "hf.co/loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG:Q4_0"
@@ -102,6 +105,22 @@ class ReasoningCascade:
         if not cleaned:
             raise RuntimeError("extractor did not return a safe local correction")
         return cleaned
+
+    async def candidates(self, text: str, context: str = "") -> list[EditCandidate]:
+        if not self.enabled:
+            return []
+        out: list[EditCandidate] = []
+        for segment in [strip_enumeration(s) for s in split_sentences(text)][:self.max_sentences]:
+            try:
+                corrected = await self.correct(segment.text, context)
+            except Exception:
+                self._failures += 1
+                continue
+            out.extend(diff_candidates(
+                segment.text, corrected, "russian-gec-reasoning", 0.86,
+                offset=segment.start,
+            ))
+        return out
 
     def metrics(self) -> ReasoningCascadeStats:
         return ReasoningCascadeStats(
