@@ -30,7 +30,9 @@ jobs:
       - name: Run architecture regressions
         run: pytest -q test_v9_agreement.py test_v9_pipeline.py test_v10_regressions.py
       - name: Run model routing regressions
-        run: pytest -q test_reasoning_cascade.py test_rupunct_stage.py test_punctuation_pipeline.py
+        run: >-
+          pytest -q test_reasoning_cascade.py test_rupunct_stage.py
+          test_punctuation_pipeline.py test_structural_punctuation.py
       - name: Validate punctuation corpus
         run: pytest -q test_punctuation_corpus.py
       - name: Run remaining local regressions
