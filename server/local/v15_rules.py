@@ -24,24 +24,48 @@ class V15RuleExtension:
     def __init__(self, morphology: Morphology | None = None) -> None:
         self.morph = morphology or get_morphology()
 
+    @staticmethod
+    def _instrumental_plural_surface(suffix: str, head_parses) -> str | None:
+        """Safe fallback for compound words absent from dictionaries.
+
+        Russian full adjectives ending in -ым/-им are singular instrumental or
+        plural dative, never plural instrumental. A noun unambiguously parsed as
+        instrumental plural requires -ыми/-ими. The transformation is therefore
+        grammatical rather than lexical.
+        """
+        has_ablt_plural = any(
+            p.tag.case == "ablt" and p.tag.number == "plur" for p in head_parses
+        )
+        if not has_ablt_plural:
+            return None
+        lower = suffix.casefold()
+        if lower.endswith("ым"):
+            return suffix[:-2] + ("ЫМИ" if suffix[-2:].isupper() else "ыми")
+        if lower.endswith("им"):
+            return suffix[:-2] + ("ИМИ" if suffix[-2:].isupper() else "ими")
+        return None
+
     def _compound_modifier_agreement(self, text: str) -> list[EditCandidate]:
         out: list[EditCandidate] = []
         for match in COMPOUND_MODIFIER_RE.finditer(text):
             modifier = match.group("modifier")
             head = match.group("head")
-            suffix = modifier.rsplit("-", 1)[1]
+            prefix, suffix = modifier.rsplit("-", 1)
             suffix_parses = self.morph.attributive_parses(suffix)
             head_parses = self.morph.noun_parses(head)
             if not suffix_parses or not head_parses:
                 continue
-            # Any valid reading protects the source from overcorrection.
             if self.morph.pair_agrees(suffix, head):
                 continue
+
             produced: set[str] = set()
+            surface = self._instrumental_plural_surface(suffix, head_parses)
+            if surface:
+                produced.add(prefix + "-" + surface)
             for head_parse in head_parses[:8]:
                 fixed_suffix = self.morph.inflect_modifier(suffix, head_parse)
                 if fixed_suffix:
-                    produced.add(modifier.rsplit("-", 1)[0] + "-" + fixed_suffix)
+                    produced.add(prefix + "-" + fixed_suffix)
             produced = {p for p in produced if p.casefold() != modifier.casefold()}
             if len(produced) != 1:
                 continue
@@ -71,13 +95,10 @@ class V15RuleExtension:
             )
             if not same_group:
                 continue
-            # Anchor the deletion to the first modifier so the LibreOffice
-            # client applies a local edit instead of replacing the paragraph.
             comma_pos = match.start("comma") + match.group("comma").rfind(",")
             before = text[match.start("first"):comma_pos + 1]
-            after = before[:-1]
             out.append(EditCandidate(
-                before, after, 0.995, "rule-coordinated-modifiers",
+                before, before[:-1], 0.995, "rule-coordinated-modifiers",
                 "перед одиночным союзом между однородными определениями запятая не ставится",
                 start=match.start("first"),
             ))
