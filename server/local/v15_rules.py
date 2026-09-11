@@ -27,10 +27,7 @@ class V15RuleExtension:
     @staticmethod
     def _instrumental_plural_surface(suffix: str, head_parses) -> str | None:
         """Correct -ым/-им before an instrumental-plural noun to -ыми/-ими."""
-        has_ablt_plural = any(
-            p.tag.case == "ablt" and p.tag.number == "plur" for p in head_parses
-        )
-        if not has_ablt_plural:
+        if not any(p.tag.case == "ablt" and p.tag.number == "plur" for p in head_parses):
             return None
         lower = suffix.casefold()
         if lower.endswith("ым"):
@@ -45,20 +42,19 @@ class V15RuleExtension:
             modifier = match.group("modifier")
             head = match.group("head")
             prefix, suffix = modifier.rsplit("-", 1)
-            suffix_parses = self.morph.attributive_parses(suffix)
             head_parses = self.morph.noun_parses(head)
-            if not suffix_parses or not head_parses:
+            if not head_parses:
                 continue
 
-            # This surface relation is unambiguous and must be evaluated before
-            # pair_agrees(): pymorphy may expose rare homonymous readings that
-            # otherwise protect an objectively impossible -ым/-им + -ами/-ями
-            # combination.
+            # Compound components may be out of vocabulary even when the
+            # complete Russian ending relation is unambiguous. Evaluate this
+            # proof before requiring a dictionary parse for the suffix.
             surface = self._instrumental_plural_surface(suffix, head_parses)
             if surface:
                 produced = {prefix + "-" + surface}
             else:
-                if self.morph.pair_agrees(suffix, head):
+                suffix_parses = self.morph.attributive_parses(suffix)
+                if not suffix_parses or self.morph.pair_agrees(suffix, head):
                     continue
                 produced: set[str] = set()
                 for head_parse in head_parses[:8]:
