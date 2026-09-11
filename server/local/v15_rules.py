@@ -19,15 +19,19 @@ COORDINATED_MODIFIERS_RE = re.compile(
 
 
 class V15RuleExtension:
-    """Lexically general rules; every edit is morphology-proven."""
+    """Lexically general rules; every edit is morphology- or ending-proven."""
 
     def __init__(self, morphology: Morphology | None = None) -> None:
         self.morph = morphology or get_morphology()
 
     @staticmethod
-    def _instrumental_plural_surface(suffix: str, head_parses) -> str | None:
-        """Correct -ым/-им before an instrumental-plural noun to -ыми/-ими."""
-        if not any(p.tag.case == "ablt" and p.tag.number == "plur" for p in head_parses):
+    def _instrumental_plural_surface(suffix: str, head: str) -> str | None:
+        """Correct -ым/-им before a noun ending in plural instrumental -ами/-ями.
+
+        These endings encode the number/case relation directly and remain usable
+        for official compounds that are absent from OpenCorpora.
+        """
+        if not head.casefold().endswith(("ами", "ями")):
             return None
         lower = suffix.casefold()
         if lower.endswith("ым"):
@@ -42,19 +46,14 @@ class V15RuleExtension:
             modifier = match.group("modifier")
             head = match.group("head")
             prefix, suffix = modifier.rsplit("-", 1)
-            head_parses = self.morph.noun_parses(head)
-            if not head_parses:
-                continue
 
-            # Compound components may be out of vocabulary even when the
-            # complete Russian ending relation is unambiguous. Evaluate this
-            # proof before requiring a dictionary parse for the suffix.
-            surface = self._instrumental_plural_surface(suffix, head_parses)
+            surface = self._instrumental_plural_surface(suffix, head)
             if surface:
                 produced = {prefix + "-" + surface}
             else:
+                head_parses = self.morph.noun_parses(head)
                 suffix_parses = self.morph.attributive_parses(suffix)
-                if not suffix_parses or self.morph.pair_agrees(suffix, head):
+                if not head_parses or not suffix_parses or self.morph.pair_agrees(suffix, head):
                     continue
                 produced: set[str] = set()
                 for head_parse in head_parses[:8]:
@@ -99,6 +98,6 @@ class V15RuleExtension:
         return out
 
     def candidates(self, text: str) -> list[EditCandidate]:
-        if not self.morph.available or not text:
+        if not text:
             return []
         return self._compound_modifier_agreement(text) + self._coordinated_modifier_comma(text)
