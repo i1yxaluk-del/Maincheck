@@ -26,23 +26,15 @@ jobs:
           decision_engine.py hybrid_editor.py morphology.py np_agreement.py spellcheck.py
           verification.py segmentation.py llm_text.py languagetool_stage.py ollama_gec.py
           russian_quality_models.py safe_diff.py syntax_candidates.py local_rules.py v10_rules.py
-          reasoning_cascade.py punctuation_pipeline.py qwen35_backend.py russian_gec_backend.py
-      - name: Run v9 agreement regressions
-        run: pytest -q test_v9_agreement.py
-      - name: Run v9 pipeline regressions
-        run: pytest -q test_v9_pipeline.py
-      - name: Run v10 production regressions
-        run: pytest -q test_v10_regressions.py
-      - name: Run reasoner cascade regressions
-        run: pytest -q test_reasoning_cascade.py
-      - name: Run punctuation and layout regressions
-        run: pytest -q test_punctuation_pipeline.py
-      - name: Run deterministic regressions
-        run: pytest -q test_v31.py
-      - name: Run bounded diff regressions
-        run: pytest -q test_hybrid_editor.py
-      - name: Run legacy regressions
-        run: pytest -q test_pipelines.py
+          reasoning_cascade.py punctuation_pipeline.py rupunct_stage.py
+      - name: Run architecture regressions
+        run: pytest -q test_v9_agreement.py test_v9_pipeline.py test_v10_regressions.py
+      - name: Run model routing regressions
+        run: pytest -q test_reasoning_cascade.py test_rupunct_stage.py test_punctuation_pipeline.py
+      - name: Validate punctuation corpus
+        run: pytest -q test_punctuation_corpus.py
+      - name: Run remaining local regressions
+        run: pytest -q test_v31.py test_hybrid_editor.py test_pipelines.py
 
   quality-gate:
     runs-on: ubuntu-latest
