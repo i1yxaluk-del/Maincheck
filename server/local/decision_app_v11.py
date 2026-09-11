@@ -47,6 +47,7 @@ if _requested_preset == "Z":
         _cascade.reasoner,
         True,
     )
+    router.ollama_required = lambda: True  # type: ignore[method-assign]
 
     _base_metrics = router.metrics
 
