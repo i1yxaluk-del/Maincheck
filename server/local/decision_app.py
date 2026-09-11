@@ -18,8 +18,9 @@ from decision_engine import DecisionEngine
 from hybrid_editor import STACKS, HybridRouter
 from shared.audit import AuditStore, Timer, count_changes
 from shared.logging_setup import setup_logger
+from verification import GenerativeGuard
 
-SERVER_VERSION = "8.0"
+SERVER_VERSION = "9.0"
 
 load_dotenv()
 
@@ -56,7 +57,25 @@ def dict_words() -> set[str]:
 
 
 router = HybridRouter(LLM_PRESET, dict_words())
+guard = GenerativeGuard(protected_words=dict_words())
 app = FastAPI(title="AI LibreOffice Suggester", version=SERVER_VERSION)
+
+
+def build_engine() -> DecisionEngine:
+    """Собирает решающий движок с фильтром галлюцинаций.
+
+    До v9 `GenerativeGuard`-эквивалент (`_is_unverified_llm_inflection`)
+    проверял только категории `model*`/`unknown*`, а реальные категории
+    стека называются `sage-spell-punc`, `russian-gec`, `draft_*` — то
+    есть антигаллюцинационная защита в проде не работала вовсе.
+    """
+    return DecisionEngine(
+        min_confidence=MIN_CONFIDENCE,
+        max_changes=MAX_CHANGES,
+        max_before_chars=MAX_BEFORE_CHARS,
+        protected_words=dict_words(),
+        guard=guard,
+    )
 
 
 def normalize_line_breaks(text: str) -> str:
@@ -82,7 +101,8 @@ def render_result(corrected: str, accepted) -> str:
 @app.on_event("startup")
 async def startup() -> None:
     logger.info(
-        "Stack=%s (%s), generator=%s, experimental=%s, SAGE=%s, GEC=%s, retrieval=%s, rule_engine=%s",
+        "Stack=%s (%s), generator=%s, experimental=%s, SAGE=%s, GEC=%s, "
+        "retrieval=%s, rules=%s, spellcheck=%s, languagetool=%s, rescue=%s",
         router.info.name,
         router.info.description,
         router.info.model,
@@ -91,6 +111,9 @@ async def startup() -> None:
         router.gec.model if router.gec.available else "disabled",
         router.retriever.count if router.retriever.available else 0,
         router.rules.available,
+        router.speller.available,
+        router.languagetool.url if router.languagetool.available else "disabled",
+        router.rescue_mode,
     )
     if WARMUP:
         started = time.perf_counter()
@@ -102,16 +125,30 @@ async def startup() -> None:
             logger.info("Warmup OK in %d ms", elapsed)
 
 
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await router.aclose()
+
+
 @app.get("/health", response_class=PlainTextResponse)
 async def health() -> str:
+    detail = (
+        f"stack={router.info.name} | model={router.gec.model} | "
+        f"rules={router.rules.available} | spellcheck={router.speller.available}"
+    )
+    if not router.ollama_required():
+        state = "DEGRADED" if router.degraded else "OK"
+        return f"{state} | {detail} | ollama=not required"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{OLLAMA_URL}/api/tags")
             response.raise_for_status()
-        state = "DEGRADED" if router.degraded else "OK"
-        return f"{state} | stack={router.info.name} | model={router.gec.model} | degraded={len(router.degraded)}"
     except Exception as exc:
-        return f"DEGRADED | stack={router.info.name} | Ollama error: {exc}"
+        # Детерминированные стадии работают и без Ollama, поэтому это
+        # деградация, а не отказ: клиент по-прежнему получает правки.
+        return f"DEGRADED | {detail} | Ollama error: {exc}"
+    state = "DEGRADED" if router.degraded else "OK"
+    return f"{state} | {detail} | degraded={len(router.degraded)}"
 
 
 @app.get("/metrics")
@@ -127,6 +164,8 @@ async def metrics(hours: int = 24):
         "retrieval_count": router.retriever.count,
         "sage": router.sage.metrics().__dict__,
         "russian_gec": router.gec.metrics().__dict__,
+        "languagetool": router.languagetool.metrics().__dict__,
+        "guard_rejections": guard.rejections,
         "user_dict_enabled": user_dict is not None,
         "user_dict_size": len(dict_words()),
         "audit": audit.stats(hours=hours) if audit is not None else {"enabled": False},
@@ -179,18 +218,14 @@ async def suggest(request: Request, text: UploadFile = File(...), context: Uploa
         return "ОШИБКА: Пустой текст"
 
     timer = Timer()
-    candidates, accepted = [], []
+    candidates, accepted, rejections = [], [], []
     ok, error = True, ""
     try:
         with timer:
             candidates = await router.candidates(raw_text, raw_ctx)
-            engine = DecisionEngine(
-                min_confidence=MIN_CONFIDENCE,
-                max_changes=MAX_CHANGES,
-                max_before_chars=MAX_BEFORE_CHARS,
-                protected_words=dict_words(),
-            )
+            engine = build_engine()
             corrected, accepted = engine.apply(raw_text, candidates)
+            rejections = engine.rejections
             result = render_result(corrected, accepted)
     except Exception as exc:
         ok = False
@@ -198,18 +233,27 @@ async def suggest(request: Request, text: UploadFile = File(...), context: Uploa
         logger.exception("Suggestion failed")
         result = f"ОШИБКА_СЕРВЕРА: {error}"
 
+    metrics = router.metrics()
     logger.info(
-        "suggest v8 stack=%s len=%d ctx=%d candidates=%d accepted=%d stages=%s stage_ms=%s dur=%dms degraded=%d",
+        "suggest v9 stack=%s len=%d ctx=%d candidates=%d accepted=%d rejected=%d "
+        "sources=%s stages=%s stage_ms=%s dur=%dms degraded=%d",
         router.info.name,
         len(raw_text),
         len(raw_ctx),
         len(candidates),
         len(accepted),
-        router.metrics().get("stage_calls"),
-        router.metrics().get("stage_ms"),
+        len(rejections),
+        sorted({c.category for c in accepted}),
+        metrics.get("stage_calls"),
+        metrics.get("stage_ms"),
         timer.ms,
         len(router.degraded),
     )
+    for candidate, reason in rejections[:8]:
+        logger.debug(
+            "rejected %r -> %r (%s): %s",
+            candidate.before, candidate.after, candidate.category, reason,
+        )
 
     if audit is not None:
         audit.record(
