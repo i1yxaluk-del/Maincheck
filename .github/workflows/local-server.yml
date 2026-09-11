@@ -1,5 +1,4 @@
 name: local-server
-
 on:
   pull_request:
   push:
@@ -8,16 +7,12 @@ on:
 jobs:
   python-smoke:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: server/local
-    env:
-      PYTHONPATH: ${{ github.workspace }}/server
+    defaults: {run: {working-directory: server/local}}
+    env: {PYTHONPATH: "${{ github.workspace }}/server"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        with: {python-version: '3.11'}
       - run: python -m pip install --upgrade pip pytest httpx pymorphy3 pymorphy3-dicts-ru
       - run: >-
           python -m py_compile decision_app.py decision_app_v10.py decision_app_v11.py
@@ -27,14 +22,13 @@ jobs:
           v15_rules.py client_safe_edits.py reasoning_cascade.py punctuation_pipeline.py rupunct_stage.py
       - run: pytest -q test_v9_agreement.py test_v9_pipeline.py test_v10_regressions.py
       - run: pytest -q test_reasoning_cascade.py test_rupunct_stage.py test_punctuation_pipeline.py test_structural_punctuation.py
-      - run: pytest -q test_punctuation_corpus.py
-      - run: pytest -q test_v31.py test_hybrid_editor.py test_pipelines.py
+      - run: pytest -q test_punctuation_corpus.py test_v31.py test_hybrid_editor.py test_pipelines.py
 
   v15-format-protocol:
     runs-on: ubuntu-latest
     defaults: {run: {working-directory: server/local}}
     env: {PYTHONPATH: "${{ github.workspace }}/server"}
-    steps:
+    steps: &test_steps
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
@@ -52,7 +46,7 @@ jobs:
       - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
       - run: pytest -q test_v15_regressions.py -k full_report
 
-  v15-compound:
+  v15-compound-positive:
     runs-on: ubuntu-latest
     defaults: {run: {working-directory: server/local}}
     env: {PYTHONPATH: "${{ github.workspace }}/server"}
@@ -61,7 +55,18 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
-      - run: pytest -q test_v15_regressions.py -k 'compound_agreement or correct_compound'
+      - run: pytest -q test_v15_regressions.py -k compound_agreement
+
+  v15-compound-negative:
+    runs-on: ubuntu-latest
+    defaults: {run: {working-directory: server/local}}
+    env: {PYTHONPATH: "${{ github.workspace }}/server"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
+      - run: pytest -q test_v15_regressions.py -k correct_compound
 
   v15-coordinator:
     runs-on: ubuntu-latest
@@ -76,11 +81,8 @@ jobs:
 
   quality-gate:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: server/local
-    env:
-      PYTHONPATH: ${{ github.workspace }}/server:${{ github.workspace }}/server/local
+    defaults: {run: {working-directory: server/local}}
+    env: {PYTHONPATH: "${{ github.workspace }}/server:${{ github.workspace }}/server/local"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
