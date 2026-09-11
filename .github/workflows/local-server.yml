@@ -26,13 +26,15 @@ jobs:
           decision_engine.py hybrid_editor.py morphology.py np_agreement.py spellcheck.py
           verification.py segmentation.py llm_text.py languagetool_stage.py ollama_gec.py
           russian_quality_models.py safe_diff.py syntax_candidates.py local_rules.py v10_rules.py
-          reasoning_cascade.py punctuation_pipeline.py rupunct_stage.py
+          v15_rules.py client_safe_edits.py reasoning_cascade.py punctuation_pipeline.py
+          rupunct_stage.py
       - name: Run architecture regressions
         run: pytest -q test_v9_agreement.py test_v9_pipeline.py test_v10_regressions.py
       - name: Run model routing regressions
         run: >-
           pytest -q test_reasoning_cascade.py test_rupunct_stage.py
           test_punctuation_pipeline.py test_structural_punctuation.py
+          test_v15_regressions.py
       - name: Validate punctuation corpus
         run: pytest -q test_punctuation_corpus.py
       - name: Run remaining local regressions
