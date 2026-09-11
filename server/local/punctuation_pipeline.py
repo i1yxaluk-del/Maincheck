@@ -1,4 +1,4 @@
-"""Layout-aware punctuation processing for wrapped LibreOffice text."""
+"""Layout-aware and structural punctuation processing for official Russian."""
 from __future__ import annotations
 
 import difflib
@@ -11,6 +11,7 @@ from segmentation import split_sentences, strip_enumeration
 
 TOKEN_RE = re.compile(r"[А-Яа-яЁёA-Za-z0-9]+|[^\sА-Яа-яЁёA-Za-z0-9]")
 SOFT_BREAK_RE = re.compile(r"(?<!\n)\n(?!\n)")
+WORD_RE = re.compile(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*")
 WORD = r"[А-Яа-яЁё]+"
 ORG_RE = re.compile(
     rf"(?P<participle>{WORD})\s+с\s+личн(?:ым|ого|ому|ом)\s+состав(?:ом|а|у|е)"
@@ -19,15 +20,19 @@ ORG_RE = re.compile(
     rf"(?P<gap>\s+)(?P<next>{WORD})",
     re.IGNORECASE,
 )
+PREPOSITIONS = {
+    "в", "во", "на", "по", "для", "с", "со", "из", "от", "при",
+    "к", "ко", "о", "об", "обо", "под", "над", "между", "через",
+}
+CONJUNCTIONS = {"и", "или", "либо", "а также"}
+FINITE_POS = {"VERB", "INFN", "PRTS"}
 
 
 def collapse_soft_breaks(text: str) -> str:
-    """Turn visual line wraps into spaces, preserving real blank paragraphs."""
     return SOFT_BREAK_RE.sub(" ", text)
 
 
 def restore_soft_breaks(original: str, corrected: str) -> str:
-    """Project original visual wraps onto corrected text by token alignment."""
     breaks = [m.start() for m in SOFT_BREAK_RE.finditer(original)]
     if not breaks:
         return corrected
@@ -91,9 +96,89 @@ class OfficePunctuationRules:
         return out
 
 
-class LayoutAwareReasoningCascade(ReasoningCascade):
-    """Run models on unwrapped text, then restore LibreOffice line layout."""
+class StructuralPunctuationRules:
+    """Remove commas that split one homogeneous nominal construction.
 
+    The rule is lexical-independent.  It requires a complete structural proof:
+    a nominal member, its genitive complement, a following prepositional
+    modifier without a predicate, and a coordinated nominal member in the same
+    case.  This covers a productive official-prose error while avoiding a broad
+    and unsafe "comma before preposition" heuristic.
+    """
+
+    def __init__(self, morphology) -> None:
+        self.morph = morphology
+
+    @staticmethod
+    def _cases(parses) -> set[str]:
+        return {str(p.tag.case) for p in parses if getattr(p.tag, "case", None)}
+
+    def _has_finite(self, words) -> bool:
+        for word in words:
+            parses = self.morph.known_parses(word.group(0))
+            if any(getattr(p.tag, "POS", None) in FINITE_POS for p in parses):
+                return True
+        return False
+
+    def candidates(self, text: str) -> list[EditCandidate]:
+        words = list(WORD_RE.finditer(text))
+        if len(words) < 6:
+            return []
+        out: list[EditCandidate] = []
+        for comma in re.finditer(",", text):
+            left_index = next((i for i in range(len(words) - 1, -1, -1)
+                               if words[i].end() <= comma.start()), None)
+            right_index = next((i for i, word in enumerate(words)
+                                if word.start() >= comma.end()), None)
+            if left_index is None or right_index is None or right_index == 0:
+                continue
+            if words[right_index].group(0).casefold() not in PREPOSITIONS:
+                continue
+            # Require the comma to be adjacent to the nominal phrase modulo
+            # whitespace/visual wraps.
+            if text[words[left_index].end():comma.start()].strip():
+                continue
+            if text[comma.end():words[right_index].start()].strip():
+                continue
+            complement_cases = self._cases(self.morph.noun_parses(words[left_index].group(0)))
+            if not complement_cases or not (complement_cases & {"gent", "datv", "ablt", "accs"}):
+                continue
+
+            head = None
+            head_cases: set[str] = set()
+            for item in reversed(words[max(0, left_index - 6):left_index]):
+                cases = self._cases(self.morph.noun_parses(item.group(0))) & {"nomn", "accs"}
+                if cases:
+                    head, head_cases = item, cases
+                    break
+            if head is None:
+                continue
+
+            conjunction_index = None
+            for i in range(right_index + 2, min(len(words), right_index + 11)):
+                if words[i].group(0).casefold() in {"и", "или", "либо"}:
+                    conjunction_index = i
+                    break
+            if conjunction_index is None:
+                continue
+            between = words[right_index + 1:conjunction_index]
+            if len(between) < 2 or self._has_finite(between):
+                continue
+
+            peer_cases: set[str] = set()
+            for item in words[conjunction_index + 1:min(len(words), conjunction_index + 5)]:
+                peer_cases |= self._cases(self.morph.noun_parses(item.group(0))) & {"nomn", "accs"}
+            if not (head_cases & peer_cases):
+                continue
+            out.append(EditCandidate(
+                ",", "", 0.99, "rule-punctuation-structure",
+                "запятая разрывает однородную именную конструкцию перед зависимым оборотом",
+                start=comma.start(),
+            ))
+        return out
+
+
+class LayoutAwareReasoningCascade(ReasoningCascade):
     async def candidates(self, text: str, context: str = "") -> list[EditCandidate]:
         if not self.enabled:
             return []

@@ -6,26 +6,34 @@ import os
 
 _requested_preset = os.getenv("LLM_PRESET", "A").strip().upper()
 if _requested_preset == "Z":
-    # Z uses the 0.8B model only as an extractor. Do not also run the old GEC
-    # stage and rescue models: production logs showed 140-218 s contention.
     os.environ["LLM_PRESET"] = "X"
     os.environ["OLLAMA_GEC_ENABLED"] = "false"
     os.environ["LOCAL_RESCUE_MODE"] = "never"
 
 from decision_app import app, router
 from hybrid_editor import StackInfo
-from punctuation_pipeline import LayoutAwareReasoningCascade, OfficePunctuationRules
+from punctuation_pipeline import (
+    LayoutAwareReasoningCascade,
+    OfficePunctuationRules,
+    StructuralPunctuationRules,
+)
 from rupunct_stage import RuPunctStage
 from v10_rules import V10RuleExtension
 
 _v10 = V10RuleExtension(router.rules.morph_helper)
-_punctuation = OfficePunctuationRules(router.rules.morph_helper)
+_office_punctuation = OfficePunctuationRules(router.rules.morph_helper)
+_structural_punctuation = StructuralPunctuationRules(router.rules.morph_helper)
 _rupunct = RuPunctStage()
 _base_rule_candidates = router.rules.candidates
 
 
 def _rules_with_extensions(text: str):
-    return _base_rule_candidates(text) + _v10.candidates(text) + _punctuation.candidates(text)
+    return (
+        _base_rule_candidates(text)
+        + _v10.candidates(text)
+        + _office_punctuation.candidates(text)
+        + _structural_punctuation.candidates(text)
+    )
 
 
 router.rules.candidates = _rules_with_extensions  # type: ignore[method-assign]
@@ -46,11 +54,7 @@ if _requested_preset == "Z":
     async def _reasoning_candidates(text: str, context: str = ""):
         fast = await _fast_candidates(text, context)
         mode = os.getenv("REASONING_MODE", "fallback").strip().lower()
-        if mode == "never":
-            return fast
-        # Default: the slow model runs only when the fast ensemble found
-        # nothing. Set always only for offline quality comparison.
-        if mode != "always" and fast:
+        if mode == "never" or (mode != "always" and fast):
             return fast
         reasoned = await _cascade.candidates(text, context)
         return router.arbiter.merge(fast + reasoned)
