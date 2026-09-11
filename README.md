@@ -1,90 +1,143 @@
 # AI LibreOffice Suggester
 
-Расширение LibreOffice Writer для осторожной коррекции официально-делового русского текста. Пользователь выделяет фрагмент, получает список локальных правок и применяет их через штатный механизм Track Changes.
+Расширение LibreOffice Writer для осторожной коррекции официально-делового
+русского текста. Пользователь выделяет фрагмент, получает список локальных
+правок и применяет их через штатный механизм Track Changes.
 
-## Архитектура v2
+Служба работает полностью офлайн: ни текст документа, ни его фрагменты
+никуда не отправляются.
 
-Локальный production работает в **одном** systemd-сервисе и **одном** Uvicorn-процессе:
+## Архитектура v9 — «точность прежде всего»
+
+Главный принцип: **корректный текст неприкосновенен.** Ошибочная правка
+дороже пропущенной ошибки, потому что подрывает доверие к инструменту.
+Поэтому любая морфологическая омонимия трактуется в пользу исходного
+текста, а генеративная модель не может применить правку без подтверждения.
 
 ```text
 LibreOffice extension
-        ↓ HTTP
+        ↓ HTTP  POST /suggest
 server/local/decision_app.py
         ↓
-       A — T-lite (production)
-       F — Spell-Corrector-RU-4B (experimental)
-       G — MorphDetector + T-lite verifier (experimental)
+segmentation → предложения с абсолютными смещениями
         ↓
-   DecisionEngine
+┌────────────────────┬──────────────────┬──────────────┬─────────┬────────────┐
+│ LocalRuleEngine    │ DictionarySpell  │ LanguageTool │  SAGE   │ Qwen3.5-GEC│
+│ морфология,        │ Checker          │ пунктуация,  │ орфо-   │ грамматика,│
+│ доказуемо          │ словарь          │ типографика  │ графия  │ few-shot   │
+└────────────────────┴──────────────────┴──────────────┴─────────┴────────────┘
         ↓
-  exact local edits
+rescue T-lite / GigaChat — только если ничего не подтверждено
+        ↓
+CandidateArbiter → голосование между источниками
+        ↓
+GenerativeGuard → классовый фильтр галлюцинаций
+        ↓
+DecisionEngine → адресация по смещению, защищённые термины, лимиты
+        ↓
+точные правки + блок ===CHANGES===
 ```
+
+Подробный разбор дефектов v8 и решений v9 — в
+[`server/local/architecture_v9.md`](server/local/architecture_v9.md).
 
 ### Поддерживаемые стеки
 
-| Stack | Назначение | Режим |
+| Stack | Назначение | Rescue | Ollama |
+|---|---|---|---|
+| **A** | production | T-lite-it-2.1 (8B dense) | требуется |
+| **B** | production-candidate | GigaChat3.1-10B-A1.8B (MoE, быстрее на CPU) | требуется |
+| **X** | быстрый локальный путь | нет | не требуется |
+| **Y** | максимальная полнота | T-lite + GigaChat | требуется |
+
+Детерминированный слой (`LocalRuleEngine` + `DictionarySpellChecker`)
+работает во всех стеках и не зависит ни от сети, ни от Ollama: при
+недоступности моделей служба деградирует, но продолжает находить ошибки.
+
+## Качество
+
+Метрика, а не декларация: `server/local/eval/` — 70 заведомо корректных
+официально-деловых предложений и 20 с ошибками известных классов.
+Ключевой показатель — доля испорченных корректных предложений.
+
+| Метрика | v8 (`1ec8c62`) | v9 |
 |---|---|---|
-| **A** | T-lite-it-2.1 + structured edit JSON + deterministic gates | production |
-| **G** | MorphDetector candidates + T-lite verifier | experimental |
-| **F** | Spell-Corrector-RU-4B + morphology-preserving surface gate | experimental |
+| Испорчено корректных предложений | 49 из 70 | **0 из 70** |
+| Точных исправлений | 3 из 20 | **16 из 20** |
+| Precision правок | 0.093 | **1.000** |
+| Recall | 0.348 | **0.826** |
+| F0.5 | 0.109 | **0.960** |
 
-D/C/E из старых версий удалены из runtime: D не соответствует практическому latency/adapter safety на текущем сервере, C добавлял второй генерационный hop, E не был запуском готового официального checkpoint.
+Замер выполнен только детерминированными стадиями, без сети и без моделей,
+поэтому воспроизводим в CI:
 
-## Главный принцип качества
+```bash
+cd server/local
+PYTHONPATH=..:. python -m eval.run_eval --verbose
+PYTHONPATH=..:. python -m eval.run_eval --stack full     # включая SAGE/GEC/Ollama
+```
 
-LLM не имеет права напрямую переписывать пользовательский текст в production. Стек A просит только точечные `before → after` правки в строгом JSON. `DecisionEngine` затем проверяет уверенность, точное вхождение исходного фрагмента, защищённые термины, пересечения правок и лимиты изменений.
-
-F — исключение только для эксперимента: модель возвращает полный текст, после чего сервер извлекает локальные diff-кандидаты и пропускает их через морфологический gate. Поэтому изменения типа `изучена → изучено`, `должностного → должностных`, `деятельностей → деятельности` блокируются.
+CI-гейт запрещает мерж при `clean_damaged > 0` или `error_exact < 16`.
 
 ## Структура
 
 ```text
 server/local/
-├── decision_app.py          FastAPI + endpoints + one runtime process
-├── decision_engine.py       final safety merger
-├── pipelines.py             A/F/G stack implementations
-├── requirements.txt         common runtime
-├── requirements-experimental.txt  optional F runtime
-└── test_pipelines.py        regression tests
+├── decision_app.py         FastAPI, endpoints, единый процесс
+├── hybrid_editor.py        маршрутизация стадий, сегментация, rescue
+├── decision_engine.py      итоговая сборка правок и защитные лимиты
+├── morphology.py           согласование и словоизменение (pymorphy3)
+├── np_agreement.py         унификация признаков именной группы
+├── local_rules.py          детерминированные правила
+├── spellcheck.py           опечатки по словарю OpenCorpora
+├── verification.py         фильтр галлюцинаций + голосование
+├── segmentation.py         предложения с сохранением смещений
+├── llm_text.py             нормализация ответов LLM
+├── languagetool_stage.py   локальный LanguageTool
+├── safe_diff.py            токенный diff с абсолютными смещениями
+├── russian_quality_models.py  SAGE (батч, int8)
+├── ollama_gec.py           Qwen3.5-GEC в демоне Ollama
+└── eval/                   корпус и метрики качества
 
 server/shared/
-├── audit.py                 SQLite request audit
-├── morph_detector.py        deterministic Russian error detector
-├── user_dict.py             protected terminology dictionary
-└── logging_setup.py         service logging
+├── audit.py                аудит запросов в SQLite
+├── gec_bank.py             банк эталонных пар для few-shot
+├── user_dict.py            защищённая терминология
+├── languagetool_client.py  HTTP-клиент LanguageTool
+└── logging_setup.py        журналирование службы
 ```
 
-`server/cloud/` остаётся отдельным интернет-зависимым вариантом и не участвует в локальном production path.
+`server/cloud/` — отдельный интернет-зависимый вариант, в локальном
+production-пути не участвует.
 
-## Быстрый запуск локального production
+## Быстрый запуск
 
 ```bash
-ollama pull t-tech/T-lite-it-2.1:q4_K_M
 cd server/local
-cp .env.example .env
-pip install -r requirements.txt
+cp -n .env.v9.example .env
+./install_v9_stack.sh
 sudo systemctl restart ai-suggester.service
-curl http://localhost:8000/health
+curl http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8000/metrics | python3 -m json.tool
 ```
 
-Переключение только между `A`, `F`, `G`:
+Переключение стека — правкой `LLM_PRESET` в `.env` (`A`, `B`, `X`, `Y`) и
+перезапуском службы.
 
-```bash
-./scripts/switch_llm_preset.sh A
-./scripts/switch_llm_preset.sh G
-./scripts/switch_llm_preset.sh F
-```
+Тюнинг под конкретный сервер (NUMA, потоки, квантизация) —
+[`Инструкции/PERFORMANCE_TUNING.md`](Инструкции/PERFORMANCE_TUNING.md).
 
 ## Тестирование
 
 ```bash
-pytest -q server/local/test_pipelines.py
+cd server/local
+PYTHONPATH=.. python -m pytest -q test_v9_agreement.py test_v9_pipeline.py
+PYTHONPATH=..:. python -m eval.run_eval --max-fp 0 --min-exact 16
 ```
-
-CI компилирует локальный сервер и запускает regression suite для защитных правил.
 
 ## Клиент
 
-Исходники LibreOffice-расширения находятся в `Клиент/AI_Suggester`. Адрес сервера и сборка `.oxt` описаны в `Инструкции/ADMIN_GUIDE.md`.
+Исходники расширения LibreOffice — в `Клиент/AI_Suggester`. Адрес сервера
+и сборка `.oxt` описаны в `Инструкции/ADMIN_GUIDE.md`.
 
 Лицензия: MIT.

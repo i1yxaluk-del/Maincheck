@@ -52,6 +52,9 @@ DETERMINISTIC_PREFIXES = ("rule-", "dict-spell", "languagetool-")
 GENERATIVE_PREFIXES = ("sage", "russian-gec", "draft", "model", "surface", "unknown", "diff")
 
 WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+")
+#: «Скелет» фрагмента: слова и числа. Пунктуация не входит, поэтому
+#: правки, отличающиеся только знаками, распознаются как безопасный класс.
+SKELETON_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+|\d+")
 DIGIT_RE = re.compile(r"\d")
 ABBREV_RE = re.compile(r"\b(?:[а-яё]{1,4}\.|[А-ЯЁ]\.)")
 PUNCT_ONLY = re.compile(r"^[\s.,;:!?()\[\]«»\"'—–-]*$")
@@ -99,12 +102,14 @@ class GenerativeGuard:
         if not is_generative(candidate.category):
             return True, ""
 
-        # Пунктуация и пробелы — разрешённый класс: сравниваем «скелет» из слов.
-        if WORD_RE.findall(before) == WORD_RE.findall(after):
-            return True, ""
-
         if self._changes_digits(before, after):
             return self._reject("правка меняет числа или даты")
+
+        # Пунктуация и пробелы — разрешённый класс: сравниваем «скелет»
+        # из слов и чисел.
+        if SKELETON_RE.findall(before) == SKELETON_RE.findall(after):
+            return True, ""
+
         if self._touches_abbreviation(before, after):
             return self._reject("правка внутри сокращения или инициалов")
 
@@ -202,7 +207,19 @@ class GenerativeGuard:
 class CandidateArbiter:
     """Слияние кандидатов от разных стадий с голосованием."""
 
-    #: Базовое доверие к источнику. Детерминированные стадии выше любой модели.
+    #: Базовое доверие к источнику. Детерминированные стадии выше любой
+    #: модели. Калибровка привязана к `DECISION_MIN_CONFIDENCE=0.55` и
+    #: `ARBITER_SOLO_PENALTY=0.25`:
+    #:
+    #:   russian-gec  0.86 − 0.25 = 0.61  → одиночная правка принимается
+    #:   sage         0.80 − 0.25 = 0.55  → принимается на границе
+    #:   draft_*      0.66 − 0.25 = 0.41  → требуется подтверждение
+    #:
+    #: Смысл: специализированный GEC-корректор — целевая модель для этого
+    #: класса ошибок, и её одиночному голосу мы доверяем (галлюцинации у
+    #: неё отсекает `GenerativeGuard`). Универсальные rescue-генераторы
+    #: перепишут что угодно, поэтому их инфлективные правки без второго
+    #: голоса не применяются.
     WEIGHTS = {
         "rule-": 1.00,
         "dict-spell": 0.94,

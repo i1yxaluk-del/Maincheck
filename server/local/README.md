@@ -1,144 +1,117 @@
-# AI LibreOffice Suggester — local v2.4
+# AI LibreOffice Suggester — local v9
 
-This server is a **local Russian proofreader that applies minimal edits**. It is not a generic text-improvement service.
+Локальный корректор официально-делового русского текста, применяющий
+**минимальные** правки. Это не сервис «улучшения текста»: любая правка
+обязана быть объективной ошибкой и иметь проверяемое обоснование.
 
-## Runtime model
+## Модель исполнения
 
-Production uses exactly one systemd service and one Uvicorn process:
+Один systemd-сервис, один процесс Uvicorn, никаких вторых inference-серверов:
 
 ```text
 .env
   ↓
-ai-suggester.service
+ai-suggester.service   (AllowedCPUs=0-15, NUMA node0)
   ↓
 uvicorn decision_app:app --host 0.0.0.0 --port 8000
+  ↓
+ollama.service         (AllowedCPUs=16-31, NUMA node1)
 ```
 
-No second inference server is used.
-
-## Three supported stacks
-
-### A — production
+## Конвейер
 
 ```text
-raw selected text
+выделенный фрагмент
   ↓
-deterministic morphology candidates
+segmentation            предложения + абсолютные смещения
   ↓
-local BM25 + char-trigram retrieval of similar Russian GEC examples
+LocalRuleEngine         согласование (унификация признаков ИГ),
+                        управление количественных слов, год,
+                        согласование сказуемого с подлежащим
   ↓
-T-lite structured local-edit proposal
+DictionarySpellChecker  опечатки, доказуемые словарём OpenCorpora
   ↓
-merge candidates
+LanguageTool            пунктуация и типографика (офлайн, опционально)
   ↓
-DecisionEngine
+SAGE + Qwen3.5-GEC      параллельно, по предложениям
   ↓
-minimal exact edits
+rescue T-lite/GigaChat  только если ничего не подтверждено
+  ↓
+CandidateArbiter        слияние и голосование между источниками
+  ↓
+GenerativeGuard         классовый фильтр галлюцинаций
+  ↓
+DecisionEngine          адресация по смещению, защищённые термины, лимиты
+  ↓
+минимальные точные правки
 ```
 
-Model: `t-tech/T-lite-it-2.1:q4_K_M` via Ollama.
+## Стеки
 
-The LLM is never asked to rewrite the paragraph. Retrieval is local and deterministic; it uses the repository's Russian GEC example bank with hashing embeddings plus BM25 word/trigram fusion, so no embedding model or external service is needed.
+| Stack | Rescue | Ollama | Когда использовать |
+|---|---|---|---|
+| **A** | T-lite-it-2.1 (8B dense) | требуется | production |
+| **B** | GigaChat3.1-10B-A1.8B (MoE) | требуется | быстрее A на CPU, кандидат в production |
+| **X** | нет | не требуется | минимальная latency, деградация без Ollama |
+| **Y** | T-lite + GigaChat | требуется | максимальная полнота, отладка recall |
 
-### G — experimental high-precision editor
+## Главный принцип качества
+
+Модель не имеет права переписать текст пользователя. Все генеративные
+стадии возвращают текст, из которого сервер извлекает **токенный** diff, и
+каждая правка проходит:
+
+1. `GenerativeGuard` — отклоняет лексические подмены словарных слов,
+   падежные «улучшения» уже согласованных форм, изменения чисел и дат,
+   правки внутри сокращений;
+2. `CandidateArbiter` — инфлективная правка от одной модели без
+   подтверждения опускается ниже порога принятия;
+3. `DecisionEngine` — защищённая терминология, составные термины, лимиты
+   на число и размер правок, непересечение диапазонов.
+
+Детерминированные правила проходят guard без ограничений: они опираются
+на морфологическое доказательство, а не на вероятность.
+
+## Файлы
 
 ```text
-MorphDetector + narrow morphology rescue
-  ↓
-T-lite verifier
-  ↓
-DecisionEngine
+decision_app.py            FastAPI + endpoints
+hybrid_editor.py           маршрутизация стадий и rescue
+decision_engine.py         итоговая сборка правок
+morphology.py              согласование и словоизменение
+np_agreement.py            унификация признаков именной группы
+local_rules.py             детерминированные правила
+spellcheck.py              словарная орфография
+verification.py            guard + арбитраж
+segmentation.py            предложения со смещениями
+llm_text.py                нормализация ответов LLM
+languagetool_stage.py      локальный LanguageTool
+safe_diff.py               токенный diff со смещениями
+russian_quality_models.py  SAGE (батч, опциональный int8)
+ollama_gec.py              Qwen3.5-GEC + few-shot
+eval/                      корпус и метрики
 ```
 
-G does not ask the LLM to discover new text changes. The LLM only votes on candidates already produced by deterministic logic. This is the conservative experiment for measuring precision-first correction.
-
-### F — experimental surface corrector
-
-```text
-Spell-Corrector-RU-4B
-  ↓
-bounded local diff
-  ↓
-paragraph / line-break guard
-  ↓
-pymorphy3 morphology gate
-  ↓
-DecisionEngine
-```
-
-F remains isolated because it is a full-text generator and therefore has higher compute cost and a larger risk of changing valid word forms.
-
-## Why this architecture
-
-2025 Russian GEC research reports strong results from edit-based sequence tagging and shows that selecting similar correction examples with a GECToR-style retriever improves few-shot LLM correction. The LORuGEC paper reports up to 83% F0.5 for its best 5-shot setup and specifically reports gains from GECToR-based example selection. urlBEA 2025 paperhttps://aclanthology.org/2025.bea-1.38/
-
-The 2025 Russian sequence-tagging work also reports state-of-the-art results on RU-Lang8 and GERA for its edit-based architecture. urlRussian sequence tagging paperhttps://aclanthology.org/2025.acl-srw.82/
-
-BEA 2026 shows why a single aggregate score is insufficient: synthetic fine-tuning can raise overall F0.5 while sharply degrading individual grammar rules. Our service therefore keeps rule-level regression cases and destructive-edit tests in the repository. urlBEA 2026 diagnostichttps://synterr-nlp.github.io/papers/bea-2026/
-
-For our hardware, the practical conclusion is to spend the expensive T-lite generation budget once, on a small edit-oriented prompt, and to move easy high-confidence work into deterministic local components.
-
-## Installation and operation
-
-Normal operation is only:
+## Команды
 
 ```bash
-cd /home/service/llama/server/local
+cp -n .env.v9.example .env
+./install_v9_stack.sh
 sudo systemctl restart ai-suggester.service
-journalctl -u ai-suggester.service -n 120 --no-pager
+
+curl http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8000/metrics | python3 -m json.tool
+
+PYTHONPATH=.. python -m pytest -q test_v9_agreement.py test_v9_pipeline.py
+PYTHONPATH=..:. python -m eval.run_eval --verbose
 ```
 
-After dependency/model changes, run the one-time installer:
+## Диагностика
 
-```bash
-cd /home/service/llama/server/local
-bash install_experimental_models.sh
-```
+`/metrics` → `stage_calls` показывает, какие стадии реально вызывались.
+Ноль у `gec` при непустом тексте означает, что специалист не работает —
+именно так вела себя v8 из-за grammar gate. `guard_rejections` показывает,
+по каким причинам отклонялись правки моделей.
 
-Select the stack only by editing `.env`:
-
-```text
-LLM_PRESET=A
-```
-
-or `F` / `G`, then restart the same service.
-
-There is no preset-switching shell command in the production workflow. `/metrics` is diagnostic only and is not part of startup.
-
-## Main settings
-
-```text
-LLM_PRESET=A
-OLLAMA_URL=http://localhost:11434
-NUM_THREADS=28
-OLLAMA_NUM_CTX=2048
-OLLAMA_NUM_PREDICT=192
-OLLAMA_TIMEOUT=120
-OLLAMA_WARMUP=true
-OLLAMA_KEEP_ALIVE=24h
-OLLAMA_TEMPERATURE=0
-
-DECISION_MIN_CONFIDENCE=0.60
-DECISION_MAX_CHANGES=12
-DECISION_MAX_BEFORE_CHARS=120
-MORPH_DETECTOR_ENABLED=true
-USER_DICT_ENABLED=true
-AUDIT_ENABLED=true
-```
-
-## Critical regression targets
-
-The production corpus must detect:
-
-```text
-должностного лиц → должностного лица
-```
-
-and must never introduce the previously observed F transformations:
-
-```text
-изучена → изучено
-dолжностного → должностных
-деятельностей → деятельности
-```
-
+Разбор дефектов v8 и обоснование решений — `architecture_v9.md`.
+Тюнинг под сервер — `../../Инструкции/PERFORMANCE_TUNING.md`.

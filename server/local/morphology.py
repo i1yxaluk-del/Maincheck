@@ -90,6 +90,18 @@ class Features:
         plural = "plur" in {self.number, head.number}
         if not plural and self.gender and head.gender and self.gender != head.gender:
             return False
+        # В винительном падеже прилагательное различает одушевлённость, и
+        # одушевлённость вершины — лексический факт. Без этой проверки
+        # «соответствующего раздел» считалось согласованным: у формы
+        # «соответствующего» есть разбор accs+anim, а у «раздел» —
+        # accs+inan.
+        if (
+            self.case == "accs"
+            and self.animacy
+            and head.animacy
+            and self.animacy != head.animacy
+        ):
+            return False
         return True
 
 
