@@ -1,4 +1,4 @@
-name: patch-v17-once
+name: patch-morphology-once
 on:
   push:
     branches: [fix/v17-modifier-chain-ui]
@@ -6,44 +6,31 @@ permissions:
   contents: write
 jobs:
   patch:
-    if: ${{ !contains(github.event.head_commit.message, '[morph-patched]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[morphology-patched]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: {ref: fix/v17-modifier-chain-ui}
-      - name: Исправить словоизменение цепочки определений
+      - name: Учитывать одушевлённость только в винительном падеже
         run: |
           python - <<'PY'
           from pathlib import Path
-          path = Path('server/local/v16_rules.py')
+          path = Path('server/local/morphology.py')
           text = path.read_text(encoding='utf-8')
-          old = '''                target = self.morph.inflect_modifier(source, head_parse)
-                if target and target.casefold() != source.casefold():
-                    proposals.add((mismatch.start(), target))'''
-          new = '''                target = self.morph.inflect_modifier(source, head_parse)
-                if not target and head_features.case != "accs":
-                    grammemes = {value for value in (
-                        head_features.case, head_features.number,
-                        head_features.gender if head_features.number != "plur" else None,
-                    ) if value}
-                    forms = self.morph.inflected_forms(source, grammemes)
-                    forms = {
-                        preserve_capitalization(source, preserve_yo(source, form))
-                        for form in forms
-                        if form.casefold() != source.casefold()
-                    }
-                    if len(forms) == 1:
-                        target = forms.pop()
-                if target and target.casefold() != source.casefold():
-                    proposals.add((mismatch.start(), target))'''
+          old = 'if f.animacy and (f.case == "accs" or f.number == "plur"):'
+          new = 'if f.animacy and f.case == "accs":'
           if text.count(old) != 1:
-              raise SystemExit('Не найден единственный блок словоизменения')
+              raise SystemExit(f'Ожидалось одно совпадение, найдено {text.count(old)}')
           path.write_text(text.replace(old, new), encoding='utf-8')
           PY
-      - name: Зафиксировать изменение исходника
+      - name: Проверить и зафиксировать
         run: |
+          python -m pip install -q pytest pymorphy3 pymorphy3-dicts-ru
+          cd server/local
+          pytest -q test_v15_regressions.py test_v16_regressions.py test_coverage_policy.py
+          cd ../..
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add server/local/v16_rules.py
-          git commit -m 'fix: согласовать определение без лишней одушевленности [morph-patched]'
+          git add server/local/morphology.py
+          git commit -m 'fix: не передавать одушевленность вне винительного падежа [morphology-patched]'
           git push
