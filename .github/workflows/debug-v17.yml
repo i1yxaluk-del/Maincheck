@@ -1,0 +1,45 @@
+name: debug-v17-once
+on:
+  push:
+    branches: [fix/v17-modifier-chain-ui]
+permissions:
+  contents: write
+jobs:
+  debug:
+    if: ${{ !contains(github.event.head_commit.message, '[debug-output]') }}
+    runs-on: ubuntu-latest
+    defaults: {run: {working-directory: server/local}}
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: fix/v17-modifier-chain-ui}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: python -m pip install -q pymorphy3 pymorphy3-dicts-ru
+      - name: Записать фактический результат
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from decision_engine import DecisionEngine
+          from morphology import get_morphology
+          from v16_rules import V16RuleExtension
+          samples = [
+              'актуализации сведений о регистрационных\nданных несъемных жесткого\nмагнитных дисков',
+              'данных несъемных жестких магнитных дисков',
+              'сведения о жесткого магнитных дисках',
+          ]
+          lines = []
+          rules = V16RuleExtension(get_morphology())
+          for text in samples:
+              candidates = rules.candidates(text)
+              corrected, accepted = DecisionEngine(min_confidence=0.55).apply(text, candidates)
+              lines += [repr(text), repr([(c.before, c.after, c.category, c.start) for c in candidates]), repr(corrected), repr([(c.before, c.after) for c in accepted]), '---']
+          Path('../../v17-debug.txt').write_text('\n'.join(lines), encoding='utf-8')
+          PY
+      - name: Зафиксировать диагностику
+        working-directory: .
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add v17-debug.txt
+          git commit -m 'chore: сохранить диагностику v17 [debug-output]'
+          git push
