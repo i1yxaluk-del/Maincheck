@@ -8,7 +8,7 @@ from morphology import Morphology, get_morphology, preserve_capitalization, pres
 
 WORD = r"[А-Яа-яЁё]+"
 ORDER_PROCESS_RE = re.compile(
-    rf"\bпорядк{WORD}*\s+(?P<process>{WORD}+ний)\s+(?P<object>{WORD}+)\b",
+    rf"\bпорядк[А-Яа-яЁё]*\s+(?P<process>{WORD}ний)\s+(?P<object>{WORD})\b",
     re.IGNORECASE,
 )
 DOCUMENT_TARGET_RE = re.compile(
@@ -62,8 +62,6 @@ class V16RuleExtension:
             forms = {preserve_capitalization(source, preserve_yo(source, f)) for f in forms}
             forms = {f for f in forms if f.casefold() != source.casefold()}
             if len(forms) != 1:
-                # Productive -ние nouns have genitive plural -ний and
-                # genitive singular -ния; this remains valid for OOV terms.
                 forms = {source[:-2] + "ия"} if source.casefold().endswith("ний") else set()
             if len(forms) != 1:
                 continue
@@ -79,14 +77,11 @@ class V16RuleExtension:
     def _document_locative(text: str) -> list[EditCandidate]:
         out: list[EditCandidate] = []
         for match in DOCUMENT_TARGET_RE.finditer(text):
-            # A bounded look-ahead proves location rather than direction:
-            # the document field contains/does not contain a value.
             tail = text[match.end():match.end() + 320]
             if not STATIVE_PREDICATES.search(tail):
                 continue
             source = match.group("target")
-            target = LOCATIVE_FORMS[source.casefold()]
-            target = preserve_capitalization(source, target)
+            target = preserve_capitalization(source, LOCATIVE_FORMS[source.casefold()])
             out.append(EditCandidate(
                 source, target, 0.995, "rule-document-locative",
                 "местонахождение в разделе документа требует предложного падежа",
@@ -98,8 +93,7 @@ class V16RuleExtension:
     def _comma_before_impersonal_predicate(text: str) -> list[EditCandidate]:
         out: list[EditCandidate] = []
         for match in LOCATIVE_PREDICATE_RE.finditer(text):
-            predicate = match.group("predicate").casefold()
-            if predicate not in IMPERSONAL_PARTICIPLES:
+            if match.group("predicate").casefold() not in IMPERSONAL_PARTICIPLES:
                 continue
             out.append(EditCandidate(
                 ",", "", 0.997, "rule-predicate-boundary",
