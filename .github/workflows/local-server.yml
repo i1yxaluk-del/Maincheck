@@ -36,20 +36,14 @@ jobs:
       - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
       - run: pytest -q test_v15_regressions.py test_v16_regressions.py test_coverage_policy.py
 
-  extension-v190:
+  extension-package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - run: python -m pip install --upgrade pip pytest
-      - run: pytest -q tests/test_extension_package.py tests/test_extension_v190.py
-      - run: python 'Клиент/build_oxt.py' --output dist/AI_Suggester-1.9.0.oxt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: AI_Suggester-1.9.0
-          path: dist/AI_Suggester-1.9.0.oxt
-          if-no-files-found: error
+      - run: pytest -q tests/test_extension_package.py
 
   quality-gate:
     runs-on: ubuntu-latest

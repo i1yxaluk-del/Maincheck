@@ -1,4 +1,4 @@
-"""Precision guard for unsupported punctuation emitted by generative stages."""
+"""Защита от неподтверждённых пунктуационных правок генеративных моделей."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -17,11 +17,11 @@ def _quote_signature(value: str) -> tuple[str, ...]:
 def suppress_unsafe_solo_punctuation(
     candidates: list[EditCandidate],
 ) -> list[EditCandidate]:
-    """Lower unsupported model punctuation below the decision threshold.
+    """Понижает неподтверждённую пунктуацию ниже порога принятия.
 
-    RuPunct-backed candidates are exempt. Deletions remain allowed because
-    the production failures were unsupported additions and asymmetric quote
-    substitutions, while local punctuation removal is a useful SAGE signal.
+    Кандидаты, подтверждённые RuPunct, не ограничиваются. Удаление знаков
+    также остаётся разрешённым: в производственных примерах опасными были
+    одиночные вставки и асимметричная замена кавычек.
     """
     out: list[EditCandidate] = []
     for candidate in candidates:

@@ -1,4 +1,4 @@
-"""Coverage-aware escalation policy for local correction cascades."""
+"""Политика эскалации каскада по полноте найденных исправлений."""
 from __future__ import annotations
 
 import os
@@ -10,16 +10,16 @@ SKELETON_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+|\d+")
 
 
 def is_punctuation_only(candidate: EditCandidate) -> bool:
-    """True when an edit changes only punctuation or spacing."""
+    """Возвращает True, если правка меняет только пунктуацию или пробелы."""
     return SKELETON_RE.findall(candidate.before) == SKELETON_RE.findall(candidate.after)
 
 
 def needs_deep_review(text: str, candidates: list[EditCandidate]) -> bool:
-    """Escalate when the fast pass found no substantive language correction.
+    """Запускает углублённую проверку без содержательной языковой правки.
 
-    The old `if fast: stop` policy treated one comma as proof that the whole
-    selection was checked. This is a coverage decision, not an error-count
-    decision: punctuation-only candidates must not suppress grammar review.
+    Старая проверка ``if fast: stop`` считала одну найденную запятую
+    доказательством проверки всего выделения. Теперь решение принимается
+    по покрытию: пунктуационные кандидаты не отключают проверку грамматики.
     """
     min_chars = int(os.getenv("REASONING_COVERAGE_MIN_CHARS", "50"))
     if len(text.strip()) < min_chars:
@@ -30,7 +30,7 @@ def needs_deep_review(text: str, candidates: list[EditCandidate]) -> bool:
 def needs_rescue_despite_verified_punctuation(
     candidates: list[EditCandidate], original_decision: bool,
 ) -> bool:
-    """Do not let a verified comma suppress A/B/Y rescue models."""
+    """Не позволяет подтверждённой запятой отключить rescue в A/B/Y."""
     if candidates and all(is_punctuation_only(c) for c in candidates):
         return True
     return original_decision

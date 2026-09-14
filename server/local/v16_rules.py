@@ -1,4 +1,4 @@
-"""High-precision rules for government and predicate-boundary punctuation."""
+"""Высокоточные правила управления и пунктуации на границе сказуемого."""
 from __future__ import annotations
 
 import re
@@ -49,6 +49,8 @@ LOCATIVE_FORMS = {
 
 
 class V16RuleExtension:
+    """Общие детерминированные правила для официально-делового текста."""
+
     def __init__(self, morphology: Morphology | None = None) -> None:
         self.morph = morphology or get_morphology()
 

@@ -1,4 +1,4 @@
-"""Canonical entry point for presets A, B, X, Y and Z."""
+"""Основная точка входа для пресетов A, B, X, Y и Z."""
 from __future__ import annotations
 
 import asyncio
@@ -47,9 +47,9 @@ def _rules_with_extensions(text: str):
 
 router.rules.candidates = _rules_with_extensions  # type: ignore[method-assign]
 
-# A/B/Y previously skipped rescue as soon as one deterministic comma was
-# present. Preserve the original policy for substantive edits, but force a
-# second language pass when every fast candidate is punctuation-only.
+# Раньше одна подтверждённая запятая могла отключить rescue в A/B/Y.
+# Исходная политика сохраняется для содержательных правок, но второй
+# языковой проход запускается, если все кандидаты меняют только пунктуацию.
 _original_needs_rescue = router._needs_rescue
 def _coverage_aware_rescue(candidates):
     original = _original_needs_rescue(candidates)
@@ -86,7 +86,7 @@ if _requested_preset == "Z":
 
     router.candidates = _reasoning_candidates  # type: ignore[method-assign]
     router.info = StackInfo(
-        "Z", "coverage-aware fast ensemble + DeepSeek-R1 grammar review",
+        "Z", "проверка покрытия быстрым ансамблем + грамматический проход DeepSeek-R1",
         _cascade.reasoner, True,
     )
     router.ollama_required = lambda: True  # type: ignore[method-assign]
