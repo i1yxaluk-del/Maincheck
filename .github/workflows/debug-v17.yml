@@ -20,19 +20,26 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           from decision_engine import DecisionEngine
-          from morphology import get_morphology
+          from morphology import features, get_morphology
           from v16_rules import V16RuleExtension
-          samples = [
-              'актуализации сведений о регистрационных\nданных несъемных жесткого\nмагнитных дисков',
-              'данных несъемных жестких магнитных дисков',
-              'сведения о жесткого магнитных дисках',
-          ]
-          lines = []
-          rules = V16RuleExtension(get_morphology())
-          for text in samples:
-              candidates = rules.candidates(text)
-              corrected, accepted = DecisionEngine(min_confidence=0.55).apply(text, candidates)
-              lines += [repr(text), repr([(c.before, c.after, c.category, c.start) for c in candidates]), repr(corrected), repr([(c.before, c.after) for c in accepted]), '---']
+          morph = get_morphology()
+          rules = V16RuleExtension(morph)
+          text = 'актуализации сведений о регистрационных\nданных несъемных жесткого\nмагнитных дисков'
+          lines = ['РАЗБОРЫ']
+          for word in ['данных', 'несъемных', 'жесткого', 'магнитных', 'дисков']:
+              lines.append(word)
+              for p in morph.parse(word):
+                  lines.append(f'  known={p.is_known} tag={p.tag} normal={p.normal_form}')
+          lines.append('СОГЛАСОВАНИЕ С РАЗБОРАМИ ДИСКОВ')
+          for head in morph.noun_parses('дисков'):
+              lines.append(f'HEAD {head.tag} target={morph.target_grammemes(head)}')
+              for word in ['данных', 'несъемных', 'жесткого', 'магнитных']:
+                  pars = morph.attributive_parses(word)
+                  agrees = [features(p).agrees_with(features(head)) for p in pars]
+                  lines.append(f'  {word}: parses={len(pars)} agrees={agrees} inflect={morph.inflect_modifier(word, head)!r}')
+          candidates = rules.candidates(text)
+          corrected, accepted = DecisionEngine(min_confidence=0.55).apply(text, candidates)
+          lines += ['КАНДИДАТЫ', repr([(c.before, c.after, c.category, c.start) for c in candidates]), 'РЕЗУЛЬТАТ', repr(corrected), repr([(c.before, c.after) for c in accepted])]
           Path('../../v17-debug.txt').write_text('\n'.join(lines), encoding='utf-8')
           PY
       - name: Зафиксировать диагностику
@@ -41,5 +48,5 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add v17-debug.txt
-          git commit -m 'chore: сохранить диагностику v17 [debug-output]'
+          git commit -m 'chore: сохранить расширенную диагностику v17 [debug-output]'
           git push
