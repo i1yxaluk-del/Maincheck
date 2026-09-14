@@ -9,8 +9,8 @@ User=service
 WorkingDirectory=/home/service/llama/server/local
 Environment="PYTHONPATH=/home/service/llama/server"
 EnvironmentFile=-/home/service/llama/server/local/.env
-ExecStart=/home/service/llama/server/local/venv/bin/python -m shared.rag_worker
-Restart=always
+ExecStart=/home/service/llama/server/local/venv/bin/python -m shared.rag_worker_entry
+Restart=on-failure
 RestartSec=10
 Nice=10
 IOSchedulingClass=idle
