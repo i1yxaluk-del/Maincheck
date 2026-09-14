@@ -237,7 +237,7 @@ class Morphology:
             target.add(f.number)
         if f.number != "plur" and f.gender:
             target.add(f.gender)
-        if f.animacy and (f.case == "accs" or f.number == "plur"):
+        if f.animacy and f.case == "accs":
             target.add(f.animacy)
         return target
 
