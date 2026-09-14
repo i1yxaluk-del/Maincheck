@@ -19,23 +19,13 @@ jobs:
           decision_engine.py hybrid_editor.py morphology.py np_agreement.py spellcheck.py
           verification.py segmentation.py llm_text.py languagetool_stage.py ollama_gec.py
           russian_quality_models.py safe_diff.py syntax_candidates.py local_rules.py v10_rules.py
-          v15_rules.py client_safe_edits.py reasoning_cascade.py punctuation_pipeline.py rupunct_stage.py
+          v15_rules.py v16_rules.py v16_safety.py coverage_policy.py client_safe_edits.py
+          reasoning_cascade.py punctuation_pipeline.py rupunct_stage.py
       - run: pytest -q test_v9_agreement.py test_v9_pipeline.py test_v10_regressions.py
       - run: pytest -q test_reasoning_cascade.py test_rupunct_stage.py test_punctuation_pipeline.py test_structural_punctuation.py
       - run: pytest -q test_punctuation_corpus.py test_v31.py test_hybrid_editor.py test_pipelines.py
 
-  v15-format-protocol:
-    runs-on: ubuntu-latest
-    defaults: {run: {working-directory: server/local}}
-    env: {PYTHONPATH: "${{ github.workspace }}/server"}
-    steps: &test_steps
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.11'}
-      - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
-      - run: pytest -q test_v15_regressions.py -k 'punctuation_deletion or non_deletion'
-
-  v15-full-example:
+  service-regressions:
     runs-on: ubuntu-latest
     defaults: {run: {working-directory: server/local}}
     env: {PYTHONPATH: "${{ github.workspace }}/server"}
@@ -44,40 +34,16 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
-      - run: pytest -q test_v15_regressions.py -k full_report
+      - run: pytest -q test_v15_regressions.py test_v16_regressions.py test_coverage_policy.py
 
-  v15-compound-positive:
+  extension-package:
     runs-on: ubuntu-latest
-    defaults: {run: {working-directory: server/local}}
-    env: {PYTHONPATH: "${{ github.workspace }}/server"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
-      - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
-      - run: pytest -q test_v15_regressions.py -k compound_agreement
-
-  v15-compound-negative:
-    runs-on: ubuntu-latest
-    defaults: {run: {working-directory: server/local}}
-    env: {PYTHONPATH: "${{ github.workspace }}/server"}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.11'}
-      - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
-      - run: pytest -q test_v15_regressions.py -k correct_compound
-
-  v15-coordinator:
-    runs-on: ubuntu-latest
-    defaults: {run: {working-directory: server/local}}
-    env: {PYTHONPATH: "${{ github.workspace }}/server"}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.11'}
-      - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
-      - run: pytest -q test_v15_regressions.py -k comma_before_single
+      - run: python -m pip install --upgrade pip pytest
+      - run: pytest -q tests/test_extension_package.py
 
   quality-gate:
     runs-on: ubuntu-latest

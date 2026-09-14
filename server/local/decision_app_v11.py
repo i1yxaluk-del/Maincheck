@@ -1,4 +1,4 @@
-"""Canonical entry point for presets A, B, X, Y and Z."""
+"""Основная точка входа для пресетов A, B, X, Y и Z."""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +11,7 @@ if _requested_preset == "Z":
     os.environ["LOCAL_RESCUE_MODE"] = "never"
 
 from client_safe_edits import materialize_client_safe_deletions
+from coverage_policy import needs_deep_review, needs_rescue_despite_verified_punctuation
 from decision_app import app, router
 from hybrid_editor import StackInfo
 from punctuation_pipeline import (
@@ -21,9 +22,12 @@ from punctuation_pipeline import (
 from rupunct_stage import RuPunctStage
 from v10_rules import V10RuleExtension
 from v15_rules import V15RuleExtension
+from v16_rules import V16RuleExtension
+from v16_safety import suppress_unsafe_solo_punctuation
 
 _v10 = V10RuleExtension(router.rules.morph_helper)
 _v15 = V15RuleExtension(router.rules.morph_helper)
+_v16 = V16RuleExtension(router.rules.morph_helper)
 _office_punctuation = OfficePunctuationRules(router.rules.morph_helper)
 _structural_punctuation = StructuralPunctuationRules(router.rules.morph_helper)
 _rupunct = RuPunctStage()
@@ -35,12 +39,25 @@ def _rules_with_extensions(text: str):
         _base_rule_candidates(text)
         + _v10.candidates(text)
         + _v15.candidates(text)
+        + _v16.candidates(text)
         + _office_punctuation.candidates(text)
         + _structural_punctuation.candidates(text)
     )
 
 
 router.rules.candidates = _rules_with_extensions  # type: ignore[method-assign]
+
+# Раньше одна подтверждённая запятая могла отключить rescue в A/B/Y.
+# Исходная политика сохраняется для содержательных правок, но второй
+# языковой проход запускается, если все кандидаты меняют только пунктуацию.
+_original_needs_rescue = router._needs_rescue
+def _coverage_aware_rescue(candidates):
+    original = _original_needs_rescue(candidates)
+    if router.rescue_mode == "never" or not router._rescue_models():
+        return False
+    return needs_rescue_despite_verified_punctuation(candidates, original)
+router._needs_rescue = _coverage_aware_rescue  # type: ignore[method-assign]
+
 _base_candidates = router.candidates
 
 async def _candidates_with_rupunct(text: str, context: str = ""):
@@ -57,27 +74,29 @@ if _requested_preset == "Z":
 
     async def _reasoning_candidates(text: str, context: str = ""):
         fast = await _fast_candidates(text, context)
-        mode = os.getenv("REASONING_MODE", "fallback").strip().lower()
-        if mode == "never" or (mode != "always" and fast):
+        mode = os.getenv("REASONING_MODE", "coverage").strip().lower()
+        if mode == "never":
+            return fast
+        if mode == "fallback" and fast:
+            return fast
+        if mode == "coverage" and not needs_deep_review(text, fast):
             return fast
         reasoned = await _cascade.candidates(text, context)
         return router.arbiter.merge(fast + reasoned)
 
     router.candidates = _reasoning_candidates  # type: ignore[method-assign]
     router.info = StackInfo(
-        "Z", "fast punctuation ensemble + fallback DeepSeek-R1 7B",
+        "Z", "проверка покрытия быстрым ансамблем + грамматический проход DeepSeek-R1",
         _cascade.reasoner, True,
     )
     router.ollama_required = lambda: True  # type: ignore[method-assign]
 else:
     _cascade = None
 
-# Last protocol adapter: every punctuation deletion receives a neighbouring
-# lexical anchor, so the installed Writer extension never falls back to a
-# whole-selection replacement merely because the replacement fragment is empty.
 _protocol_candidates = router.candidates
 async def _client_safe_candidates(text: str, context: str = ""):
     candidates = await _protocol_candidates(text, context)
+    candidates = suppress_unsafe_solo_punctuation(candidates)
     return materialize_client_safe_deletions(text, candidates)
 router.candidates = _client_safe_candidates  # type: ignore[method-assign]
 
