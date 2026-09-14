@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Suggester — background RAG indexer
+After=ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=service
+WorkingDirectory=/home/service/llama/server/local
+Environment="PYTHONPATH=/home/service/llama/server"
+EnvironmentFile=-/home/service/llama/server/local/.env
+ExecStart=/home/service/llama/server/local/venv/bin/python -m shared.rag_worker
+Restart=always
+RestartSec=10
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=400%
+MemoryMax=4G
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
