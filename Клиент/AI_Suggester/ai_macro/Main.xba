@@ -181,7 +181,7 @@ Sub AISuggestSelection()
     Dim k As Integer
     For k = 0 To nChanges - 1
         aSelected(k) = True
-        If aOldFrags(k) <> "" And aNewFrags(k) <> "" Then nFrags = nFrags + 1
+        If aOldFrags(k) <> "" Then nFrags = nFrags + 1
     Next k
 
     ' Панели diff — берут «до/после» из тех же aOldFrags/aNewFrags
@@ -257,8 +257,8 @@ Sub ApplyCorrection(oDoc As Object, oSel As Object, sCorrected As String, _
     If nFrags > 0 Then
         ApplyPerFragment oSel, aOldFrags(), aNewFrags(), aSelected(), nChanges, sSkipped
     Else
-        ' Нет структурированных правок — применяем целиком, но аккуратно
-        ApplyWholeReplace oSel, sCorrected
+        ' Без локальных пар форматированное выделение не изменяем.
+        MsgBox "Сервер не вернул безопасных локальных правок. Текст не изменен.", 48, "AI Suggester"
     End If
 
     If bShouldRestore Then
@@ -302,6 +302,12 @@ Sub ApplyPerFragment(oSel As Object, _
         sCurText = Replace(sCurText, Chr(13), "")
 
         Dim nPos As Long : nPos = InStr(sCurText, sOld)
+        Dim nNextPos As Long : nNextPos = 0
+        If nPos > 0 Then nNextPos = InStr(nPos + Len(sOld), sCurText, sOld)
+        If nNextPos > 0 Then
+            sSkipped = sSkipped & "  • неоднозначный фрагмент: «" & Left(sOld, 70) & "»" & Chr(10)
+            GoTo NextFrag
+        End If
         If nPos = 0 Then
             sSkipped = sSkipped & "  • «" & Left(sOld, 80) & _
                        IIf(Len(sOld) > 80, "…", "") & "»" & Chr(10)
@@ -502,9 +508,9 @@ Function ShowDiffDialog(sBeforePanel As String, sAfterPanel As String, _
     On Error GoTo DlgErr
 
     ' Геометрия
-    Dim nW As Integer : nW = 340
-    Dim nRowH As Integer : nRowH = 12
-    Dim nCBStartY As Integer : nCBStartY = 122
+    Dim nW As Integer : nW = 420
+    Dim nRowH As Integer : nRowH = 14
+    Dim nCBStartY As Integer : nCBStartY = 92
 
     Dim nCols As Integer
     If nChanges <= 18 Then
@@ -525,14 +531,14 @@ Function ShowDiffDialog(sBeforePanel As String, sAfterPanel As String, _
     Dim oMdl As Object : oMdl = CreateUnoService("com.sun.star.awt.UnoControlDialogModel")
     With oMdl
         .Width = nW : .Height = nDlgH
-        .Title = "AI Suggester — Предложение по улучшению текста"
+        .Title = "AI Suggester — проверка текста"
         .Closeable = True : .Moveable = True : .Sizeable = False
     End With
 
     ' Шапка
     Dim oHdr As Object : oHdr = oMdl.createInstance("com.sun.star.awt.UnoControlFixedTextModel")
     With oHdr
-        .PositionX = 0 : .PositionY = 0 : .Width = nW : .Height = 14
+        .PositionX = 0 : .PositionY = 0 : .Width = nW : .Height = 16
         .Label = "  Найденные ошибки. Снимите галочки с тех правок, которые применять не нужно."
         .BackgroundColor = RGB(17, 78, 140) : .TextColor = RGB(255, 255, 255)
         .FontWeight = com.sun.star.awt.FontWeight.BOLD : .FontHeight = 11
@@ -542,7 +548,7 @@ Function ShowDiffDialog(sBeforePanel As String, sAfterPanel As String, _
     ' Заголовки панелей diff
     Dim oL1 As Object : oL1 = oMdl.createInstance("com.sun.star.awt.UnoControlFixedTextModel")
     With oL1
-        .PositionX = 6 : .PositionY = 17 : .Width = 158 : .Height = 9
+        .PositionX = 8 : .PositionY = 18 : .Width = 194 : .Height = 9
         .Label = "  Исходные фрагменты с ошибками:"
         .BackgroundColor = RGB(255, 235, 220) : .TextColor = RGB(140, 40, 0)
         .FontWeight = com.sun.star.awt.FontWeight.BOLD : .FontHeight = 11
@@ -551,7 +557,7 @@ Function ShowDiffDialog(sBeforePanel As String, sAfterPanel As String, _
 
     Dim oL2 As Object : oL2 = oMdl.createInstance("com.sun.star.awt.UnoControlFixedTextModel")
     With oL2
-        .PositionX = 172 : .PositionY = 17 : .Width = 162 : .Height = 9
+        .PositionX = 218 : .PositionY = 18 : .Width = 194 : .Height = 9
         .Label = "  Исправленные фрагменты:"
         .BackgroundColor = RGB(220, 245, 220) : .TextColor = RGB(0, 100, 0)
         .FontWeight = com.sun.star.awt.FontWeight.BOLD : .FontHeight = 11
@@ -560,19 +566,19 @@ Function ShowDiffDialog(sBeforePanel As String, sAfterPanel As String, _
 
     Dim oT1 As Object : oT1 = oMdl.createInstance("com.sun.star.awt.UnoControlEditModel")
     With oT1
-        .PositionX = 6 : .PositionY = 27 : .Width = 158 : .Height = 72
+        .PositionX = 8 : .PositionY = 28 : .Width = 194 : .Height = 42
         .MultiLine = True : .ReadOnly = True : .VScroll = True : .HScroll = False
         .Text = sBeforePanel
-        .Border = 1 : .BackgroundColor = RGB(255, 246, 238) : .FontHeight = 14
+        .Border = 1 : .BackgroundColor = RGB(255, 246, 238) : .FontHeight = 11
     End With
     oMdl.insertByName("t1", oT1)
 
     Dim oT2 As Object : oT2 = oMdl.createInstance("com.sun.star.awt.UnoControlEditModel")
     With oT2
-        .PositionX = 172 : .PositionY = 27 : .Width = 162 : .Height = 72
+        .PositionX = 218 : .PositionY = 28 : .Width = 194 : .Height = 42
         .MultiLine = True : .ReadOnly = True : .VScroll = True : .HScroll = False
         .Text = sAfterPanel
-        .Border = 1 : .BackgroundColor = RGB(238, 255, 238) : .FontHeight = 14
+        .Border = 1 : .BackgroundColor = RGB(238, 255, 238) : .FontHeight = 11
     End With
     oMdl.insertByName("t2", oT2)
 
@@ -580,7 +586,7 @@ Function ShowDiffDialog(sBeforePanel As String, sAfterPanel As String, _
     Dim oCnt As Object : oCnt = oMdl.createInstance("com.sun.star.awt.UnoControlFixedTextModel")
     Dim sMode As String : sMode = IIf(Settings.GetUseTrackChanges(), " · режим Track Changes", "")
     With oCnt
-        .PositionX = 6 : .PositionY = 102 : .Width = nW - 12 : .Height = 9
+        .PositionX = 8 : .PositionY = 74 : .Width = nW - 16 : .Height = 10
         .Label = "Найдено правок: " & CStr(nChanges) & sMode & _
                  ". Нажмите «?» рядом с галочкой, чтобы прочитать пояснение."
         .TextColor = RGB(80, 80, 80) : .FontHeight = 11

@@ -22,7 +22,7 @@ def test_description_version():
     # v1.8.3: диалог управления словарём (ListBox + Кнопки
     # Удалить/Добавить/Закрыть) + новая тулбар-кнопка
     # m003 «AI: Словарь».
-    assert version.get("value") == "1.8.3"
+    assert version.get("value") == "1.9.0"
 
 
 def test_manifest_lists_library_and_xcu():
@@ -152,6 +152,9 @@ def test_main_xba_uses_settings_module():
     assert "Settings.GetUseTrackChanges()" in body
     assert "ApplyCorrection" in body
     assert "RecordChanges" in body
+    assert 'And aNewFrags(k) <> ""' not in body
+    assert "ApplyWholeReplace oSel, sCorrected" not in body
+    assert "nNextPos" in body
     # HTTP-status-code проверка
     assert "-w" in body and "http_code" in body
 
