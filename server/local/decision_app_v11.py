@@ -23,11 +23,13 @@ from rupunct_stage import RuPunctStage
 from v10_rules import V10RuleExtension
 from v15_rules import V15RuleExtension
 from v16_rules import V16RuleExtension
+from v17_rules import V17RuleExtension
 from v16_safety import suppress_unsafe_solo_punctuation
 
 _v10 = V10RuleExtension(router.rules.morph_helper)
 _v15 = V15RuleExtension(router.rules.morph_helper)
 _v16 = V16RuleExtension(router.rules.morph_helper)
+_v17 = V17RuleExtension(router.rules.morph_helper)
 _office_punctuation = OfficePunctuationRules(router.rules.morph_helper)
 _structural_punctuation = StructuralPunctuationRules(router.rules.morph_helper)
 _rupunct = RuPunctStage()
@@ -40,6 +42,7 @@ def _rules_with_extensions(text: str):
         + _v10.candidates(text)
         + _v15.candidates(text)
         + _v16.candidates(text)
+        + _v17.candidates(text)
         + _office_punctuation.candidates(text)
         + _structural_punctuation.candidates(text)
     )
@@ -96,7 +99,7 @@ else:
 _protocol_candidates = router.candidates
 async def _client_safe_candidates(text: str, context: str = ""):
     candidates = await _protocol_candidates(text, context)
-    candidates = suppress_unsafe_solo_punctuation(candidates)
+    candidates = suppress_unsafe_solo_punctuation(candidates, text)
     return materialize_client_safe_deletions(text, candidates)
 router.candidates = _client_safe_candidates  # type: ignore[method-assign]
 
