@@ -49,6 +49,17 @@ LOCATIVE_FORMS = {
     "раздел": "разделе", "подраздел": "подразделе", "пункт": "пункте",
     "подпункт": "подпункте", "графу": "графе", "таблицу": "таблице",
 }
+ADJECTIVE_ENDINGS = (
+    "ый", "ий", "ой", "ая", "яя", "ое", "ее", "ые", "ие", "ого", "его",
+    "ому", "ему", "ую", "юю", "ым", "им", "ых", "их", "ыми", "ими",
+)
+PLURAL_CASE_ENDINGS = {
+    "gent": ("ых", "их"),
+    "loct": ("ых", "их"),
+    "datv": ("ым", "им"),
+    "ablt": ("ыми", "ими"),
+    "nomn": ("ые", "ие"),
+}
 
 
 class V16RuleExtension:
@@ -77,12 +88,25 @@ class V16RuleExtension:
             ))
         return out
 
+    @staticmethod
+    def _looks_like_modifier(word: str) -> bool:
+        return word.casefold().endswith(ADJECTIVE_ENDINGS)
+
+    @staticmethod
+    def _surface_agrees(word: str, head_features) -> bool:
+        """Даёт голос неизвестному словарю при однозначном окончании."""
+        if head_features.number != "plur":
+            return False
+        endings = PLURAL_CASE_ENDINGS.get(head_features.case)
+        return bool(endings and word.casefold().endswith(endings))
+
     def _modifier_chain_agreement(self, text: str) -> list[EditCandidate]:
         """Находит один выбивающийся модификатор в цепочке перед существительным.
 
         Исправление создаётся только при поддержке минимум двух соседних
-        определений и единственном результате словоизменения. Благодаря этому
-        правило работает для произвольной лексики, но не угадывает по одной паре.
+        определений и единственном результате словоизменения. Неизвестное
+        словарю определение может подтвердить форму своим русским окончанием,
+        но само по такому эвристическому разбору никогда не исправляется.
         """
         words = list(WORD_RE.finditer(text))
         out: list[EditCandidate] = []
@@ -98,7 +122,9 @@ class V16RuleExtension:
                 current = words[cursor]
                 gap = text[current.end():words[cursor + 1].start()]
                 parses = self.morph.attributive_parses(current.group(0))
-                if not parses or not gap or not gap.isspace():
+                if not gap or not gap.isspace():
+                    break
+                if not parses and not self._looks_like_modifier(current.group(0)):
                     break
                 modifiers.insert(0, (current, parses))
                 cursor -= 1
@@ -110,11 +136,17 @@ class V16RuleExtension:
                 head_features = features(head_parse)
                 mismatches = []
                 for position, (modifier_match, parses) in enumerate(modifiers):
-                    if not any(features(p).agrees_with(head_features) for p in parses):
-                        mismatches.append((position, modifier_match))
+                    agrees = (
+                        any(features(p).agrees_with(head_features) for p in parses)
+                        if parses else self._surface_agrees(modifier_match.group(0), head_features)
+                    )
+                    if not agrees:
+                        mismatches.append((position, modifier_match, parses))
                 if len(mismatches) != 1 or len(modifiers) - 1 < 2:
                     continue
-                _, mismatch = mismatches[0]
+                _, mismatch, parses = mismatches[0]
+                if not parses:
+                    continue
                 source = mismatch.group(0)
                 target = self.morph.inflect_modifier(source, head_parse)
                 if target and target.casefold() != source.casefold():
