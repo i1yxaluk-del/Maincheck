@@ -19,13 +19,13 @@ jobs:
           decision_engine.py hybrid_editor.py morphology.py np_agreement.py spellcheck.py
           verification.py segmentation.py llm_text.py languagetool_stage.py ollama_gec.py
           russian_quality_models.py safe_diff.py syntax_candidates.py local_rules.py v10_rules.py
-          v15_rules.py v16_rules.py v16_safety.py client_safe_edits.py reasoning_cascade.py
-          punctuation_pipeline.py rupunct_stage.py
+          v15_rules.py v16_rules.py v16_safety.py coverage_policy.py client_safe_edits.py
+          reasoning_cascade.py punctuation_pipeline.py rupunct_stage.py
       - run: pytest -q test_v9_agreement.py test_v9_pipeline.py test_v10_regressions.py
       - run: pytest -q test_reasoning_cascade.py test_rupunct_stage.py test_punctuation_pipeline.py test_structural_punctuation.py
       - run: pytest -q test_punctuation_corpus.py test_v31.py test_hybrid_editor.py test_pipelines.py
 
-  v15-regressions:
+  service-regressions:
     runs-on: ubuntu-latest
     defaults: {run: {working-directory: server/local}}
     env: {PYTHONPATH: "${{ github.workspace }}/server"}
@@ -34,18 +34,22 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
-      - run: pytest -q test_v15_regressions.py
+      - run: pytest -q test_v15_regressions.py test_v16_regressions.py test_coverage_policy.py
 
-  v16-regressions:
+  extension-v190:
     runs-on: ubuntu-latest
-    defaults: {run: {working-directory: server/local}}
-    env: {PYTHONPATH: "${{ github.workspace }}/server"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
-      - run: python -m pip install --upgrade pip pytest pymorphy3 pymorphy3-dicts-ru
-      - run: pytest -q test_v16_regressions.py
+      - run: python -m pip install --upgrade pip pytest
+      - run: pytest -q tests/test_extension_package.py tests/test_extension_v190.py
+      - run: python 'Клиент/build_oxt.py' --output dist/AI_Suggester-1.9.0.oxt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AI_Suggester-1.9.0
+          path: dist/AI_Suggester-1.9.0.oxt
+          if-no-files-found: error
 
   quality-gate:
     runs-on: ubuntu-latest
