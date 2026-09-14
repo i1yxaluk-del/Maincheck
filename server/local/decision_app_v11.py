@@ -11,6 +11,7 @@ if _requested_preset == "Z":
     os.environ["LOCAL_RESCUE_MODE"] = "never"
 
 from client_safe_edits import materialize_client_safe_deletions
+from coverage_policy import needs_deep_review, needs_rescue_despite_verified_punctuation
 from decision_app import app, router
 from hybrid_editor import StackInfo
 from punctuation_pipeline import (
@@ -45,6 +46,18 @@ def _rules_with_extensions(text: str):
 
 
 router.rules.candidates = _rules_with_extensions  # type: ignore[method-assign]
+
+# A/B/Y previously skipped rescue as soon as one deterministic comma was
+# present. Preserve the original policy for substantive edits, but force a
+# second language pass when every fast candidate is punctuation-only.
+_original_needs_rescue = router._needs_rescue
+def _coverage_aware_rescue(candidates):
+    original = _original_needs_rescue(candidates)
+    if router.rescue_mode == "never" or not router._rescue_models():
+        return False
+    return needs_rescue_despite_verified_punctuation(candidates, original)
+router._needs_rescue = _coverage_aware_rescue  # type: ignore[method-assign]
+
 _base_candidates = router.candidates
 
 async def _candidates_with_rupunct(text: str, context: str = ""):
@@ -61,15 +74,19 @@ if _requested_preset == "Z":
 
     async def _reasoning_candidates(text: str, context: str = ""):
         fast = await _fast_candidates(text, context)
-        mode = os.getenv("REASONING_MODE", "fallback").strip().lower()
-        if mode == "never" or (mode != "always" and fast):
+        mode = os.getenv("REASONING_MODE", "coverage").strip().lower()
+        if mode == "never":
+            return fast
+        if mode == "fallback" and fast:
+            return fast
+        if mode == "coverage" and not needs_deep_review(text, fast):
             return fast
         reasoned = await _cascade.candidates(text, context)
         return router.arbiter.merge(fast + reasoned)
 
     router.candidates = _reasoning_candidates  # type: ignore[method-assign]
     router.info = StackInfo(
-        "Z", "fast punctuation ensemble + fallback DeepSeek-R1 7B",
+        "Z", "coverage-aware fast ensemble + DeepSeek-R1 grammar review",
         _cascade.reasoner, True,
     )
     router.ollama_required = lambda: True  # type: ignore[method-assign]
