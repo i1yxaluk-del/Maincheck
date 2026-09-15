@@ -8,7 +8,7 @@ User=service
 WorkingDirectory=/home/service/llama/server/local
 EnvironmentFile=/home/service/llama/server/local/.env.v20
 Environment=PYTHONPATH=/home/service/llama/server
-ExecStart=/home/service/llama/server/local/venv/bin/uvicorn v20.openvino_app:app --host 0.0.0.0 --port 8000
+ExecStart=/home/service/llama/server/local/venv-openvino/bin/uvicorn v20.openvino_app:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=900

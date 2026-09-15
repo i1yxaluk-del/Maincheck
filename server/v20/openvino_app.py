@@ -1,18 +1,22 @@
 from __future__ import annotations
 import asyncio,os,re
+from pathlib import Path
 from .api import make_app
 from .protocol import Edit,apply_edits
 
 class OpenVinoEngine:
     name='openvino-seq2seq'
-    def __init__(self): self.model_id=os.getenv('V20_OPENVINO_MODEL','ai-forever/sage-fredt5-large'); self.model=None; self.tokenizer=None; self.error='not loaded'
+    def __init__(self): self.model_id=os.getenv('V20_OPENVINO_MODEL','ai-forever/sage-fredt5-large'); self.model=None; self.tokenizer=None; self.error='not loaded'; self.attempted=False
     def _load(self):
         if self.model is not None:return
+        if self.attempted:raise RuntimeError(self.error)
+        self.attempted=True
         try:
             from transformers import AutoTokenizer
             from optimum.intel.openvino import OVModelForSeq2SeqLM
+            local_ir=Path(self.model_id).is_dir()
             self.tokenizer=AutoTokenizer.from_pretrained(self.model_id)
-            self.model=OVModelForSeq2SeqLM.from_pretrained(self.model_id,export=True,compile=True)
+            self.model=OVModelForSeq2SeqLM.from_pretrained(self.model_id,export=not local_ir,device='CPU',compile=True)
             self.error=''
         except Exception as exc:self.error=f'{type(exc).__name__}: {exc}';raise
     def _infer(self,text):
@@ -20,7 +24,6 @@ class OpenVinoEngine:
         out=self.model.generate(**inputs,max_new_tokens=min(256,max(32,len(inputs['input_ids'][0])+32)),num_beams=1)
         corrected=self.tokenizer.decode(out[0],skip_special_tokens=True).strip()
         from difflib import SequenceMatcher
-        # Source tokens retain true offsets in Writer text; flattened input is only a model projection.
         src=list(re.finditer(r'[А-Яа-яЁёA-Za-z0-9-]+',text)); dst=list(re.finditer(r'[А-Яа-яЁёA-Za-z0-9-]+',corrected)); edits=[]
         for tag,i1,i2,j1,j2 in SequenceMatcher(None,[x.group() for x in src],[x.group() for x in dst],autojunk=False).get_opcodes():
             if tag=='replace' and i2-i1==j2-j1==1:
