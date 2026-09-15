@@ -3,11 +3,12 @@ uvicorn[standard]>=0.29.0
 httpx>=0.27.0
 python-multipart>=0.0.9
 python-dotenv>=1.0.0
+python-docx>=1.1.0
 
-# All three local stacks share this environment; F adds the optional HF runtime.
+# Все локальные пресеты используют одно окружение.
 -r requirements-experimental.txt
 
-# Deterministic Russian morphology/syntax components.
+# Детерминированная русская морфология и синтаксис.
 pymorphy3>=2.0.0
 pymorphy3-dicts-ru>=2.4.0
 natasha>=1.6.0
