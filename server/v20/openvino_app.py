@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio,os,re
+from pathlib import Path
 from .api import make_app
 from .protocol import Edit,apply_edits
 
@@ -13,8 +14,9 @@ class OpenVinoEngine:
         try:
             from transformers import AutoTokenizer
             from optimum.intel.openvino import OVModelForSeq2SeqLM
+            local_ir=Path(self.model_id).is_dir()
             self.tokenizer=AutoTokenizer.from_pretrained(self.model_id)
-            self.model=OVModelForSeq2SeqLM.from_pretrained(self.model_id,export=True,compile=True)
+            self.model=OVModelForSeq2SeqLM.from_pretrained(self.model_id,export=not local_ir,device='CPU',compile=True)
             self.error=''
         except Exception as exc:self.error=f'{type(exc).__name__}: {exc}';raise
     def _infer(self,text):

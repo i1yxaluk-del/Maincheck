@@ -1,0 +1,12 @@
+# Isolated because the main cascade currently pins Transformers 5.x,
+# while Optimum's TorchScript exporter for FRED-T5 requires the stable 4.x path.
+fastapi>=0.111,<1
+uvicorn[standard]>=0.29,<1
+httpx>=0.27,<1
+python-multipart>=0.0.9
+transformers==4.53.3
+torch>=2.5,<3
+optimum-intel[openvino]>=1.24,<2
+openvino>=2025.4,<2026.1
+sentencepiece>=0.2
+safetensors>=0.7

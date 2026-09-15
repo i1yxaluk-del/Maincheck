@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-PROFILE=${1:?profile}; ROOT=${MAINCHK_ROOT:-/home/service/llama}; LOCAL="$ROOT/server/local"; VENV="$LOCAL/venv"; ENV="$LOCAL/.env.v20"; MODEL_DIR="$ROOT/models/v20"; LLAMA_DIR="$ROOT/vendor/llama.cpp"; LOG=${V20_INSTALL_LOG:-/var/log/ai-suggester-v20-install.log}; STATUS=/run/maincheck-v20-install.status; READY=/run/maincheck-v20-ready
+PROFILE=${1:?profile}; ROOT=${MAINCHK_ROOT:-/home/service/llama}; LOCAL="$ROOT/server/local"; VENV="$LOCAL/venv"; OV_VENV="$LOCAL/venv-openvino"; ENV="$LOCAL/.env.v20"; MODEL_DIR="$ROOT/models/v20"; LLAMA_DIR="$ROOT/vendor/llama.cpp"; LOG=${V20_INSTALL_LOG:-/var/log/ai-suggester-v20-install.log}; STATUS=/run/maincheck-v20-install.status; READY=/run/maincheck-v20-ready
 exec > >(tee -a "$LOG") 2>&1
 log(){ printf '%s %s\n' "$(date -Is)" "$*"; }
 fail(){ code=$?; printf 'failed profile=%s line=%s code=%s\n' "$PROFILE" "$1" "$code" >"$STATUS"; log "V20 INSTALL FAILED profile=$PROFILE line=$1 code=$code"; exit "$code"; }; trap 'fail $LINENO' ERR
@@ -8,11 +8,25 @@ rm -f "$READY"; printf 'running profile=%s\n' "$PROFILE" >"$STATUS"; log "V20 IN
 install -d -o service -g service "$MODEL_DIR" "$ROOT/results" "$ROOT/vendor"
 for u in ai-suggester.service v20-main.service v20-openvino.service v20-llama-json.service v20-llama-backend.service; do systemctl disable --now "$u" 2>/dev/null || true; done
 if [[ "$PROFILE" != main ]]; then systemctl stop ollama.service 2>/dev/null || true; fi
-"$VENV/bin/pip" install --disable-pip-version-check -r "$LOCAL/requirements.txt" python-multipart
-if [[ "$PROFILE" == openvino ]]; then "$VENV/bin/pip" install --disable-pip-version-check 'openvino>=2025.4,<2027' 'optimum-intel>=1.24' sentencepiece; fi
-pkg_install(){ if command -v dnf >/dev/null; then dnf install -y git cmake gcc-c++ openblas-devel curl; elif command -v apt-get >/dev/null; then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y git cmake g++ libopenblas-dev curl; else log 'no supported package manager'; return 1; fi; }
+pkg_build(){ if command -v dnf >/dev/null; then dnf install -y git cmake gcc-c++ openblas-devel curl; elif command -v apt-get >/dev/null; then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y git cmake g++ libopenblas-dev curl; else log 'no supported package manager'; return 1; fi; }
+pkg_venv(){ if command -v dnf >/dev/null; then dnf install -y python3; elif command -v apt-get >/dev/null; then apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv; else return 1; fi; }
+OPENVINO_RUNTIME=${V20_OPENVINO_MODEL:-ai-forever/sage-fredt5-large}
+if [[ "$PROFILE" == openvino ]]; then
+  if [[ ! -x "$OV_VENV/bin/python" ]]; then python3 -m venv "$OV_VENV" || { pkg_venv; python3 -m venv "$OV_VENV"; }; chown -R service:service "$OV_VENV"; fi
+  "$OV_VENV/bin/pip" install --disable-pip-version-check -r "$LOCAL/requirements-v20-openvino.txt"
+  OV_SOURCE=${V20_OPENVINO_MODEL:-ai-forever/sage-fredt5-large}; OV_DIR="$MODEL_DIR/openvino-sage-fredt5-large"
+  if [[ ! -s "$OV_DIR/openvino_encoder_model.xml" || ! -s "$OV_DIR/openvino_decoder_model.xml" ]]; then
+    TMP_OV="$OV_DIR.tmp"; rm -rf "$TMP_OV"; install -d -o service -g service "$TMP_OV" "$MODEL_DIR/hf-cache"
+    log "V20 OPENVINO EXPORT source=$OV_SOURCE target=$OV_DIR"
+    runuser -u service -- env HF_HOME="$MODEL_DIR/hf-cache" "$OV_VENV/bin/optimum-cli" export openvino --model "$OV_SOURCE" --task text2text-generation-with-past "$TMP_OV"
+    rm -rf "$OV_DIR"; mv "$TMP_OV" "$OV_DIR"; chown -R service:service "$OV_DIR"
+  fi
+  OPENVINO_RUNTIME=$OV_DIR
+else
+  "$VENV/bin/pip" install --disable-pip-version-check -r "$LOCAL/requirements.txt" python-multipart
+fi
 if [[ "$PROFILE" == llama-json ]]; then
-  if ! command -v git >/dev/null || ! command -v cmake >/dev/null || ! command -v g++ >/dev/null; then pkg_install; fi
+  if ! command -v git >/dev/null || ! command -v cmake >/dev/null || ! command -v g++ >/dev/null; then pkg_build; fi
   if [[ ! -x "$LLAMA_DIR/build/bin/llama-server" ]]; then
     [[ -d "$LLAMA_DIR/.git" ]] || runuser -u service -- git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$LLAMA_DIR"
     runuser -u service -- cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" -DGGML_NATIVE=ON -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS
@@ -30,7 +44,7 @@ RAG_DOCUMENTS_DIR=$ROOT/RAG/documents
 REASONING_MODE=coverage
 REASONING_TOTAL_TIMEOUT=20
 OLLAMA_URL=http://127.0.0.1:11434
-V20_OPENVINO_MODEL=${V20_OPENVINO_MODEL:-ai-forever/sage-fredt5-large}
+V20_OPENVINO_MODEL=$OPENVINO_RUNTIME
 V20_LLAMA_URL=http://127.0.0.1:8091
 V20_LLAMA_MODEL_NAME=local-gec
 V20_LLAMA_TIMEOUT=25
