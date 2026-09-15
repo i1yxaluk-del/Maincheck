@@ -40,5 +40,11 @@ EOF
 install -o service -g service -m 0640 "$TMP" "$ENV"; rm -f "$TMP"
 for f in "$LOCAL"/v20-*.service; do install -m 0644 "$f" /etc/systemd/system/; done; systemctl daemon-reload
 case "$PROFILE" in main) systemctl enable --now ollama.service 2>/dev/null || true; systemctl enable --now v20-main.service; SERVICE=v20-main.service;; openvino) systemctl enable --now v20-openvino.service; SERVICE=v20-openvino.service;; llama-json) systemctl enable --now v20-llama-backend.service v20-llama-json.service; SERVICE=v20-llama-json.service;; esac
-for _ in $(seq 1 180); do if curl --max-time 30 -fsS http://127.0.0.1:8000/health >/dev/null; then printf '%s\n' "$PROFILE" >"$READY"; printf 'ready profile=%s service=%s\n' "$PROFILE" "$SERVICE" >"$STATUS"; log "V20 READY profile=$PROFILE service=$SERVICE"; exit 0; fi; sleep 5; done
+for i in $(seq 1 180); do
+  REPLY=$(curl --max-time 30 -sS -w $'\n%{http_code}' http://127.0.0.1:8000/health 2>&1 || true); HTTP=${REPLY##*$'\n'}; BODY=${REPLY%$'\n'*}
+  if [[ "$HTTP" == 200 ]]; then printf '%s\n' "$PROFILE" >"$READY"; printf 'ready profile=%s service=%s\n' "$PROFILE" "$SERVICE" >"$STATUS"; log "V20 READY profile=$PROFILE service=$SERVICE"; exit 0; fi
+  if [[ "$PROFILE" == openvino && "$HTTP" == 503 ]]; then log "V20 OPENVINO HEALTH FAILED body=$BODY"; false; fi
+  (( i % 6 == 0 )) && log "V20 HEALTH WAIT profile=$PROFILE http=$HTTP body=$BODY"
+  sleep 5
+done
 log "health timeout profile=$PROFILE"; systemctl status "$SERVICE" --no-pager || true; exit 4
