@@ -1,10 +1,15 @@
 from __future__ import annotations
-import argparse,json,statistics,time,urllib.request,uuid
+import argparse,json,statistics,sys,time,urllib.request,uuid
 from pathlib import Path
 from .protocol import parse_corrected
 
-def load_cases(path):
-    cases=[json.loads(x) for x in Path(path).read_text(encoding='utf-8').splitlines() if x.strip()]
+DEFAULT_CORPUS=Path(__file__).with_name('cases.jsonl')
+
+def load_cases(path=None):
+    requested=Path(path) if path else DEFAULT_CORPUS
+    target=requested if requested.exists() else DEFAULT_CORPUS
+    if target != requested: print(f'V20 CORPUS FALLBACK requested={requested} using={target}',file=sys.stderr)
+    cases=[json.loads(x) for x in target.read_text(encoding='utf-8').splitlines() if x.strip()]
     ids=[c.get('id') for c in cases]
     if not cases or len(ids)!=len(set(ids)) or not all(ids):raise ValueError('corpus needs unique ids')
     if not any(c.get('clean') for c in cases) or not any(not c.get('clean') for c in cases):raise ValueError('corpus needs positive and clean controls')
@@ -29,7 +34,7 @@ def run(url,cases):
 def self_test():
     sample='===CORRECTED===\nтекст\n===CHANGES===\n1. Ошибок не найдено.\n===END===';assert parse_corrected(sample)=='текст';print('V20 BENCHMARK SELFTEST OK')
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--self-test',action='store_true');p.add_argument('--validate-corpus');p.add_argument('--url');p.add_argument('--corpus',default='tests/v20/cases.jsonl');p.add_argument('--out');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--self-test',action='store_true');p.add_argument('--validate-corpus');p.add_argument('--url');p.add_argument('--corpus',default=str(DEFAULT_CORPUS));p.add_argument('--out');a=p.parse_args()
     if a.self_test:self_test();return 0
     cases=load_cases(a.validate_corpus or a.corpus)
     if a.validate_corpus:print(f'V20 CORPUS OK cases={len(cases)}');return 0
