@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse,json,statistics,sys,time,urllib.request,uuid
+import argparse,json,statistics,sys,time,urllib.error,urllib.request,uuid
 from pathlib import Path
 from .protocol import parse_corrected
 
@@ -26,7 +26,8 @@ def run(url,cases):
         body,b=multipart(c['text'],c.get('context',''));req=urllib.request.Request(url.rstrip('/')+'/suggest',body,{'Content-Type':f'multipart/form-data; boundary={b}'})
         t=time.perf_counter()
         try: payload=urllib.request.urlopen(req,timeout=c.get('timeout',90)).read().decode(); corrected=parse_corrected(payload);error=''
-        except Exception as exc: corrected='';error=str(exc)
+        except urllib.error.HTTPError as exc: corrected='';error=f'HTTP {exc.code}: {exc.read().decode("utf-8","replace")[:2000]}'
+        except Exception as exc: corrected='';error=f'{type(exc).__name__}: {exc}'
         ms=(time.perf_counter()-t)*1000; missing=[x for x in c.get('must_contain',[]) if x not in corrected]; forbidden=[x for x in c.get('must_not_contain',[]) if x in corrected]; layout=corrected.count('\n')==c['text'].count('\n'); clean_ok=(corrected==c['text']) if c.get('clean') else True
         rows.append({'id':c['id'],'clean':bool(c.get('clean')),'pass':bool(not error and not missing and not forbidden and layout and clean_ok),'layout_ok':layout,'changed':corrected!=c['text'] if corrected else False,'latency_ms':round(ms,1),'missing_required':missing,'present_forbidden':forbidden,'corrected':corrected,'error':error})
     times=[r['latency_ms'] for r in rows]; pos=[r for r in rows if not r['clean']]; clean=[r for r in rows if r['clean']]; passed=sum(r['pass'] for r in rows);p95=sorted(times)[max(0,int(.95*len(times))-1)]
