@@ -10,15 +10,20 @@ NUMERAL_RE=re.compile(r"\b(?P<predicate>[А-Яа-яЁё-]+)\s+(?:два|две|�
 PROCESS_COORD_RE=re.compile(r"\bпри\s+(?P<first>[А-Яа-яЁё-]+)(?:\s+[А-Яа-яЁё-]+){1,4}\s+и\s+(?P<second>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
 ORDER_PROCESS_RE=re.compile(r"\bпорядк[А-Яа-яЁё-]*\s+(?P<process>[А-Яа-яЁё-]+)\s+(?P<object>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
 REPORTING_LEMMAS={'выявить','обнаружить','установить','зафиксировать','зарегистрировать'};PROCESS_SUFFIXES=('ция','ение','ание','тие','ство');PREPOSITIONS={'в','во','на','по','с','со','из','от','у','для','при','к','ко','о','об','под','над','между','через'}
+def _render(word,parse,grams):
+ try:form=parse.inflect(grams)
+ except Exception:form=None
+ if not form or not form.word:return None
+ fixed=preserve_capitalization(word,preserve_yo(word,form.word));return fixed if fixed.casefold()!=word.casefold() else None
 def _from_parses(word,parses,grams):
- forms=set()
- for parse in parses:
-  try:form=parse.inflect(grams)
-  except Exception:form=None
-  if form and form.word:
-   fixed=preserve_capitalization(word,preserve_yo(word,form.word))
-   if fixed.casefold()!=word.casefold():forms.add(fixed)
- return next(iter(forms)) if len(forms)==1 else None
+ forms={fixed for parse in parses if (fixed:=_render(word,parse,grams))};return next(iter(forms)) if len(forms)==1 else None
+def _best_form(word,parses,grams):
+ """Prefer common lexical parses over name/homonym readings in a governed frame."""
+ ranked=sorted(parses,key=lambda p:(any(mark in p.tag for mark in ('Name','Surn','Patr','Geox')), -float(getattr(p,'score',0.0))))
+ for parse in ranked:
+  fixed=_render(word,parse,grams)
+  if fixed:return fixed
+ return None
 class GovernmentFrameStage:
  def __init__(self,morphology=None):self.morph=morphology or get_morphology();self.calls=0;self.found={'coordination':0,'dative':0,'po':0,'locative':0,'numeral':0,'process_coordination':0,'order_process':0,'auxiliary':0}
  def _coordination(self,text):
@@ -49,20 +54,18 @@ class GovernmentFrameStage:
     nouns=self.morph.noun_parses(w.group())
     if not nouns:continue
     gent=[p for p in nouns if p.tag.case=='gent' and p.tag.number]
-    # Prefer an explicit genitive error over rare homonymous dative
-    # readings (e.g. proper-name analyses of «приказа»).
     if gent:head=w;head_parses=gent;break
     if any(p.tag.case=='datv' for p in nouns):head=None;break
     if not any(p.tag.case=='ablt' for p in nouns):break
    if head is None:continue
-   numbers={p.tag.number for p in head_parses if p.tag.number}
-   if len(numbers)!=1:continue
-   number=next(iter(numbers));fixed_head=_from_parses(head.group(),head_parses,{'datv',number})
+   preferred=sorted(head_parses,key=lambda p:(any(mark in p.tag for mark in ('Name','Surn','Patr','Geox')),-float(getattr(p,'score',0.0))))
+   if not preferred or not preferred[0].tag.number:continue
+   number=preferred[0].tag.number;fixed_head=_best_form(head.group(),[p for p in preferred if p.tag.number==number],{'datv',number})
    if fixed_head:out.append(EditCandidate(head.group(),fixed_head,.998,'rule-dative-frame',f'Предлог «{prep.group()}» требует дательного падежа.',start=head.start(),sources=('rule-dative-frame',)))
    modifier_added=False
    for w in window:
     if w.start()>=head.start():break
-    parses=[p for p in self.morph.attributive_parses(w.group()) if p.tag.case=='gent' and p.tag.number==number];fixed=_from_parses(w.group(),parses,{'datv',number}) if parses else None
+    parses=[p for p in self.morph.attributive_parses(w.group()) if p.tag.case=='gent' and p.tag.number==number];fixed=_best_form(w.group(),parses,{'datv',number}) if parses else None
     if fixed:out.append(EditCandidate(w.group(),fixed,.998,'rule-dative-frame',f'Определение после «{prep.group()}» согласуется с существительным в дательном падеже.',start=w.start(),sources=('rule-dative-frame',)));modifier_added=True
    if fixed_head or modifier_added:self.found['dative']+=1
   return out
@@ -78,17 +81,17 @@ class GovernmentFrameStage:
   out=[]
   for m in PROCESS_COORD_RE.finditer(text):
    for name in ('first','second'):
-    word=m.group(name);parses=self.morph.noun_parses(word)
-    if not any(x.endswith(PROCESS_SUFFIXES) for x in self.morph.lemmas(word)):continue
-    fixed=_from_parses(word,parses,{'loct','sing'})
+    word=m.group(name);parses=[p for p in self.morph.noun_parses(word) if p.normal_form.endswith(PROCESS_SUFFIXES)]
+    if not parses:continue
+    fixed=_best_form(word,parses,{'loct','sing'})
     if fixed:out.append(EditCandidate(word,fixed,.997,'rule-pri-process-coordination','Однородные названия процессов после «при» употребляются в предложном единственного числа.',start=m.start(name),sources=('rule-pri-process-coordination',)));self.found['process_coordination']+=1
   return out
  def _order_process(self,text):
   out=[]
   for m in ORDER_PROCESS_RE.finditer(text):
-   word=m.group('process');parses=self.morph.noun_parses(word)
-   if not any(x.endswith(PROCESS_SUFFIXES) for x in self.morph.lemmas(word)):continue
-   fixed=_from_parses(word,parses,{'gent','sing'})
+   word=m.group('process');parses=[p for p in self.morph.noun_parses(word) if p.normal_form.endswith(PROCESS_SUFFIXES)]
+   if not parses:continue
+   fixed=_best_form(word,parses,{'gent','sing'})
    if fixed:out.append(EditCandidate(word,fixed,.998,'rule-order-process','После слова «порядок» название процесса употребляется в родительном единственного числа.',start=m.start('process'),sources=('rule-order-process',)));self.found['order_process']+=1
   return out
  def _locative(self,text):
