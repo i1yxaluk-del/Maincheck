@@ -9,21 +9,20 @@ Read first. Keep <3 KB. After each repo task update **NOW**, prepend one **LOG**
 - Only production unit: `ai-suggester.service`; never recreate `v20-main.service`.
 - API: `POST /suggest`, multipart files `text` + `context`; preserve cloud contract.
 - No phrase-specific patches: fix morphology/syntax/safety classes + regressions.
-- Claim quality only after target `scripts/v20/benchmark-current.sh`.
+- Claim quality only after target `scripts/v20/benchmark-current.sh` and real-document replay.
 
 ## NOW — 2026-09-17
-- PR #50 merged/deployed; host remains on `feat/v20-gec-engine-lab`.
-- Target deep-40 v2: **39/40**; recall .967; clean 1.0; FP 0; exact .975; median 626 ms; p95 8375 ms.
-- All user cases: 19/19. Only failure: `deep-soglasno-vopreki`: `согласно приказа` not corrected; `вопреки требований` corrected by LT.
-- Unit `test_soglasno` passes, so remaining defect is production composition/filtering, not isolated morphology.
-- Transformers warning is absent in latest logs: GenerationConfig fix confirmed.
-- Tail latency source: RAG lookup blocks ~14–15 s before `RAG evidence`; SAGE/LT deltas stay ~0.4–0.6 s. Next: bounded RAG query timeout/circuit breaker.
-- Next code: final deterministic closure after upstream merge; end-to-end combined-frame regression; bounded RAG retrieval. Open a new PR; do not reuse merged #50.
+- PR #53 open: https://github.com/i1yxaluk-del/Maincheck/pull/53; head `6855fd76049cc93ba10c91480784a893ab15da2b`; all 24 current CI jobs green.
+- Real incident: correct `два государственных контракта` was damaged into `два ггосударственногоконтракта`; `поставщиком, Центром` became `ппоставщикомЦентром`.
+- #53 adds generative word-boundary/duplicate/capital-concatenation guards, same-sentence family taint, and valid 2–4 numeral-government protection.
+- #53 also reintroduces deterministic legal/government candidates at the final production boundary, targeting the remaining `согласно приказа` loss.
+- Baseline target deep-40: 39/40; recall .967; clean 1.0; FP 0; exact .975; median 589 ms; p95 1028 ms.
+- One 14.8 s RAG outlier remains outside p95; handle retrieval timeout separately after quality validation.
+- Next: merge #53, pull existing branch, finalize, run deep-40 and replay the full reported paragraph. Do not claim fixed before target output.
 
 ## Active files
-- Core: `server/v20/main_app.py`, `server/local/decision_app_v12.py`, `government_frame_stage.py`, `production_safety.py`, `contextual_agreement.py`, `legal_style_stage.py`, `russian_quality_models.py`.
-- Tests: `server/local/test_v20_production.py`, `scripts/v20/build_deep_corpus_v2.py`, `scripts/v20/benchmark-current.sh`, `.github/workflows/v20-engine-lab.yml`.
-- Service: `server/local/ai-suggester.service`.
+- `server/local/production_safety.py`, `server/v20/main_app.py`, `server/local/test_v20_real_document_safety.py`, `.github/workflows/v20-engine-lab.yml`.
+- Core context: `decision_app_v12.py`, `government_frame_stage.py`, `safe_diff.py`, `decision_engine.py`.
 
 ## Host commands
 ```bash
@@ -35,7 +34,7 @@ sudo bash scripts/v20/benchmark-current.sh
 ```
 
 ## LOG (newest first)
-- 2026-09-17: target after #50 reached 39/40; final miss is production composition; RAG caused 14–15 s outliers; Transformers warning gone.
-- 2026-09-17: #50 fixed dative homonyms, `порядок + процесс`, and model GenerationConfig; CI 23/23 green.
-- 2026-09-17: target after #49 reached 38/40 from 31/40; clean 1.0, FP 0.
-- 2026-09-17: #49 added bracket safety, copular boundaries, variable dative NP, coordinated processes, auxiliary agreement, normalized duplicate removal, deep corpus v2.
+- 2026-09-17: opened #53; structural generative guards + numeral protection + deterministic final closure; CI 24/24 green.
+- 2026-09-17: real paragraph exposed accepted SAGE word concatenation/duplication and false agreement after `два` despite 39/40 benchmark.
+- 2026-09-17: target after #50 stayed 39/40; median 589 ms, p95 1028 ms, one hidden 14.8 s RAG outlier.
+- 2026-09-17: #50 fixed dative homonyms, `порядок + процесс`, and model GenerationConfig; CI green.
