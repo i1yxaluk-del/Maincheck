@@ -8,7 +8,7 @@ DOC_RE=re.compile(r"\bв\s+(?P<target>раздел|подраздел|пункт
 STATIVE_RE=re.compile(r"\b(?:приведен[аоы]?|указан[аоы]?|отражен[аоы]?|содержится|содержатся|зафиксирован[аоы]?|представлен[аоы]?)\b",re.IGNORECASE)
 NUMERAL_RE=re.compile(r"\b(?P<predicate>[А-Яа-яЁё-]+)\s+(?:два|две|три|четыре)\s+[А-Яа-яЁё-]+\b",re.IGNORECASE);AUX_RE=re.compile(r"\b(?P<aux>был|была|было)\s+(?P<predicate>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
 PROCESS_COORD_RE=re.compile(r"\bпри\s+(?P<first>[А-Яа-яЁё-]+)(?:\s+[А-Яа-яЁё-]+){1,4}\s+и\s+(?P<second>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
-ORDER_PROCESS_RE=re.compile(r"\bпорядк[А-Яа-яЁё-]*\s+(?P<process>[А-Яа-яЁё-]+)\s+(?P<object>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
+ORDER_PROCESS_RE=re.compile(r"\bпоряд(?:ок|ка|ку|ком|ке|ки|ков|кам|ками|ках)\s+(?P<process>[А-Яа-яЁё-]+)\s+(?P<object>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
 REPORTING_LEMMAS={'выявить','обнаружить','установить','зафиксировать','зарегистрировать'};PROCESS_SUFFIXES=('ция','ение','ание','тие','ство');PREPOSITIONS={'в','во','на','по','с','со','из','от','у','для','при','к','ко','о','об','под','над','между','через'}
 def _render(word,parse,grams):
  try:form=parse.inflect(grams)
