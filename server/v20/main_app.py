@@ -12,6 +12,7 @@ _SHORT_GRAMMAR_SIGNAL=re.compile(r'\b(?:был|была|было|были|ост
 _legal=LegalStyleStage();_frames=GovernmentFrameStage(router.rules.morph_helper);_safety=ProductionSafety();_rules=router.rules.candidates
 router.rules.candidates=lambda text:_rules(text)+_legal.candidates(text)+_frames.candidates(text)
 def _production_review(text,candidates):
+ if candidates and all(c.category.startswith('rule-') for c in candidates):return False
  if candidates and any(not is_punctuation_only(c) for c in candidates):return False
  if len(text.strip())>=180:return True
  return bool(_SHORT_GRAMMAR_SIGNAL.search(text))
