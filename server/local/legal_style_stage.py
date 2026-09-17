@@ -2,21 +2,13 @@
 from __future__ import annotations
 import re
 from decision_engine import EditCandidate
-
 WORD_RE=re.compile(r"[А-Яа-яЁёA-Za-z]+(?:-[А-Яа-яЁёA-Za-z]+)*")
 AUDIT_CUE=re.compile(r"\b(?:проверк(?:а|ой|е|и)|установлен[аоы]?|выявлен[аоы]?|обнаружен[аоы]?|нарушен[аоы]?|не\s+(?:разработан|утвержден|определен|установлен|представлен)[аоы]?)\b",re.IGNORECASE)
 RELATION_ERROR=re.compile(r"\bв(?P<gap>\s+)отношениях(?P<object>\s+(?!между\b|с\b|по\b)[А-Яа-яЁё-]+)",re.IGNORECASE)
 AMOUNT_COMMA=re.compile(r"\bпостановлен[А-Яа-яЁё-]*[\s\S]{0,500}?(?P<comma>,)(?P<gap>\s+)на\s+сумму\s+\d",re.IGNORECASE)
-FIXED_RULES=(
- (re.compile(r"\bв\s+соответствие\s+с\b",re.IGNORECASE),"в соответствии с","Устойчивая конструкция «в соответствии с»."),
- (re.compile(r"\bпо\s+истечению\b",re.IGNORECASE),"по истечении","Нормативная временная конструкция «по истечении»."),
- (re.compile(r"\bпо\s+окончанию\b",re.IGNORECASE),"по окончании","Нормативная временная конструкция «по окончании»."),
- (re.compile(r"\bпо\s+прибытию\b",re.IGNORECASE),"по прибытии","Нормативная временная конструкция «по прибытии»."),
- (re.compile(r"\bв\s+течении(?=\s+(?:срока|дня|дней|месяца|месяцев|года|лет|периода)\b)",re.IGNORECASE),"в течение","Производный предлог «в течение»."),
-)
+FIXED_RULES=((re.compile(r"\bв\s+соответствие\s+с\b",re.IGNORECASE),'в соответствии с','Устойчивая конструкция «в соответствии с».'),(re.compile(r"\bпо\s+истечению\b",re.IGNORECASE),'по истечении','Нормативная временная конструкция «по истечении».'),(re.compile(r"\bпо\s+окончанию\b",re.IGNORECASE),'по окончании','Нормативная временная конструкция «по окончании».'),(re.compile(r"\bпо\s+прибытию\b",re.IGNORECASE),'по прибытии','Нормативная временная конструкция «по прибытии».'),(re.compile(r"\bв\s+течении(?=\s+(?:срока|дня|дней|месяца|месяцев|года|лет|периода)\b)",re.IGNORECASE),'в течение','Производный предлог «в течение».'),(re.compile(r"\bвследствии\b",re.IGNORECASE),'вследствие','Производный предлог пишется «вследствие».'))
 def _case_like(source,replacement):return replacement[:1].upper()+replacement[1:] if source[:1].isupper() else replacement
 def _inside_quotes(text,pos):return text.rfind('«',0,pos+1)>text.rfind('»',0,pos+1)
-
 class LegalStyleStage:
  def __init__(self):self.calls=0;self.found={'repetition':0,'government':0,'collocation':0,'legal_punctuation':0}
  def _duplicates(self,text):
@@ -38,8 +30,7 @@ class LegalStyleStage:
   for m in RELATION_ERROR.finditer(text):
    left=max(0,text.rfind('.',0,m.start())+1);right=text.find('.',m.end());right=len(text) if right<0 else right+1
    if not AUDIT_CUE.search(text[left:right]):continue
-   source='отношениях';start=m.start()+m.group(0).lower().find(source);after=_case_like(text[start:start+len(source)],'отношении')
-   out.append(EditCandidate(text[start:start+len(source)],after,1.0,'rule-legal-government','В значении «касательно объекта» употребляется «в отношении».',start=start,sources=('rule-legal-government',)));self.found['government']+=1
+   source='отношениях';start=m.start()+m.group(0).lower().find(source);after=_case_like(text[start:start+len(source)],'отношении');out.append(EditCandidate(text[start:start+len(source)],after,1.0,'rule-legal-government','В значении «касательно объекта» употребляется «в отношении».',start=start,sources=('rule-legal-government',)));self.found['government']+=1
   return out
  def _fixed(self,text):
   out=[]
@@ -51,6 +42,5 @@ class LegalStyleStage:
   for m in AMOUNT_COMMA.finditer(text):
    start=m.start('comma');out.append(EditCandidate(',', '',1.0,'rule-legal-punctuation','Удалена лишняя запятая: оборот «на сумму …» связан со сказуемым и не обособляется.',start=start,sources=('rule-legal-punctuation',)));self.found['legal_punctuation']+=1
   return out
- def candidates(self,text):
-  self.calls+=1;return self._duplicates(text)+self._government(text)+self._fixed(text)+self._legal_punctuation(text)
+ def candidates(self,text):self.calls+=1;return self._duplicates(text)+self._government(text)+self._fixed(text)+self._legal_punctuation(text)
  def metrics(self):return {'calls':self.calls,**self.found}
