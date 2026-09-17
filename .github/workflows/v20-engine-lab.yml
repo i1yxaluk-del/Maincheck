@@ -13,6 +13,7 @@ on:
       - 'server/local/decision_engine.py'
       - 'server/local/safe_diff.py'
       - 'server/local/test_v20_production.py'
+      - 'server/local/test_v20_real_document_safety.py'
       - 'scripts/v20/**'
       - 'tests/v20/**'
       - 'docs/v20/**'
@@ -43,13 +44,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [department, section, training, subject, blagodarya, spelling, safety, complex, deepfix, clean]
+        case: [department, section, training, subject, blagodarya, soglasno, spelling, safety, complex, dative_measures, dative_order, process_coord, auxiliary, order_process, legal_repeat, contextual, clean]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - run: python -m pip install pytest pymorphy3 pymorphy3-dicts-ru
       - run: PYTHONPATH=server/local pytest -q server/local/test_v20_production.py::test_${{ matrix.case }}
+  real-document-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: python -m pip install pytest pymorphy3 pymorphy3-dicts-ru
+      - run: PYTHONPATH=server/local pytest -q server/local/test_v20_real_document_safety.py
   network-contract:
     runs-on: ubuntu-latest
     steps:
