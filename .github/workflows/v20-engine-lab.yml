@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [department, section, training, subject, blagodarya, spelling, safety, complex, deepfix, clean]
+        case: [department, section, training, subject, blagodarya, soglasno, spelling, safety, complex, dative_measures, dative_order, process_coord, auxiliary, order_process, legal_repeat, contextual, clean]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
