@@ -4,6 +4,9 @@ on:
     paths:
       - 'server/v20/**'
       - 'server/local/v20-*.service'
+      - 'server/local/ai-suggester.service'
+      - 'server/local/legal_style_stage.py'
+      - 'server/local/decision_engine.py'
       - 'scripts/v20/**'
       - 'tests/v20/**'
       - 'docs/v20/**'
@@ -22,4 +25,5 @@ jobs:
       - run: PYTHONPATH=server python3 -m v20.registry --check
       - run: PYTHONPATH=server python3 -m v20.benchmark --self-test
       - run: PYTHONPATH=server python3 -m v20.benchmark --validate-corpus server/v20/cases.jsonl
+      - run: python3 scripts/v20/test_legal_style.py
       - run: bash -n scripts/v20/install.sh scripts/v20/install-worker.sh scripts/v20/benchmark.sh scripts/v20/finalize-main.sh
