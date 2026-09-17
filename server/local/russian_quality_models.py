@@ -21,10 +21,11 @@ class SageRussianCorrector:
   if self.quantize=='int8':
    try:model=torch.ao.quantization.quantize_dynamic(model,{torch.nn.Linear},dtype=torch.qint8);self._quantized=True;logger.info('SAGE: включена динамическая int8-квантизация')
    except Exception as exc:logger.warning('SAGE: int8-квантизация недоступна (%s), работаем в fp32',exc)
-  self._model=model
-  # Some model repositories ship max_length=256 in generation_config.json.
-  # Explicitly null it: max_new_tokens is the only output-length limit.
-  self._generation_config=GenerationConfig(max_length=None,max_new_tokens=self.max_new_tokens,num_beams=max(1,self.num_beams),do_sample=False,no_repeat_ngram_size=3,early_stopping=self.num_beams>1)
+  config=GenerationConfig.from_model_config(model.config);config.max_length=None;config.max_new_tokens=self.max_new_tokens;config.num_beams=max(1,self.num_beams);config.do_sample=False;config.no_repeat_ngram_size=3;config.early_stopping=self.num_beams>1
+  # Transformers 5 may merge the explicitly passed object with the model's
+  # repository generation_config. Replace both references to prevent the
+  # inherited max_length=256 from reappearing.
+  model.generation_config=config;self._generation_config=config;self._model=model
  async def correct(self,text):
   result=await self.correct_batch([text]);return result[0] if result else text
  async def correct_batch(self,texts):
