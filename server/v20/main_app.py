@@ -19,7 +19,7 @@ def _production_review(text,candidates):
 v11.needs_deep_review=_production_review
 _base_candidates=router.candidates
 async def _production_candidates(text,context=''):
- candidates=await _base_candidates(text,context);safe=[c for c in candidates if _safety.allowed(text,c)]
+ candidates=await _base_candidates(text,context);safe=_safety.filter(text,candidates)
  if len(safe)!=len(candidates):logger.info('v20 production safety rejected=%d accepted_candidates=%d',len(candidates)-len(safe),len(safe))
  return safe
 router.candidates=_production_candidates
@@ -27,4 +27,4 @@ _base_metrics=router.metrics
 def _metrics():
  result=_base_metrics();result['legal_style']=_legal.metrics();result['government_frames']=_frames.metrics();result['v20_production_safety']=_safety.metrics();result['v20_reasoning_timeout']=float(os.environ['REASONING_TOTAL_TIMEOUT']);return result
 router.metrics=_metrics
-app.title='Maincheck production: punctuation, spelling, grammar and legal style';app.version='20-main-production.3'
+app.title='Maincheck production: punctuation, spelling, grammar and legal style';app.version='20-main-production.4'
