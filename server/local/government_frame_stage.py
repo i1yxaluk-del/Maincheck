@@ -10,10 +10,17 @@ DOC_RE=re.compile(r"\bв\s+(?P<target>раздел|подраздел|пункт
 DOC_FORMS={'раздел':'разделе','подраздел':'подразделе','пункт':'пункте','подпункт':'подпункте','графу':'графе','таблицу':'таблице'}
 STATIVE_RE=re.compile(r"\b(?:приведен[аоы]?|указан[аоы]?|отражен[аоы]?|содержится|содержатся|зафиксирован[аоы]?|представлен[аоы]?)\b",re.IGNORECASE)
 NUMERAL_RE=re.compile(r"\b(?P<predicate>[А-Яа-яЁё-]+)\s+(?P<number>два|две|три|четыре)\s+(?P<head>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
-REPORTING_LEMMAS={'выявить','обнаружить','установить','зафиксировать','зарегистрировать'}
-PROCESS_SUFFIXES=('ция','ение','ание','тие','ство')
-def _form(morph,word,grams):
- forms={preserve_capitalization(word,preserve_yo(word,x)) for x in morph.inflected_forms(word,grams)};forms={x for x in forms if x.casefold()!=word.casefold()};return next(iter(forms)) if len(forms)==1 else None
+REPORTING_LEMMAS={'выявить','обнаружить','установить','зафиксировать','зарегистрировать'};PROCESS_SUFFIXES=('ция','ение','ание','тие','ство')
+def _from_parses(word,parses,grams):
+ forms=set()
+ for parse in parses:
+  try:form=parse.inflect(grams)
+  except Exception:form=None
+  if form and form.word:
+   fixed=preserve_capitalization(word,preserve_yo(word,form.word))
+   if fixed.casefold()!=word.casefold():forms.add(fixed)
+ return next(iter(forms)) if len(forms)==1 else None
+def _form(morph,word,grams):return _from_parses(word,morph.known_parses(word),grams)
 class GovernmentFrameStage:
  def __init__(self,morphology=None):self.morph=morphology or get_morphology();self.calls=0;self.found={'coordination':0,'dative':0,'po':0,'locative':0,'numeral':0}
  def _coordination(self,text):
@@ -26,17 +33,17 @@ class GovernmentFrameStage:
    if not first_n or not second_n or not gov_n or not any(p.tag.case=='gent' for p in gov_n):continue
    targets={(p.tag.case,p.tag.number) for p in second_n if p.tag.case=='gent' and p.tag.number};lemmas1=self.morph.lemmas(first.group());lemmas2=self.morph.lemmas(second.group())
    if not any(x.endswith(PROCESS_SUFFIXES) for x in lemmas1) or not any(x.endswith(PROCESS_SUFFIXES) for x in lemmas2):continue
-   forms={_form(self.morph,first.group(),{case,number}) for case,number in targets};forms.discard(None)
+   forms={_from_parses(first.group(),first_n,{case,number}) for case,number in targets};forms.discard(None)
    if len(forms)==1:out.append(EditCandidate(first.group(),forms.pop(),.997,'rule-government-coordination','Однородные названия функций после родительного падежа должны иметь одинаковую форму.',start=first.start(),sources=('rule-government-coordination',)));self.found['coordination']+=1
   return out
  def _dative(self,text):
   out=[]
   for m in DATIVE_RE.finditer(text):
    head=m.group('head');modifier=m.group('modifier');heads=self.morph.noun_parses(head);mods=self.morph.attributive_parses(modifier)
-   head_numbers={p.tag.number for p in heads if p.tag.number};modifier_numbers={p.tag.number for p in mods if p.tag.number}
-   candidates=head_numbers & modifier_numbers if modifier_numbers else head_numbers
+   head_numbers={p.tag.number for p in heads if p.tag.number};modifier_numbers={p.tag.number for p in mods if p.tag.number};candidates=head_numbers & modifier_numbers if modifier_numbers else head_numbers
    if len(candidates)!=1:continue
-   number=next(iter(candidates));fixed_head=_form(self.morph,head,{'datv',number});fixed_modifier=_form(self.morph,modifier,{'datv',number}) if mods else None
+   number=next(iter(candidates));head_source=[p for p in heads if p.tag.number==number];mod_source=[p for p in mods if p.tag.number==number]
+   fixed_head=_from_parses(head,head_source,{'datv',number});fixed_modifier=_from_parses(modifier,mod_source,{'datv',number}) if mod_source else None
    if fixed_modifier:out.append(EditCandidate(modifier,fixed_modifier,.997,'rule-dative-frame',f'Предлог «{m.group("prep")}» требует дательного падежа.',start=m.start('modifier'),sources=('rule-dative-frame',)))
    if fixed_head:out.append(EditCandidate(head,fixed_head,.997,'rule-dative-frame',f'Предлог «{m.group("prep")}» требует дательного падежа.',start=m.start('head'),sources=('rule-dative-frame',)))
    if fixed_head or fixed_modifier:self.found['dative']+=1
@@ -44,10 +51,9 @@ class GovernmentFrameStage:
  def _po(self,text):
   out=[]
   for m in PO_RE.finditer(text):
-   modifier=m.group('modifier');head=m.group('head');mods=self.morph.attributive_parses(modifier);heads=self.morph.noun_parses(head)
-   if not any(p.tag.case in {'datv','loct'} and p.tag.number=='sing' for p in mods):continue
-   if not any(p.tag.case=='gent' and p.tag.number=='plur' for p in heads):continue
-   fixed=_form(self.morph,head,{'datv','sing'})
+   modifier=m.group('modifier');head=m.group('head');mods=self.morph.attributive_parses(modifier);heads=self.morph.noun_parses(head);source_heads=[p for p in heads if p.tag.case=='gent' and p.tag.number=='plur']
+   if not any(p.tag.case in {'datv','loct'} and p.tag.number=='sing' for p in mods) or not source_heads:continue
+   fixed=_from_parses(head,source_heads,{'datv','sing'})
    if fixed:out.append(EditCandidate(head,fixed,.996,'rule-po-government','После «по» название направления подготовки употребляется в дательном падеже.',start=m.start('head'),sources=('rule-po-government',)));self.found['po']+=1
   return out
  def _locative(self,text):
@@ -60,8 +66,7 @@ class GovernmentFrameStage:
   out=[]
   for m in NUMERAL_RE.finditer(text):
    word=m.group('predicate');parses=[p for p in self.morph.known_parses(word) if p.tag.POS=='PRTS' and p.tag.number=='sing' and p.normal_form in REPORTING_LEMMAS]
-   if not parses:continue
-   fixed=_form(self.morph,word,{'plur'})
+   fixed=_from_parses(word,parses,{'plur'}) if parses else None
    if fixed:out.append(EditCandidate(word,fixed,.996,'rule-numeral-predicate','Сказуемое согласуется с количественной группой во множественном числе.',start=m.start('predicate'),sources=('rule-numeral-predicate',)));self.found['numeral']+=1
   return out
  def candidates(self,text):
