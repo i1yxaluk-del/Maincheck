@@ -1,5 +1,5 @@
 [Unit]
-Description=AI LibreOffice Suggester — Local Server
+Description=AI LibreOffice Suggester — production punctuation, grammar and legal style
 After=network.target ollama.service
 Wants=ollama.service
 
@@ -8,15 +8,15 @@ Type=simple
 User=service
 WorkingDirectory=/home/service/llama/server/local
 Environment="PYTHONPATH=/home/service/llama/server"
-AllowedCPUs=0-15
 Environment="MALLOC_ARENA_MAX=2"
-Environment="OMP_NUM_THREADS=8"
-Environment="MKL_NUM_THREADS=8"
-Environment="OPENBLAS_NUM_THREADS=8"
+Environment="OMP_NUM_THREADS=16"
+Environment="MKL_NUM_THREADS=16"
+Environment="OPENBLAS_NUM_THREADS=16"
 Environment="TOKENIZERS_PARALLELISM=false"
 Environment="HF_HUB_DISABLE_TELEMETRY=1"
 EnvironmentFile=-/home/service/llama/server/local/.env
-ExecStart=/home/service/llama/server/local/venv/bin/uvicorn decision_app_v12:app --host 0.0.0.0 --port 8000
+EnvironmentFile=-/home/service/llama/server/local/.env.v20
+ExecStart=/home/service/llama/server/local/venv/bin/uvicorn v20.main_app:app --host 0.0.0.0 --port 8000
 TimeoutStartSec=240
 Restart=on-failure
 RestartSec=5

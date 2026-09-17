@@ -1,0 +1,6 @@
+# Lightweight interpreter environment. llama.cpp performs model inference;
+# this process does not need Torch, Transformers, CUDA or OpenVINO.
+fastapi>=0.111,<1
+uvicorn[standard]>=0.29,<1
+httpx>=0.27,<1
+python-multipart>=0.0.9
