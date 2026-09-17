@@ -12,7 +12,6 @@ STATIVE_RE=re.compile(r"\b(?:приведен[аоы]?|указан[аоы]?|о�
 NUMERAL_RE=re.compile(r"\b(?P<predicate>[А-Яа-яЁё-]+)\s+(?P<number>два|две|три|четыре)\s+(?P<head>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
 REPORTING_LEMMAS={'выявить','обнаружить','установить','зафиксировать','зарегистрировать'}
 PROCESS_SUFFIXES=('ция','ение','ание','тие','ство')
-
 def _form(morph,word,grams):
  forms={preserve_capitalization(word,preserve_yo(word,x)) for x in morph.inflected_forms(word,grams)};forms={x for x in forms if x.casefold()!=word.casefold()};return next(iter(forms)) if len(forms)==1 else None
 class GovernmentFrameStage:
@@ -24,22 +23,20 @@ class GovernmentFrameStage:
    governor,first,second=words[i-2],words[i-1],words[i+1]
    if not all(text[a.end():b.start()].isspace() for a,b in ((governor,first),(first,words[i]),(words[i],second))):continue
    first_n=self.morph.noun_parses(first.group());second_n=self.morph.noun_parses(second.group());gov_n=self.morph.noun_parses(governor.group())
-   if not first_n or not second_n or not gov_n:continue
-   if not any(p.tag.case=='gent' for p in gov_n):continue
-   targets={(p.tag.case,p.tag.number) for p in second_n if p.tag.case=='gent' and p.tag.number}
-   lemmas1=self.morph.lemmas(first.group());lemmas2=self.morph.lemmas(second.group())
+   if not first_n or not second_n or not gov_n or not any(p.tag.case=='gent' for p in gov_n):continue
+   targets={(p.tag.case,p.tag.number) for p in second_n if p.tag.case=='gent' and p.tag.number};lemmas1=self.morph.lemmas(first.group());lemmas2=self.morph.lemmas(second.group())
    if not any(x.endswith(PROCESS_SUFFIXES) for x in lemmas1) or not any(x.endswith(PROCESS_SUFFIXES) for x in lemmas2):continue
    forms={_form(self.morph,first.group(),{case,number}) for case,number in targets};forms.discard(None)
-   if len(forms)==1:
-    out.append(EditCandidate(first.group(),forms.pop(),.997,'rule-government-coordination','Однородные названия функций после родительного падежа должны иметь одинаковую форму.',start=first.start(),sources=('rule-government-coordination',)));self.found['coordination']+=1
+   if len(forms)==1:out.append(EditCandidate(first.group(),forms.pop(),.997,'rule-government-coordination','Однородные названия функций после родительного падежа должны иметь одинаковую форму.',start=first.start(),sources=('rule-government-coordination',)));self.found['coordination']+=1
   return out
  def _dative(self,text):
   out=[]
   for m in DATIVE_RE.finditer(text):
-   head=m.group('head');modifier=m.group('modifier');heads=self.morph.noun_parses(head)
-   numbers={p.tag.number for p in heads if p.tag.number and p.tag.case!='datv'}
-   if len(numbers)!=1:continue
-   number=next(iter(numbers));fixed_head=_form(self.morph,head,{'datv',number});fixed_modifier=_form(self.morph,modifier,{'datv',number})
+   head=m.group('head');modifier=m.group('modifier');heads=self.morph.noun_parses(head);mods=self.morph.attributive_parses(modifier)
+   head_numbers={p.tag.number for p in heads if p.tag.number};modifier_numbers={p.tag.number for p in mods if p.tag.number}
+   candidates=head_numbers & modifier_numbers if modifier_numbers else head_numbers
+   if len(candidates)!=1:continue
+   number=next(iter(candidates));fixed_head=_form(self.morph,head,{'datv',number});fixed_modifier=_form(self.morph,modifier,{'datv',number}) if mods else None
    if fixed_modifier:out.append(EditCandidate(modifier,fixed_modifier,.997,'rule-dative-frame',f'Предлог «{m.group("prep")}» требует дательного падежа.',start=m.start('modifier'),sources=('rule-dative-frame',)))
    if fixed_head:out.append(EditCandidate(head,fixed_head,.997,'rule-dative-frame',f'Предлог «{m.group("prep")}» требует дательного падежа.',start=m.start('head'),sources=('rule-dative-frame',)))
    if fixed_head or fixed_modifier:self.found['dative']+=1
