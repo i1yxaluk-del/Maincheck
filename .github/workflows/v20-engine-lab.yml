@@ -6,7 +6,11 @@ on:
       - 'server/local/v20-*.service'
       - 'server/local/ai-suggester.service'
       - 'server/local/legal_style_stage.py'
+      - 'server/local/government_frame_stage.py'
+      - 'server/local/production_safety.py'
       - 'server/local/decision_engine.py'
+      - 'server/local/safe_diff.py'
+      - 'server/local/test_v20_production.py'
       - 'scripts/v20/**'
       - 'tests/v20/**'
       - 'docs/v20/**'
@@ -25,5 +29,28 @@ jobs:
       - run: PYTHONPATH=server python3 -m v20.registry --check
       - run: PYTHONPATH=server python3 -m v20.benchmark --self-test
       - run: PYTHONPATH=server python3 -m v20.benchmark --validate-corpus server/v20/cases.jsonl
+      - run: PYTHONPATH=server python3 -m v20.benchmark --validate-corpus server/v20/cases-current-30.jsonl
+      - run: python3 -c "import json,pathlib; p=pathlib.Path('server/v20/cases-current-30.jsonl'); assert len([json.loads(x) for x in p.read_text().splitlines() if x.strip()]) == 30"
       - run: python3 scripts/v20/test_legal_style.py
-      - run: bash -n scripts/v20/install.sh scripts/v20/install-worker.sh scripts/v20/benchmark.sh scripts/v20/finalize-main.sh
+      - run: python3 scripts/v20/test_cloud_contract.py
+      - run: bash -n scripts/v20/install.sh scripts/v20/install-worker.sh scripts/v20/benchmark.sh scripts/v20/benchmark-current.sh scripts/v20/finalize-main.sh
+  production-regressions:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [department, section, training, subject, blagodarya, spelling, safety, clean]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: python -m pip install pytest pymorphy3 pymorphy3-dicts-ru
+      - run: PYTHONPATH=server/local pytest -q server/local/test_v20_production.py::test_${{ matrix.case }}
+  network-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: python -m pip install -r server/cloud/requirements.txt pytest
+      - run: PYTHONPATH=server pytest -q tests/test_servers_smoke.py -k 'test_cloud_suggest_with_mocked_openrouter or test_cloud_metrics or test_cloud_missing_key or test_cloud_soft_linebreak_normalized or test_cloud_suggest_appends_end_marker'
