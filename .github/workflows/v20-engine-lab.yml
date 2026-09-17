@@ -36,12 +36,16 @@ jobs:
       - run: bash -n scripts/v20/install.sh scripts/v20/install-worker.sh scripts/v20/benchmark.sh scripts/v20/benchmark-current.sh scripts/v20/finalize-main.sh
   production-regressions:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [department, section, training, subject, blagodarya, spelling, safety, clean]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - run: python -m pip install pytest pymorphy3 pymorphy3-dicts-ru
-      - run: PYTHONPATH=server/local pytest -q server/local/test_v20_production.py
+      - run: PYTHONPATH=server/local pytest -q server/local/test_v20_production.py::test_${{ matrix.case }}
   network-contract:
     runs-on: ubuntu-latest
     steps:
