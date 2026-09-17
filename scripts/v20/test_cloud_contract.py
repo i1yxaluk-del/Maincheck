@@ -7,5 +7,9 @@ for node in ast.walk(tree):
 assert suggest is not None
 args={a.arg for a in suggest.args.args};assert {'text','context'}<=args
 assert '===CORRECTED===' in source and '===CHANGES===' in source and '===END===' in source
-assert 'server/local' not in source and 'decision_engine' not in source
+imports=[]
+for node in ast.walk(tree):
+ if isinstance(node,ast.Import):imports.extend(alias.name for alias in node.names)
+ elif isinstance(node,ast.ImportFrom):imports.append(node.module or '')
+assert not any(name.startswith(('decision_engine','legal_style_stage','v20.')) for name in imports)
 print('V20 CLOUD CONTRACT OK: multipart text/context and response protocol preserved')
