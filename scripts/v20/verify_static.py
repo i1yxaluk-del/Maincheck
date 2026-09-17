@@ -9,9 +9,10 @@ def main():
  if a.services:
   files=list((ROOT/'server/local').glob('v20-*.service')); assert len(files)==4
   text='\n'.join(x.read_text() for x in files); assert 'v20.main_app:app' in text and 'v20.openvino_app:app' in text and 'v20.llama_json_app:app' in text; print('V20 SERVICES OK');return
- if a.docs: require(['docs/v20/README.md','docs/v20/ARCHITECTURE.md']); text=(ROOT/'docs/v20/README.md').read_text(); assert all(x in text for x in ('main','openvino','llama-json','rollback')); print('V20 DOCS OK');return
- if a.ci: text=(ROOT/'.github/workflows/v20-engine-lab.yml').read_text(); assert 'verify_static.py' in text and 'benchmark --self-test' in text; print('V20 CI OK');return
+ if a.docs: require(['docs/v20/README.md','docs/v20/ARCHITECTURE.md','docs/v20/FINALIZE.md']); text=(ROOT/'docs/v20/README.md').read_text(); assert all(x in text for x in ('main','openvino','llama-json','rollback')); print('V20 DOCS OK');return
+ if a.ci: text=(ROOT/'.github/workflows/v20-engine-lab.yml').read_text(); assert 'verify_static.py' in text and 'benchmark --self-test' in text and 'finalize-main.sh' in text; print('V20 CI OK');return
  for f in (ROOT/'server/v20').glob('*.py'):ast.parse(f.read_text())
- require(['scripts/v20/install.sh','scripts/v20/install-worker.sh','scripts/v20/benchmark.sh','tests/v20/cases.jsonl'])
+ require(['scripts/v20/install.sh','scripts/v20/install-worker.sh','scripts/v20/benchmark.sh','scripts/v20/finalize-main.sh','server/v20/cases.jsonl'])
+ main_text=(ROOT/'server/v20/main_app.py').read_text();assert 'DECISION_MIN_CONFIDENCE' in main_text and 'v20_production_safety' in main_text
  print('V20 STATIC OK')
 if __name__=='__main__':main()
