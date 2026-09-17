@@ -1,9 +1,4 @@
-"""High-precision legal/official style checks that operate on edit spans.
-
-The stage detects classes of errors rather than document-specific phrases:
-adjacent repeated multi-word spans, malformed legal collocations and the
-instrumental audit construction «в отношениях X» used instead of «в отношении X».
-"""
+"""High-precision legal/official style checks that operate on edit spans."""
 from __future__ import annotations
 import re
 from decision_engine import EditCandidate
@@ -11,25 +6,21 @@ from decision_engine import EditCandidate
 WORD_RE=re.compile(r"[А-Яа-яЁёA-Za-z]+(?:-[А-Яа-яЁёA-Za-z]+)*")
 AUDIT_CUE=re.compile(r"\b(?:проверк(?:а|ой|е|и)|установлен[аоы]?|выявлен[аоы]?|обнаружен[аоы]?|нарушен[аоы]?|не\s+(?:разработан|утвержден|определен|установлен|представлен)[аоы]?)\b",re.IGNORECASE)
 RELATION_ERROR=re.compile(r"\bв(?P<gap>\s+)отношениях(?P<object>\s+(?!между\b|с\b|по\b)[А-Яа-яЁё-]+)",re.IGNORECASE)
+AMOUNT_COMMA=re.compile(r"\bпостановлен[А-Яа-яЁё-]*[\s\S]{0,500}?(?P<comma>,)(?P<gap>\s+)на\s+сумму\s+\d",re.IGNORECASE)
 FIXED_RULES=(
- (re.compile(r"\bв\s+соответствие\s+с\b",re.IGNORECASE),"в соответствии с","устойчивая конструкция «в соответствии с»"),
- (re.compile(r"\bпо\s+истечению\b",re.IGNORECASE),"по истечении","нормативная временная конструкция «по истечении»"),
- (re.compile(r"\bпо\s+окончанию\b",re.IGNORECASE),"по окончании","нормативная временная конструкция «по окончании»"),
- (re.compile(r"\bпо\s+прибытию\b",re.IGNORECASE),"по прибытии","нормативная временная конструкция «по прибытии»"),
- (re.compile(r"\bв\s+течении(?=\s+(?:срока|дня|дней|месяца|месяцев|года|лет|периода)\b)",re.IGNORECASE),"в течение","производный предлог «в течение»"),
+ (re.compile(r"\bв\s+соответствие\s+с\b",re.IGNORECASE),"в соответствии с","Устойчивая конструкция «в соответствии с»."),
+ (re.compile(r"\bпо\s+истечению\b",re.IGNORECASE),"по истечении","Нормативная временная конструкция «по истечении»."),
+ (re.compile(r"\bпо\s+окончанию\b",re.IGNORECASE),"по окончании","Нормативная временная конструкция «по окончании»."),
+ (re.compile(r"\bпо\s+прибытию\b",re.IGNORECASE),"по прибытии","Нормативная временная конструкция «по прибытии»."),
+ (re.compile(r"\bв\s+течении(?=\s+(?:срока|дня|дней|месяца|месяцев|года|лет|периода)\b)",re.IGNORECASE),"в течение","Производный предлог «в течение»."),
 )
-
-def _case_like(source,replacement):
- return replacement[:1].upper()+replacement[1:] if source[:1].isupper() else replacement
-
-def _inside_quotes(text,pos):
- return text.rfind('«',0,pos+1)>text.rfind('»',0,pos+1)
+def _case_like(source,replacement):return replacement[:1].upper()+replacement[1:] if source[:1].isupper() else replacement
+def _inside_quotes(text,pos):return text.rfind('«',0,pos+1)>text.rfind('»',0,pos+1)
 
 class LegalStyleStage:
- def __init__(self):self.calls=0;self.found={'repetition':0,'government':0,'collocation':0}
+ def __init__(self):self.calls=0;self.found={'repetition':0,'government':0,'collocation':0,'legal_punctuation':0}
  def _duplicates(self,text):
-  words=list(WORD_RE.finditer(text));out=[];occupied=[]
-  folded=[m.group().casefold() for m in words]
+  words=list(WORD_RE.finditer(text));out=[];occupied=[];folded=[m.group().casefold() for m in words]
   for size in range(6,1,-1):
    i=0
    while i+2*size<=len(words):
@@ -39,10 +30,8 @@ class LegalStyleStage:
     second_last=words[i+2*size-1];start=first.end();end=second_last.end()
     while end<len(text) and text[end] in ' \t\n':end+=1
     if any(not(end<=a or start>=b) for a,b in occupied):i+=1;continue
-    before=text[start:end];newlines=before.count('\n')
-    after='\n'*newlines if newlines else (' ' if end<len(text) and text[end] not in ',.;:!?)»' else '')
-    out.append(EditCandidate(before,after,1.0,'rule-legal-repetition','удалён соседний повтор фразы',start=start,sources=('rule-legal-repetition',)))
-    occupied.append((start,end));self.found['repetition']+=1;i+=2*size
+    before=text[start:end];newlines=before.count('\n');after='\n'*newlines if newlines else (' ' if end<len(text) and text[end] not in ',.;:!?)»' else '')
+    out.append(EditCandidate(before,after,1.0,'rule-legal-repetition','Удалён соседний повтор фразы.',start=start,sources=('rule-legal-repetition',)));occupied.append((start,end));self.found['repetition']+=1;i+=2*size
   return out
  def _government(self,text):
   out=[]
@@ -50,15 +39,18 @@ class LegalStyleStage:
    left=max(0,text.rfind('.',0,m.start())+1);right=text.find('.',m.end());right=len(text) if right<0 else right+1
    if not AUDIT_CUE.search(text[left:right]):continue
    source='отношениях';start=m.start()+m.group(0).lower().find(source);after=_case_like(text[start:start+len(source)],'отношении')
-   out.append(EditCandidate(text[start:start+len(source)],after,1.0,'rule-legal-government','в значении «касательно объекта» употребляется «в отношении»',start=start,sources=('rule-legal-government',)))
-   self.found['government']+=1
+   out.append(EditCandidate(text[start:start+len(source)],after,1.0,'rule-legal-government','В значении «касательно объекта» употребляется «в отношении».',start=start,sources=('rule-legal-government',)));self.found['government']+=1
   return out
  def _fixed(self,text):
   out=[]
   for pattern,replacement,reason in FIXED_RULES:
-   for m in pattern.finditer(text):
-    out.append(EditCandidate(m.group(),_case_like(m.group(),replacement),1.0,'rule-legal-collocation',reason,start=m.start(),sources=('rule-legal-collocation',)));self.found['collocation']+=1
+   for m in pattern.finditer(text):out.append(EditCandidate(m.group(),_case_like(m.group(),replacement),1.0,'rule-legal-collocation',reason,start=m.start(),sources=('rule-legal-collocation',)));self.found['collocation']+=1
+  return out
+ def _legal_punctuation(self,text):
+  out=[]
+  for m in AMOUNT_COMMA.finditer(text):
+   start=m.start('comma');out.append(EditCandidate(',', '',1.0,'rule-legal-punctuation','Удалена лишняя запятая: оборот «на сумму …» связан со сказуемым и не обособляется.',start=start,sources=('rule-legal-punctuation',)));self.found['legal_punctuation']+=1
   return out
  def candidates(self,text):
-  self.calls+=1;return self._duplicates(text)+self._government(text)+self._fixed(text)
+  self.calls+=1;return self._duplicates(text)+self._government(text)+self._fixed(text)+self._legal_punctuation(text)
  def metrics(self):return {'calls':self.calls,**self.found}
