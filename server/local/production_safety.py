@@ -1,18 +1,12 @@
-"""Production rejection policy for unsupported model edits.
-
-A model proposal is treated as a transaction inside one sentence. If it damages
-brackets, protected notation, or punctuation next to parentheses, all
-punctuation edits from the same model family in that sentence are discarded.
-This prevents a partially accepted broken rewrite.
-"""
+"""Production rejection policy for unsupported model and rule edits."""
 from __future__ import annotations
 import re
 from coverage_policy import is_punctuation_only
 from verification import is_generative
-ACRONYM=re.compile(r'\b[А-ЯЁA-Z]{2,12}\b');DIGITS=re.compile(r'\d+');QUOTES=re.compile(r'[«»„“”"]')
-DELIMITERS='()[]{}';PROTECTED_NOTATION=re.compile(r'\b[А-ЯЁA-Z](?:\([А-ЯЁA-Z]\))?[А-ЯЁA-Z]{1,12}\b')
+from morphology import get_morphology
+ACRONYM=re.compile(r'\b[А-ЯЁA-Z]{2,12}\b');DIGITS=re.compile(r'\d+');QUOTES=re.compile(r'[«»„“”"]');DELIMITERS='()[]{}';PROTECTED_NOTATION=re.compile(r'\b[А-ЯЁA-Z](?:\([А-ЯЁA-Z]\))?[А-ЯЁA-Z]{1,12}\b');WORD_RE=re.compile(r'[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*')
 class ProductionSafety:
- def __init__(self):self.counters={'digits':0,'acronym':0,'quote_style':0,'delimiter':0,'protected_notation':0,'parenthesis_punctuation':0,'tainted_sentence':0,'quoted':0,'enumeration':0,'solo_draft':0}
+ def __init__(self):self.morph=get_morphology();self.counters={'digits':0,'acronym':0,'quote_style':0,'delimiter':0,'protected_notation':0,'parenthesis_punctuation':0,'tainted_sentence':0,'existing_np_agreement':0,'quoted':0,'enumeration':0,'solo_draft':0}
  @staticmethod
  def _start(text,c):
   if c.start is not None and 0<=c.start<=len(text)-len(c.before) and text[c.start:c.start+len(c.before)]==c.before:return c.start
@@ -29,13 +23,25 @@ class ProductionSafety:
  @staticmethod
  def _sentence(text,pos):
   if pos is None:return (0,len(text))
-  left=max(text.rfind('.',0,pos),text.rfind('!',0,pos),text.rfind('?',0,pos),text.rfind('\n\n',0,pos));right_candidates=[x for x in (text.find('.',pos),text.find('!',pos),text.find('?',pos),text.find('\n\n',pos)) if x>=0];return (left+1,min(right_candidates)+1 if right_candidates else len(text))
+  left=max(text.rfind('.',0,pos),text.rfind('!',0,pos),text.rfind('?',0,pos),text.rfind('\n\n',0,pos));right=[x for x in (text.find('.',pos),text.find('!',pos),text.find('?',pos),text.find('\n\n',pos)) if x>=0];return (left+1,min(right)+1 if right else len(text))
  @staticmethod
  def _delimiter_changed(before,after):return any(before.count(ch)!=after.count(ch) for ch in DELIMITERS)
  @staticmethod
- def _parenthesis_punctuation(before,after):
-  patterns=(r',\s*\(',r'\)\s*,',r';\s*\(',r'\)\s*;')
-  return any(bool(re.search(p,after)) and not re.search(p,before) for p in patterns)
+ def _parenthesis_punctuation(text,c,pos):
+  if any(bool(re.search(p,c.after)) and not re.search(p,c.before) for p in (r',\s*\(',r'\)\s*,',r';\s*\(',r'\)\s*;')):return True
+  if pos is None:return False
+  inserted_comma=c.after.count(',')>c.before.count(',');removed_comma=c.after.count(',')<c.before.count(',');right=text[pos+len(c.before):];left=text[:pos]
+  if inserted_comma and (re.match(r'\s*\(',right) or re.search(r'\)\s*$',left)):return True
+  if removed_comma and (re.match(r'\s*\(',right) or re.search(r'\)\s*$',left)):return True
+  return False
+ def _already_agrees_with_following_noun(self,text,c,pos):
+  if not c.category.startswith(('rule-agreement','rule-copular-agreement')) or pos is None or not re.fullmatch(WORD_RE,c.before):return False
+  words=list(WORD_RE.finditer(text,pos+len(c.before)))
+  for w in words[:3]:
+   gap=text[pos+len(c.before):w.start()]
+   if re.search(r'[,.;:!?()]',gap):break
+   if self.morph.noun_parses(w.group()) and self.morph.pair_agrees(c.before,w.group()):return True
+  return False
  def _reason(self,text,c):
   if DIGITS.findall(c.before)!=DIGITS.findall(c.after):return 'digits'
   if ACRONYM.findall(c.before)!=ACRONYM.findall(c.after) and not c.category.startswith('rule-rag-terminology'):return 'acronym'
@@ -43,7 +49,8 @@ class ProductionSafety:
   if QUOTES.findall(c.before)!=QUOTES.findall(c.after):return 'quote_style'
   if self._delimiter_changed(c.before,c.after):return 'delimiter'
   generative=is_generative(c.category);punct=is_punctuation_only(c);pos=self._start(text,c)
-  if generative and punct and self._parenthesis_punctuation(c.before,c.after):return 'parenthesis_punctuation'
+  if self._already_agrees_with_following_noun(text,c,pos):return 'existing_np_agreement'
+  if generative and punct and self._parenthesis_punctuation(text,c,pos):return 'parenthesis_punctuation'
   if generative and not punct and self._inside_quotes(text,pos):return 'quoted'
   if pos is not None:
    stop=text.find('\n',pos);line=text[text.rfind('\n',0,pos)+1:stop if stop>=0 else len(text)]

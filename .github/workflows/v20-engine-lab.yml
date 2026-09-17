@@ -8,6 +8,8 @@ on:
       - 'server/local/legal_style_stage.py'
       - 'server/local/government_frame_stage.py'
       - 'server/local/production_safety.py'
+      - 'server/local/contextual_agreement.py'
+      - 'server/local/russian_quality_models.py'
       - 'server/local/decision_engine.py'
       - 'server/local/safe_diff.py'
       - 'server/local/test_v20_production.py'
@@ -30,8 +32,9 @@ jobs:
       - run: PYTHONPATH=server python3 -m v20.benchmark --self-test
       - run: PYTHONPATH=server python3 -m v20.benchmark --validate-corpus server/v20/cases.jsonl
       - run: PYTHONPATH=server python3 -m v20.benchmark --validate-corpus server/v20/cases-current-30.jsonl
-      - run: python3 scripts/v20/build_deep_corpus.py --out /tmp/cases-deep-40.jsonl
+      - run: python3 scripts/v20/build_deep_corpus_v2.py --out /tmp/cases-deep-40.jsonl
       - run: PYTHONPATH=server python3 -m v20.benchmark --validate-corpus /tmp/cases-deep-40.jsonl
+      - run: python3 -c "from pathlib import Path;p=Path('server/local/russian_quality_models.py').read_text();assert 'max_length=None' in p"
       - run: python3 scripts/v20/test_legal_style.py
       - run: python3 scripts/v20/test_cloud_contract.py
       - run: bash -n scripts/v20/install.sh scripts/v20/install-worker.sh scripts/v20/benchmark.sh scripts/v20/benchmark-current.sh scripts/v20/finalize-main.sh
@@ -40,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [department, section, training, subject, blagodarya, spelling, safety, complex, clean]
+        case: [department, section, training, subject, blagodarya, spelling, safety, complex, deepfix, clean]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

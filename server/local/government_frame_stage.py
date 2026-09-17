@@ -3,14 +3,12 @@ from __future__ import annotations
 import re
 from decision_engine import EditCandidate
 from morphology import get_morphology,preserve_capitalization,preserve_yo
-WORD_RE=re.compile(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*")
-DATIVE_RE=re.compile(r"\b(?P<prep>благодаря|согласно|вопреки)\s+(?P<modifier>[А-Яа-яЁё-]+)\s+(?P<head>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
-PO_RE=re.compile(r"\bпо\s+(?P<modifier>[А-Яа-яЁё-]+)\s+(?P<head>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
-DOC_RE=re.compile(r"\bв\s+(?P<target>раздел|подраздел|пункт|подпункт|графу|таблицу)(?P<number>\s+(?:№\s*)?\d+)\b",re.IGNORECASE)
-DOC_FORMS={'раздел':'разделе','подраздел':'подразделе','пункт':'пункте','подпункт':'подпункте','графу':'графе','таблицу':'таблице'}
+WORD_RE=re.compile(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*");DATIVE_PREP=re.compile(r"\b(?:благодаря|согласно|вопреки)\b",re.IGNORECASE)
+DOC_RE=re.compile(r"\bв\s+(?P<target>раздел|подраздел|пункт|подпункт|графу|таблицу)(?P<number>\s+(?:№\s*)?\d+)\b",re.IGNORECASE);DOC_FORMS={'раздел':'разделе','подраздел':'подразделе','пункт':'пункте','подпункт':'подпункте','графу':'графе','таблицу':'таблице'}
 STATIVE_RE=re.compile(r"\b(?:приведен[аоы]?|указан[аоы]?|отражен[аоы]?|содержится|содержатся|зафиксирован[аоы]?|представлен[аоы]?)\b",re.IGNORECASE)
-NUMERAL_RE=re.compile(r"\b(?P<predicate>[А-Яа-яЁё-]+)\s+(?P<number>два|две|три|четыре)\s+(?P<head>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
-REPORTING_LEMMAS={'выявить','обнаружить','установить','зафиксировать','зарегистрировать'};PROCESS_SUFFIXES=('ция','ение','ание','тие','ство')
+NUMERAL_RE=re.compile(r"\b(?P<predicate>[А-Яа-яЁё-]+)\s+(?:два|две|три|четыре)\s+[А-Яа-яЁё-]+\b",re.IGNORECASE);AUX_RE=re.compile(r"\b(?P<aux>был|была|было)\s+(?P<predicate>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
+PROCESS_COORD_RE=re.compile(r"\bпри\s+(?P<first>[А-Яа-яЁё-]+)(?:\s+[А-Яа-яЁё-]+){1,4}\s+и\s+(?P<second>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
+REPORTING_LEMMAS={'выявить','обнаружить','установить','зафиксировать','зарегистрировать'};PROCESS_SUFFIXES=('ция','ение','ание','тие','ство');PREPOSITIONS={'в','во','на','по','с','со','из','от','у','для','при','к','ко','о','об','под','над','между','через'}
 def _from_parses(word,parses,grams):
  forms=set()
  for parse in parses:
@@ -20,9 +18,8 @@ def _from_parses(word,parses,grams):
    fixed=preserve_capitalization(word,preserve_yo(word,form.word))
    if fixed.casefold()!=word.casefold():forms.add(fixed)
  return next(iter(forms)) if len(forms)==1 else None
-def _form(morph,word,grams):return _from_parses(word,morph.known_parses(word),grams)
 class GovernmentFrameStage:
- def __init__(self,morphology=None):self.morph=morphology or get_morphology();self.calls=0;self.found={'coordination':0,'dative':0,'po':0,'locative':0,'numeral':0}
+ def __init__(self,morphology=None):self.morph=morphology or get_morphology();self.calls=0;self.found={'coordination':0,'dative':0,'po':0,'locative':0,'numeral':0,'process_coordination':0,'auxiliary':0}
  def _coordination(self,text):
   words=list(WORD_RE.finditer(text));out=[]
   for i in range(2,len(words)-1):
@@ -30,31 +27,62 @@ class GovernmentFrameStage:
    governor,first,second=words[i-2],words[i-1],words[i+1]
    if not all(text[a.end():b.start()].isspace() for a,b in ((governor,first),(first,words[i]),(words[i],second))):continue
    first_n=self.morph.noun_parses(first.group());second_n=self.morph.noun_parses(second.group());gov_n=self.morph.noun_parses(governor.group())
-   if not first_n or not second_n or not gov_n or not any(p.tag.case=='gent' for p in gov_n):continue
+   if not first_n or not second_n or not any(p.tag.case=='gent' for p in gov_n):continue
    targets={(p.tag.case,p.tag.number) for p in second_n if p.tag.case=='gent' and p.tag.number};lemmas1=self.morph.lemmas(first.group());lemmas2=self.morph.lemmas(second.group())
    if not any(x.endswith(PROCESS_SUFFIXES) for x in lemmas1) or not any(x.endswith(PROCESS_SUFFIXES) for x in lemmas2):continue
    forms={_from_parses(first.group(),first_n,{case,number}) for case,number in targets};forms.discard(None)
    if len(forms)==1:out.append(EditCandidate(first.group(),forms.pop(),.997,'rule-government-coordination','Однородные названия функций после родительного падежа должны иметь одинаковую форму.',start=first.start(),sources=('rule-government-coordination',)));self.found['coordination']+=1
   return out
  def _dative(self,text):
-  out=[]
-  for m in DATIVE_RE.finditer(text):
-   head=m.group('head');modifier=m.group('modifier');heads=self.morph.noun_parses(head);mods=self.morph.attributive_parses(modifier)
-   head_numbers={p.tag.number for p in heads if p.tag.number};modifier_numbers={p.tag.number for p in mods if p.tag.number};candidates=head_numbers & modifier_numbers if modifier_numbers else head_numbers
-   if len(candidates)!=1:continue
-   number=next(iter(candidates));head_source=[p for p in heads if p.tag.number==number];mod_source=[p for p in mods if p.tag.number==number]
-   fixed_head=_from_parses(head,head_source,{'datv',number});fixed_modifier=_from_parses(modifier,mod_source,{'datv',number}) if mod_source else None
-   if fixed_modifier:out.append(EditCandidate(modifier,fixed_modifier,.997,'rule-dative-frame',f'Предлог «{m.group("prep")}» требует дательного падежа.',start=m.start('modifier'),sources=('rule-dative-frame',)))
-   if fixed_head:out.append(EditCandidate(head,fixed_head,.997,'rule-dative-frame',f'Предлог «{m.group("prep")}» требует дательного падежа.',start=m.start('head'),sources=('rule-dative-frame',)))
-   if fixed_head or fixed_modifier:self.found['dative']+=1
+  words=list(WORD_RE.finditer(text));out=[]
+  for prep in DATIVE_PREP.finditer(text):
+   start_idx=next((i for i,w in enumerate(words) if w.start()>=prep.end()),None)
+   if start_idx is None:continue
+   window=[]
+   for w in words[start_idx:start_idx+7]:
+    gap=text[prep.end() if not window else window[-1].end():w.start()]
+    if re.search(r'[,.;:!?()]',gap):break
+    window.append(w)
+   head=None;head_parses=[]
+   for w in window:
+    nouns=self.morph.noun_parses(w.group())
+    if not nouns:continue
+    # A dative noun immediately satisfies the frame; following genitives
+    # are dependents and must not be promoted to the governed head.
+    if any(p.tag.case=='datv' for p in nouns):head=None;break
+    gent=[p for p in nouns if p.tag.case=='gent' and p.tag.number]
+    if gent:head=w;head_parses=gent;break
+    # Instrumental nouns can be agents inside a participial modifier:
+    # «согласно утвержденного руководителем порядка».
+    if not any(p.tag.case=='ablt' for p in nouns):break
+   if head is None:continue
+   numbers={p.tag.number for p in head_parses if p.tag.number}
+   if len(numbers)!=1:continue
+   number=next(iter(numbers));fixed_head=_from_parses(head.group(),head_parses,{'datv',number})
+   if fixed_head:out.append(EditCandidate(head.group(),fixed_head,.998,'rule-dative-frame',f'Предлог «{prep.group()}» требует дательного падежа.',start=head.start(),sources=('rule-dative-frame',)))
+   for w in window:
+    if w.start()>=head.start():break
+    parses=[p for p in self.morph.attributive_parses(w.group()) if p.tag.case=='gent' and p.tag.number==number]
+    fixed=_from_parses(w.group(),parses,{'datv',number}) if parses else None
+    if fixed:out.append(EditCandidate(w.group(),fixed,.998,'rule-dative-frame',f'Определение после «{prep.group()}» согласуется с существительным в дательном падеже.',start=w.start(),sources=('rule-dative-frame',)))
+   if fixed_head or any(c.start>=prep.end() and c.start<head.start() for c in out):self.found['dative']+=1
   return out
  def _po(self,text):
+  out=[];pattern=re.compile(r"\bпо\s+(?P<modifier>[А-Яа-яЁё-]+)\s+(?P<head>[А-Яа-яЁё-]+)\b",re.IGNORECASE)
+  for m in pattern.finditer(text):
+   mods=self.morph.attributive_parses(m.group('modifier'));heads=self.morph.noun_parses(m.group('head'));source=[p for p in heads if p.tag.case=='gent' and p.tag.number=='plur']
+   if not any(p.tag.case in {'datv','loct'} and p.tag.number=='sing' for p in mods) or not source:continue
+   fixed=_from_parses(m.group('head'),source,{'datv','sing'})
+   if fixed:out.append(EditCandidate(m.group('head'),fixed,.996,'rule-po-government','После «по» название направления подготовки употребляется в дательном падеже.',start=m.start('head'),sources=('rule-po-government',)));self.found['po']+=1
+  return out
+ def _process_coordination(self,text):
   out=[]
-  for m in PO_RE.finditer(text):
-   modifier=m.group('modifier');head=m.group('head');mods=self.morph.attributive_parses(modifier);heads=self.morph.noun_parses(head);source_heads=[p for p in heads if p.tag.case=='gent' and p.tag.number=='plur']
-   if not any(p.tag.case in {'datv','loct'} and p.tag.number=='sing' for p in mods) or not source_heads:continue
-   fixed=_from_parses(head,source_heads,{'datv','sing'})
-   if fixed:out.append(EditCandidate(head,fixed,.996,'rule-po-government','После «по» название направления подготовки употребляется в дательном падеже.',start=m.start('head'),sources=('rule-po-government',)));self.found['po']+=1
+  for m in PROCESS_COORD_RE.finditer(text):
+   for name in ('first','second'):
+    word=m.group(name);parses=self.morph.noun_parses(word)
+    if not any(x.endswith(PROCESS_SUFFIXES) for x in self.morph.lemmas(word)):continue
+    source=[p for p in parses if p.tag.case!='loct'];fixed=_from_parses(word,source,{'loct','sing'})
+    if fixed:out.append(EditCandidate(word,fixed,.997,'rule-pri-process-coordination','Однородные названия процессов после «при» употребляются в предложном единственного числа.',start=m.start(name),sources=('rule-pri-process-coordination',)));self.found['process_coordination']+=1
   return out
  def _locative(self,text):
   out=[]
@@ -65,12 +93,26 @@ class GovernmentFrameStage:
  def _numeral(self,text):
   out=[]
   for m in NUMERAL_RE.finditer(text):
-   word=m.group('predicate');parses=[p for p in self.morph.known_parses(word) if p.tag.POS=='PRTS' and p.tag.number=='sing' and p.normal_form in REPORTING_LEMMAS]
-   fixed=_from_parses(word,parses,{'plur'}) if parses else None
+   word=m.group('predicate');parses=[p for p in self.morph.known_parses(word) if p.tag.POS=='PRTS' and p.tag.number=='sing' and p.normal_form in REPORTING_LEMMAS];fixed=_from_parses(word,parses,{'plur'}) if parses else None
    if fixed:out.append(EditCandidate(word,fixed,.996,'rule-numeral-predicate','Сказуемое согласуется с количественной группой во множественном числе.',start=m.start('predicate'),sources=('rule-numeral-predicate',)));self.found['numeral']+=1
+  return out
+ def _auxiliary(self,text):
+  words=list(WORD_RE.finditer(text));out=[]
+  for m in AUX_RE.finditer(text):
+   pred=[p for p in self.morph.known_parses(m.group('predicate')) if p.tag.POS in {'PRTS','ADJS'} and p.tag.number=='plur']
+   if not pred:continue
+   aux_idx=next((i for i,w in enumerate(words) if w.start()==m.start('aux')),None);subject=None
+   if aux_idx is None:continue
+   for i in range(aux_idx-1,max(-1,aux_idx-12),-1):
+    if re.search(r'[.!?;]',text[words[i].end():m.start('aux')]):break
+    if i>0 and words[i-1].group().casefold() in PREPOSITIONS:continue
+    nouns=[p for p in self.morph.noun_parses(words[i].group()) if p.tag.case=='nomn' and p.tag.number=='plur']
+    if nouns:subject=words[i];break
+   if subject:
+    fixed=preserve_capitalization(m.group('aux'),'были');out.append(EditCandidate(m.group('aux'),fixed,.997,'rule-auxiliary-agreement',f'Связка согласуется с подлежащим «{subject.group()}» во множественном числе.',start=m.start('aux'),sources=('rule-auxiliary-agreement',)));self.found['auxiliary']+=1
   return out
  def candidates(self,text):
   self.calls+=1
   if not self.morph.available:return []
-  return self._coordination(text)+self._dative(text)+self._po(text)+self._locative(text)+self._numeral(text)
+  return self._coordination(text)+self._dative(text)+self._po(text)+self._process_coordination(text)+self._locative(text)+self._numeral(text)+self._auxiliary(text)
  def metrics(self):return {'calls':self.calls,**self.found}
